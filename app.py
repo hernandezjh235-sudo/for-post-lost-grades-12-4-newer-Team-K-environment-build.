@@ -458,6 +458,16 @@ def apply_full_terminal_ui():
     except Exception:
         pass
 
+
+def sanitize_projection_value(v, low=0.0, high=50.0):
+    try:
+        val = safe_float(v, None)
+        if val is None:
+            return None
+        return round(float(clamp(val, low, high)), 2)
+    except Exception:
+        return None
+
 def _fmt_ui(v, nd=2):
     try:
         if v is None or v == "":
@@ -492,7 +502,7 @@ def render_terminal_hero():
     st.markdown(f"""
     <div class="terminal-hero">
       <div class="terminal-title-card">
-        <div class="terminal-title">MLB PROP TERMINAL</div>
+        <div class="terminal-title">MLB ELITE PROP TERMINAL</div>
         <div class="terminal-sub">K PROJ • OF2 Filter • All Props • Underdog Live Lines • Tracking</div>
         <div class="terminal-pill">UI v2 Safe Mode — no projection changes</div>
       </div>
@@ -511,7 +521,7 @@ def render_terminal_hero():
     </div>
     """, unsafe_allow_html=True)
 
-def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label="PROP"):
+def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="PROP"):
     """Render compact prop cards safely.
 
     Fixes:
@@ -530,7 +540,7 @@ def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label=
             dfx = dfx.sort_values(["_tier_sort"], ascending=True)
         elif "Confidence %" in dfx.columns:
             dfx = dfx.sort_values("Confidence %", ascending=False)
-        dfx = dfx.head(max_cards)
+        dfx = dfx.head(int(clamp(max_cards, 4, 20)))
 
         safe_title = html.escape(str(title))
         st.markdown(
@@ -555,7 +565,7 @@ def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label=
             source = _first_existing(row, ["Line Source", "line_source", "Source"], "Underdog")
 
             prop_upper = str(prop_label).upper()
-            proj_num = safe_float(proj, None)
+            proj_num = sanitize_projection_value(proj, 0.0, 40.0)
             line_num = safe_float(line, None)
 
             # Card-level direction sanity for auxiliary props.
@@ -588,7 +598,7 @@ def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label=
                 edge_float = abs(float(edge)) if edge not in [None, ""] else 0
             except Exception:
                 edge_float = 0
-            bar_width = max(6, min(100, edge_float / 2.5 * 100))
+            bar_width = max(6, min(100, abs(edge_float) / 3.5 * 100))
 
             badge_class = "good"
             if "PASS" in pick_s.upper() or "NO LINE" in pick_s.upper():
@@ -629,7 +639,7 @@ def render_prop_card_board(df, title="Official Board", max_cards=12, prop_label=
 
         # st.html exists in newer Streamlit; fallback to markdown.
         try:
-            st.html(html_out)
+            st.html(str(html_out))
         except Exception:
             st.markdown(html_out, unsafe_allow_html=True)
 
@@ -8559,57 +8569,15 @@ def render_batter_rbi_tab(board, dates):
     c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
     c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
-    render_prop_card_board(df, title="Batter RBI Board", max_cards=12, prop_label="RBI")
+    render_prop_card_board(df, title="Batter RBI Board", max_cards=8, prop_label="RBI")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-def render_batter_fantasy_tab(board, dates):
-    st.markdown("### Batter Fantasy Score Model")
-    st.caption("Live Underdog fantasy score lines only. This version uses stronger UD market/name parsing.")
-    df = build_batter_prop_table_ud_only(board, dates, kind="fantasy", use_underdog=True)
-    candidates = fetch_underdog_batter_prop_candidates("fantasy")
-    with st.expander("Underdog Batter Fantasy parser debug"):
-        st.write(f"Fantasy candidates found: {len(candidates)}")
-        if candidates:
-            st.dataframe(pd.DataFrame(candidates)[["Player Candidate","Line","Market","Line Evidence"]].head(50), use_container_width=True, hide_index=True)
-    if df.empty:
-        st.info("No Underdog batter fantasy lines found in the current payload yet.")
-        return
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Batter Rows", len(df))
-    c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
-    c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
-    c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
-    render_prop_card_board(df, title="Batter Fantasy Board", max_cards=12, prop_label="BAT FS")
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-
-# =========================
-# PITCHER PROP TABS: OUTS / EARNED RUNS / WALKS / FANTASY SCORE
-# =========================
-# These are separate from the strikeout engine. They reuse the same realism inputs
-# already produced for each pitcher: expected BF, recent IP, run-damage profile,
-# leash risk, K projection, and live Underdog lines when available.
-PITCHER_MARKET_TERMS = {
-    "outs": ["pitching outs", "outs recorded", "pitcher outs", "recorded outs"],
-    "earned_runs": ["earned runs", "earned runs allowed", "pitcher earned runs", "er allowed"],
-    "walks": ["walks allowed", "pitcher walks", "bases on balls", "base on balls", "bb allowed"],
-    "pitcher_fantasy": ["pitcher fantasy", "fantasy score", "fantasy points", "pitcher fantasy score"],
-}
-
-PITCHER_LINE_DEFAULTS = {
-    "outs": 15.5,
-    "earned_runs": 2.5,
-    "walks": 1.5,
-    "pitcher_fantasy": 25.5,
-}
-
-PITCHER_LINE_RANGES = {
-    "outs": (3.5, 27.5),
-    "earned_runs": (0.5, 8.5),
-    "walks": (0.5, 6.5),
-    "pitcher_fantasy": (2.5, 60.5),
-}
-
+def render_batter_fantasy_tab(*args, **kwargs):
+    """Removed for stability/performance optimization."""
+    try:
+        st.info("Batter Fantasy removed for stability optimization.")
+    except Exception:
+        pass
 
 def pitcher_prop_market_matches_text(text, kind="outs"):
     t = str(text or "").lower()
@@ -9006,7 +8974,7 @@ def render_pitcher_prop_tab(board, kind="outs"):
     c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
     c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
-    render_prop_card_board(df, title=f"{labels.get(kind, kind)} Board", max_cards=12, prop_label=labels.get(kind, kind))
+    render_prop_card_board(df, title=f"{labels.get(kind, kind)} Board", max_cards=8, prop_label=labels.get(kind, kind))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
