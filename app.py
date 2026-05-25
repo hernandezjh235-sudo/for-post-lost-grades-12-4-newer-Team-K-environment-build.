@@ -7623,6 +7623,7 @@ def clean_batter_market_name_from_text(text, kind="rbi"):
     return ""
 
 def extract_batter_candidate_name_strong(obj, kind="rbi"):
+    import re
     # Original direct/nested extraction first.
     nm = extract_batter_candidate_name(obj)
     if nm:
@@ -7655,6 +7656,7 @@ def extract_batter_candidate_name_strong(obj, kind="rbi"):
     return ""
 
 def extract_batter_prop_line_from_obj_strong(obj, kind="rbi"):
+    import re
     line, note = extract_batter_prop_line_from_obj(obj)
     if line is not None:
         return line, note
@@ -7726,6 +7728,7 @@ def linked_text_for_obj(obj, by_id, depth=0):
     return " ".join(pieces)
 
 def linked_name_for_obj(obj, by_id, kind="rbi"):
+    import re
     nm = extract_batter_candidate_name_strong(obj, kind=kind)
     if nm:
         return nm
