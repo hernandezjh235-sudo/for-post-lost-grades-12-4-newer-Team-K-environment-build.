@@ -522,13 +522,7 @@ def render_terminal_hero():
     """, unsafe_allow_html=True)
 
 def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="PROP"):
-    """Render compact prop cards safely.
-
-    Fixes:
-    - Uses prop-specific Projection first, not K PROJ.
-    - Produces non-indented HTML so Streamlit does not show raw HTML as a code block.
-    - Re-sanity-checks card direction from Projection vs Line for auxiliary prop tabs.
-    """
+    """K PROJ/Upside-style cards reused across all prop tabs. UI only."""
     try:
         if df is None or len(df) == 0:
             return
@@ -540,35 +534,49 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
             dfx = dfx.sort_values(["_tier_sort"], ascending=True)
         elif "Confidence %" in dfx.columns:
             dfx = dfx.sort_values("Confidence %", ascending=False)
-        dfx = dfx.head(int(clamp(max_cards, 4, 20)))
+        dfx = dfx.head(int(clamp(max_cards, 4, 10)))
 
-        safe_title = html.escape(str(title))
         st.markdown(
-            f'<div class="section-head"><div><div class="section-title-new">{safe_title}</div>'
-            f'<div class="section-note">Card view shows strongest visible rows first. Full table remains below.</div></div></div>',
+            f'<div class="section-head"><div><div class="section-title-new">{html.escape(str(title))}</div>'
+            f'<div class="section-note">K Projection/Upside style cards. Full table remains below.</div></div></div>',
             unsafe_allow_html=True
         )
 
-        parts = ['<div class="board-grid">']
+        def pct(v):
+            x = safe_float(v, None)
+            return "—" if x is None else f"{x:.1f}%"
+
+        def fmt_num(v, nd=2):
+            return _fmt_ui(v, nd)
+
+        parts = ['<div class="v7-card-wrap">']
 
         for _, row in dfx.iterrows():
             player = _first_existing(row, ["Pitcher", "Batter", "Player", "pitcher", "batter", "player"], "Unknown")
             matchup = _first_existing(row, ["Matchup", "matchup", "Team", "team"], "")
-
-            # IMPORTANT: for non-K prop tabs, use prop Projection before K PROJ.
             proj = _first_existing(row, ["Projection", "projection", "Proj", "K PROJ"], None)
             line = _first_existing(row, ["Line", "UD/Line", "line", "active_line"], None)
             pick = _first_existing(row, ["Pick", "Decision", "decision", "bet_action", "Main Engine Action"], "—")
             conf = _first_existing(row, ["Confidence %", "Hit Rate %", "fair_probability"], None)
-            tier = _first_existing(row, ["Tier", "tier", "action_tier"], "")
+            tier = _first_existing(row, ["Tier", "tier", "action_tier"], "—")
             edge = _first_existing(row, ["Edge Gap", "edge_ks", "Lean Gap", "Model Gap"], None)
             source = _first_existing(row, ["Line Source", "line_source", "Source"], "Underdog")
+            lineup = _first_existing(row, ["Lineup", "lineup_status"], "—")
+
+            floor = _first_existing(row, ["Floor", "floor"], None)
+            median = _first_existing(row, ["Median", "median"], proj)
+            ceiling = _first_existing(row, ["Ceiling", "ceiling"], None)
+            whiff = _first_existing(row, ["Putaway/Whiff", "putaway_whiff", "Whiff %", "whiff"], None)
+            pitcher_k = _first_existing(row, ["Pitcher K%", "pitcher_k", "K%", "Pitcher K"], None)
+            opp_k = _first_existing(row, ["Opp K%", "opp_k", "Opponent K%"], None)
+            expected_bf = _first_existing(row, ["Expected BF", "Exp BF", "expected_bf"], None)
+            upside = _first_existing(row, ["K Upside", "elite_upside_score", "Upside", "Role Score"], None)
+            last10 = _first_existing(row, ["Last 10", "last10", "recent_ks", "Hit Rate %"], None)
 
             prop_upper = str(prop_label).upper()
-            proj_num = sanitize_projection_value(proj, 0.0, 40.0)
+            proj_num = sanitize_projection_value(proj, 0.0, 80.0) if "sanitize_projection_value" in globals() else safe_float(proj, None)
             line_num = safe_float(line, None)
 
-            # Card-level direction sanity for auxiliary props.
             if proj_num is not None and line_num is not None and not any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
                 side_fix = "OVER" if proj_num > line_num else "UNDER"
                 gap_fix = abs(proj_num - line_num)
@@ -584,64 +592,62 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
                 edge = round(gap_fix, 2)
 
             pick_s = str(pick)
-            tier_s = str(tier)
+            side_word = "OVER" if "OVER" in pick_s.upper() else "UNDER" if "UNDER" in pick_s.upper() else "PLAY"
+            edge_val = safe_float(edge, None)
+            edge_big = f"+{fmt_num(edge_val)}" if edge_val is not None else "—"
+            if any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
+                edge_big = f"+{fmt_num(edge_val)} K" if edge_val is not None else "—"
 
-            card_class = ""
-            if "PASS" in pick_s.upper() or tier_s.upper() == "PASS" or "NO LINE" in pick_s.upper():
-                card_class = "pass"
-            elif "LEAN" in pick_s.upper() or tier_s.upper() == "C":
-                card_class = "warn"
-            elif "LOSS" in pick_s.upper():
-                card_class = "bad"
+            need_note = f"{side_word.title()} side"
+            if line_num is not None and any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
+                need_note = f"Needs {int(line_num + 0.5)}+"
 
-            try:
-                edge_float = abs(float(edge)) if edge not in [None, ""] else 0
-            except Exception:
-                edge_float = 0
-            bar_width = max(6, min(100, abs(edge_float) / 3.5 * 100))
-
-            badge_class = "good"
-            if "PASS" in pick_s.upper() or "NO LINE" in pick_s.upper():
-                badge_class = ""
-            elif "LEAN" in pick_s.upper():
-                badge_class = "warn"
-
-            player_h = html.escape(str(player))
-            matchup_h = html.escape(str(matchup))
-            pick_h = html.escape(str(pick_s))
-            prop_h = html.escape(str(prop_label))
-            tier_h = html.escape(str(tier_s or "—"))
-            source_h = html.escape(str(source))
+            why = f"Projection {fmt_num(proj)} vs line {fmt_num(line)}. {side_word.title()} edge {fmt_num(edge)} with {fmt_num(conf,1)}% confidence."
+            if any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
+                why = f"{side_word.title()} signal from K projection vs line, expected BF, matchup K profile, and volatility gates."
 
             parts.append(
-                f'<div class="prop-card {card_class}">'
-                f'<div class="card-top"><div>'
-                f'<div class="player-title">{player_h}</div>'
-                f'<div class="player-sub">{matchup_h}</div>'
-                f'</div><span class="badge {badge_class}">{pick_h}</span></div>'
-                f'<div class="badge-row">'
-                f'<span class="badge good">{prop_h}</span>'
-                f'<span class="badge">Tier {tier_h}</span>'
-                f'<span class="badge">{source_h}</span>'
+                f'<div class="v7-player-card">'
+                f'<div class="v7-top">'
+                f'<div>'
+                f'<div class="v7-name">{html.escape(str(player))}</div>'
+                f'<div class="v7-matchup">{html.escape(str(matchup))}</div>'
+                f'<div class="v7-chip-col">'
+                f'<span class="v7-chip green">{html.escape(str(source))} Line</span>'
+                f'<span class="v7-chip yellow">Lineup: {html.escape(str(lineup or "—"))}</span>'
+                f'<span class="v7-chip red">{html.escape(str(prop_label).replace(" Model",""))}</span>'
+                f'<span class="v7-chip purple">Tier {html.escape(str(tier or "—"))}</span>'
                 f'</div>'
-                f'<div class="card-stats">'
-                f'<div class="stat-box"><div class="stat-label">Projection</div><div class="stat-value">{_fmt_ui(proj)}</div></div>'
-                f'<div class="stat-box"><div class="stat-label">Line</div><div class="stat-value">{_fmt_ui(line)}</div></div>'
-                f'<div class="stat-box"><div class="stat-label">Conf</div><div class="stat-value">{_fmt_ui(conf,1)}%</div></div>'
                 f'</div>'
-                f'<div class="edge-bar-wrap"><div class="edge-bar" style="width:{bar_width:.0f}%"></div></div>'
-                f'<div class="card-footer"><span>Edge: {_fmt_ui(edge)}</span><span>Live board</span></div>'
+
+                f'<div>'
+                f'<div class="v7-main-row">'
+                f'<div class="v7-main-stat"><div class="v7-main-label">Projection</div><div class="v7-main-value green">{fmt_num(proj)}</div><div class="v7-main-note">Exp BF {fmt_num(expected_bf)}</div></div>'
+                f'<div class="v7-main-stat"><div class="v7-main-label">Line</div><div class="v7-main-value">{fmt_num(line)}</div><div class="v7-main-note">{html.escape(need_note)}</div></div>'
+                f'<div class="v7-main-stat"><div class="v7-main-label">Edge</div><div class="v7-edge">{html.escape(edge_big)}</div><div class="v7-edge-sub">{html.escape(side_word.title())} signal</div></div>'
+                f'</div>'
+                f'</div>'
+                f'</div>'
+
+                f'<div class="v7-divider"></div>'
+                f'<div class="v7-mini-grid">'
+                f'<div class="v7-mini"><div class="v7-mini-label">Whiff %</div><div class="v7-mini-value">{pct(whiff)}</div><div class="v7-mini-sub">Putaway/stuff proxy</div></div>'
+                f'<div class="v7-mini"><div class="v7-mini-label">Pitcher K%</div><div class="v7-mini-value">{pct(pitcher_k)}</div><div class="v7-mini-sub">Season/recent blend</div></div>'
+                f'<div class="v7-mini"><div class="v7-mini-label">Opp K%</div><div class="v7-mini-value">{pct(opp_k)}</div><div class="v7-mini-sub">Lineup/team matchup</div></div>'
+                f'<div class="v7-mini"><div class="v7-mini-label">Distribution</div><div class="v7-mini-value">F {fmt_num(floor)}<br>M <span style="color:#4ade80">{fmt_num(median)}</span><br>C {fmt_num(ceiling)}</div><div class="v7-mini-sub">Floor | Median | Ceiling</div></div>'
+                f'<div class="v7-mini"><div class="v7-mini-label">Form</div><div class="v7-mini-value">{fmt_num(last10)}</div><div class="v7-mini-sub">Recent trend</div></div>'
+                f'</div>'
+
+                f'<div class="v7-why"><div class="v7-why-title">Why {html.escape(side_word.title())}?</div>{html.escape(why)}</div>'
                 f'</div>'
             )
 
         parts.append("</div>")
         html_out = "".join(parts)
-
-        # st.html exists in newer Streamlit; fallback to markdown.
         try:
             st.html(str(html_out))
         except Exception:
-            st.markdown(html_out, unsafe_allow_html=True)
+            st.markdown(str(html_out), unsafe_allow_html=True)
 
     except Exception as e:
         try:
