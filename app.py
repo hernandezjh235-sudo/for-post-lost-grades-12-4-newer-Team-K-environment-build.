@@ -632,7 +632,7 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
                 "box-shadow:0 18px 46px rgba(0,0,0,.42);overflow:hidden;color:white;"
             )
             top_style = "display:grid;grid-template-columns:1.05fr 2.25fr;gap:24px;align-items:start;"
-            name_style = "font-size:36px;line-height:1.03;font-weight:950;color:#fff;letter-spacing:-.045em;"
+            name_style = "font-size:30px;line-height:1.03;font-weight:950;color:#fff;letter-spacing:-.045em;"
             matchup_style = "margin-top:12px;color:#cbd5e1;font-size:20px;font-weight:650;"
             chip_col = "display:flex;flex-direction:column;gap:10px;margin-top:18px;max-width:250px;"
             chip_green = "display:inline-flex;justify-content:center;border-radius:999px;padding:12px 16px;font-size:18px;font-weight:950;background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.60);color:#bbf7d0;"
@@ -643,12 +643,12 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
             main_stat = "min-height:122px;padding:10px 24px;border-right:1px solid rgba(148,163,184,.30);"
             main_stat_last = "min-height:122px;padding:10px 24px;text-align:right;"
             label_style = "color:#d1d5db;font-size:17px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;"
-            value_green = "margin-top:12px;color:#3bea5f;font-size:58px;font-weight:950;line-height:1;"
-            value_white = "margin-top:12px;color:#fff;font-size:58px;font-weight:950;line-height:1;"
-            edge_style = "margin-top:12px;color:#3bea5f;font-size:54px;font-weight:950;line-height:1;"
+            value_green = "margin-top:12px;color:#3bea5f;font-size:50px;font-weight:950;line-height:1;"
+            value_white = "margin-top:12px;color:#fff;font-size:50px;font-weight:950;line-height:1;"
+            edge_style = "margin-top:12px;color:#3bea5f;font-size:46px;font-weight:950;line-height:1;"
             note_style = "margin-top:9px;color:#d1d5db;font-size:16px;line-height:1.25;"
             divider = "height:1px;background:rgba(148,163,184,.24);margin:24px 0 20px 0;"
-            mini_grid = "display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;"
+            mini_grid = "display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;"
             mini_box = "border:1px solid rgba(239,68,68,.50);border-radius:16px;background:rgba(2,6,23,.38);min-height:150px;padding:16px 12px;text-align:center;"
             mini_label = "color:#d1d5db;font-size:15px;font-weight:900;text-transform:uppercase;letter-spacing:.05em;min-height:34px;"
             mini_value = "margin-top:16px;color:#fff;font-size:32px;font-weight:950;line-height:1.08;"
@@ -8604,25 +8604,9 @@ def build_batter_prop_table_ud_only(board, dates, kind="rbi", use_underdog=True)
     return df
 
 
-def render_batter_rbi_tab(board, dates):
-    st.markdown("### Batter RBIs / Run Production Model")
-    st.caption("Live Underdog RBI lines only. This version uses stronger UD market/name parsing.")
-    df = build_batter_prop_table_ud_only(board, dates, kind="rbi", use_underdog=True)
-    candidates = fetch_underdog_batter_prop_candidates("rbi")
-    with st.expander("Underdog RBI parser debug"):
-        st.write(f"RBI candidates found: {len(candidates)}")
-        if candidates:
-            st.dataframe(pd.DataFrame(candidates)[["Player Candidate","Line","Market","Line Evidence"]].head(50), use_container_width=True, hide_index=True)
-    if df.empty:
-        st.info("No Underdog RBI lines found in the current payload yet.")
-        return
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Batter Rows", len(df))
-    c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
-    c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
-    c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
-    render_prop_card_board(df, title="Batter RBI Board", max_cards=8, prop_label="RBI")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+def render_batter_rbi_tab(*args, **kwargs):
+    return
+
 
 def render_batter_fantasy_tab(*args, **kwargs):
     """Batter Fantasy removed for stability/performance."""
@@ -9185,13 +9169,12 @@ def render_tracking_results_tab():
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_rbi, tab_tracking, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
+tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_tracking, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHING OUTS",
     "EARNED RUNS",
     "WALKS ALLOWED",
     "PITCHER FANTASY",
-    "BATTER RBIs",
     "TRACKING / RESULTS",
     "ALL PLAYERS",
     "REAL PROP BOARD",
@@ -9215,9 +9198,7 @@ with tab_walks:
 with tab_pitcher_fantasy:
     render_pitcher_prop_tab(board, kind="pitcher_fantasy")
 
-with tab_rbi:
-    render_batter_rbi_tab(board, dates)
-
+# Batter RBI tab removed.
 # Batter Fantasy tab removed for stability/performance.
 
 with tab_tracking:
