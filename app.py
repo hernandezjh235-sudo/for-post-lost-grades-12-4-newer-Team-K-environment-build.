@@ -8012,6 +8012,7 @@ def extract_batter_candidate_name(obj):
 # BATTER LINE FIX v2 — stronger Underdog name/line extraction
 # =========================
 def clean_batter_market_name_from_text(text, kind="rbi"):
+    import re
     s = str(text or "").strip()
     if not s:
         return ""
@@ -8112,7 +8113,10 @@ def build_underdog_link_maps(data):
         oid = str(obj.get("id") or obj.get("uuid") or obj.get("_id") or "")
         if oid:
             by_id[oid] = obj
-        nm = extract_batter_candidate_name_strong(obj, kind="rbi") or extract_batter_candidate_name_strong(obj, kind="fantasy")
+        try:
+            nm = extract_batter_candidate_name_strong(obj, kind="rbi") or extract_batter_candidate_name_strong(obj, kind="fantasy")
+        except Exception:
+            nm = ""
         blob = json.dumps(obj, ensure_ascii=False).lower()
         if nm and any(x in blob for x in ["player", "appearance", "athlete", "participant"]):
             if oid:
