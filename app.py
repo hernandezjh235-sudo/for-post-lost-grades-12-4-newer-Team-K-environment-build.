@@ -8573,13 +8573,57 @@ def render_batter_rbi_tab(board, dates):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 def render_batter_fantasy_tab(*args, **kwargs):
-    """Removed for stability/performance optimization."""
-    try:
-        st.info("Batter Fantasy removed for stability optimization.")
-    except Exception:
-        pass
+    """Batter Fantasy removed for stability/performance."""
+    return
+
+
+# =========================
+# PITCHER PROP MARKET TERMS / LINE DEFAULTS / RANGES
+# Required by extra prop tabs. Manual entry is disabled; live Underdog remains primary.
+# =========================
+PITCHER_MARKET_TERMS = {
+    "outs": [
+        "pitching outs", "outs recorded", "pitcher outs", "recorded outs",
+        "outs", "pitcher recorded outs"
+    ],
+    "earned_runs": [
+        "earned runs", "earned runs allowed", "pitcher earned runs",
+        "er allowed", "earned run allowed"
+    ],
+    "walks": [
+        "walks allowed", "pitcher walks", "bases on balls",
+        "base on balls", "bb allowed"
+    ],
+    "pitcher_fantasy": [
+        "pitcher fantasy", "pitcher fantasy score", "fantasy points",
+        "fantasy score", "pitching fantasy"
+    ],
+}
+
+PITCHER_LINE_DEFAULTS = {
+    "outs": 16.5,
+    "earned_runs": 2.5,
+    "walks": 1.5,
+    "pitcher_fantasy": 29.5,
+}
+
+PITCHER_LINE_RANGES = {
+    "outs": (6.5, 24.5),
+    "earned_runs": (0.5, 7.5),
+    "walks": (0.5, 5.5),
+    "pitcher_fantasy": (2.5, 60.5),
+}
+
 
 def pitcher_prop_market_matches_text(text, kind="outs"):
+    global PITCHER_MARKET_TERMS
+    if "PITCHER_MARKET_TERMS" not in globals():
+        PITCHER_MARKET_TERMS = {
+            "outs": ["pitching outs", "outs recorded", "pitcher outs", "recorded outs", "outs"],
+            "earned_runs": ["earned runs", "earned runs allowed", "pitcher earned runs", "er allowed"],
+            "walks": ["walks allowed", "pitcher walks", "bases on balls", "bb allowed"],
+            "pitcher_fantasy": ["pitcher fantasy", "pitcher fantasy score", "fantasy points", "fantasy score"],
+        }
     t = str(text or "").lower()
     if not t:
         return False
@@ -8953,25 +8997,6 @@ def build_pitcher_prop_table(board, kind="outs", default_line=None, use_underdog
 
 
 
-# =========================
-# PITCHER PROP LINE DEFAULTS / RANGES
-# Required by extra prop tabs. Manual entry is disabled, but render functions reference these safely.
-# =========================
-PITCHER_LINE_DEFAULTS = {
-    "outs": 16.5,
-    "earned_runs": 2.5,
-    "walks": 1.5,
-    "pitcher_fantasy": 29.5,
-}
-
-PITCHER_LINE_RANGES = {
-    "outs": (6.5, 24.5),
-    "earned_runs": (0.5, 7.5),
-    "walks": (0.5, 5.5),
-    "pitcher_fantasy": (2.5, 60.5),
-}
-
-
 def render_pitcher_prop_tab(board, kind="outs"):
     global PITCHER_LINE_DEFAULTS, PITCHER_LINE_RANGES
     if "PITCHER_LINE_DEFAULTS" not in globals():
@@ -9097,14 +9122,13 @@ def render_tracking_results_tab():
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_rbi, tab_fantasy, tab_tracking, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
+tab_kproj, tab_outs, tab_er, tab_walks, tab_pitcher_fantasy, tab_rbi, tab_tracking, tab_all, tab_props, tab_statcast, tab_learning, tab_settings = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHING OUTS",
     "EARNED RUNS",
     "WALKS ALLOWED",
     "PITCHER FANTASY",
     "BATTER RBIs",
-    "BATTER FANTASY SCORE",
     "TRACKING / RESULTS",
     "ALL PLAYERS",
     "REAL PROP BOARD",
@@ -9131,8 +9155,7 @@ with tab_pitcher_fantasy:
 with tab_rbi:
     render_batter_rbi_tab(board, dates)
 
-with tab_fantasy:
-    render_batter_fantasy_tab(board, dates)
+# Batter Fantasy tab removed for stability/performance.
 
 with tab_tracking:
     render_tracking_results_tab()
