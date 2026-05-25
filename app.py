@@ -522,7 +522,11 @@ def render_terminal_hero():
     """, unsafe_allow_html=True)
 
 def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="PROP"):
-    """K PROJ/Upside-style cards reused across all prop tabs. UI only."""
+    """Unified K PROJ/Upside-style cards for all prop tabs.
+
+    This is UI-only. It does not change projections, Underdog, OF2, grading, tracking, or learning.
+    Inline styles are used so Pitching Outs / ER / Walks / Pitcher Fantasy / RBI match the K-style layout.
+    """
     try:
         if df is None or len(df) == 0:
             return
@@ -534,11 +538,12 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
             dfx = dfx.sort_values(["_tier_sort"], ascending=True)
         elif "Confidence %" in dfx.columns:
             dfx = dfx.sort_values("Confidence %", ascending=False)
+
         dfx = dfx.head(int(clamp(max_cards, 4, 10)))
 
         st.markdown(
-            f'<div class="section-head"><div><div class="section-title-new">{html.escape(str(title))}</div>'
-            f'<div class="section-note">K Projection/Upside style cards. Full table remains below.</div></div></div>',
+            f"<div style='font-size:26px;font-weight:950;color:white;margin:18px 0 6px 0;'>{html.escape(str(title))}</div>"
+            f"<div style='font-size:14px;color:#cbd5e1;margin-bottom:14px;'>Unified K Projection/Upside style cards. Full table remains below.</div>",
             unsafe_allow_html=True
         )
 
@@ -549,11 +554,15 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
         def fmt_num(v, nd=2):
             return _fmt_ui(v, nd)
 
-        parts = ['<div class="v7-card-wrap">']
+        cards = []
 
         for _, row in dfx.iterrows():
             player = _first_existing(row, ["Pitcher", "Batter", "Player", "pitcher", "batter", "player"], "Unknown")
             matchup = _first_existing(row, ["Matchup", "matchup", "Team", "team"], "")
+            hand = _first_existing(row, ["hand", "Hand", "Throws"], "")
+            matchup_line = f"{matchup} | {hand}" if hand else str(matchup)
+
+            # Important: for auxiliary tabs use Projection before K PROJ.
             proj = _first_existing(row, ["Projection", "projection", "Proj", "K PROJ"], None)
             line = _first_existing(row, ["Line", "UD/Line", "line", "active_line"], None)
             pick = _first_existing(row, ["Pick", "Decision", "decision", "bet_action", "Main Engine Action"], "—")
@@ -570,13 +579,13 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
             pitcher_k = _first_existing(row, ["Pitcher K%", "pitcher_k", "K%", "Pitcher K"], None)
             opp_k = _first_existing(row, ["Opp K%", "opp_k", "Opponent K%"], None)
             expected_bf = _first_existing(row, ["Expected BF", "Exp BF", "expected_bf"], None)
-            upside = _first_existing(row, ["K Upside", "elite_upside_score", "Upside", "Role Score"], None)
             last10 = _first_existing(row, ["Last 10", "last10", "recent_ks", "Hit Rate %"], None)
 
             prop_upper = str(prop_label).upper()
             proj_num = sanitize_projection_value(proj, 0.0, 80.0) if "sanitize_projection_value" in globals() else safe_float(proj, None)
             line_num = safe_float(line, None)
 
+            # Direction sanity for all non-K auxiliary tabs.
             if proj_num is not None and line_num is not None and not any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
                 side_fix = "OVER" if proj_num > line_num else "UNDER"
                 gap_fix = abs(proj_num - line_num)
@@ -594,9 +603,9 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
             pick_s = str(pick)
             side_word = "OVER" if "OVER" in pick_s.upper() else "UNDER" if "UNDER" in pick_s.upper() else "PLAY"
             edge_val = safe_float(edge, None)
-            edge_big = f"+{fmt_num(edge_val)}" if edge_val is not None else "—"
+            edge_big = "—" if edge_val is None else f"+{fmt_num(edge_val)}"
             if any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
-                edge_big = f"+{fmt_num(edge_val)} K" if edge_val is not None else "—"
+                edge_big = "—" if edge_val is None else f"+{fmt_num(edge_val)} K"
 
             need_note = f"{side_word.title()} side"
             if line_num is not None and any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
@@ -606,48 +615,85 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
             if any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
                 why = f"{side_word.title()} signal from K projection vs line, expected BF, matchup K profile, and volatility gates."
 
-            parts.append(
-                f'<div class="v7-player-card">'
-                f'<div class="v7-top">'
-                f'<div>'
-                f'<div class="v7-name">{html.escape(str(player))}</div>'
-                f'<div class="v7-matchup">{html.escape(str(matchup))}</div>'
-                f'<div class="v7-chip-col">'
-                f'<span class="v7-chip green">{html.escape(str(source))} Line</span>'
-                f'<span class="v7-chip yellow">Lineup: {html.escape(str(lineup or "—"))}</span>'
-                f'<span class="v7-chip red">{html.escape(str(prop_label).replace(" Model",""))}</span>'
-                f'<span class="v7-chip purple">Tier {html.escape(str(tier or "—"))}</span>'
-                f'</div>'
-                f'</div>'
+            player_h = html.escape(str(player))
+            matchup_h = html.escape(str(matchup_line))
+            source_h = html.escape(str(source))
+            lineup_h = html.escape(str(lineup or "—"))
+            prop_h = html.escape(str(prop_label).replace(" Model", ""))
+            tier_h = html.escape(str(tier or "—"))
+            side_h = html.escape(side_word.title())
+            why_h = html.escape(str(why))
 
-                f'<div>'
-                f'<div class="v7-main-row">'
-                f'<div class="v7-main-stat"><div class="v7-main-label">Projection</div><div class="v7-main-value green">{fmt_num(proj)}</div><div class="v7-main-note">Exp BF {fmt_num(expected_bf)}</div></div>'
-                f'<div class="v7-main-stat"><div class="v7-main-label">Line</div><div class="v7-main-value">{fmt_num(line)}</div><div class="v7-main-note">{html.escape(need_note)}</div></div>'
-                f'<div class="v7-main-stat"><div class="v7-main-label">Edge</div><div class="v7-edge">{html.escape(edge_big)}</div><div class="v7-edge-sub">{html.escape(side_word.title())} signal</div></div>'
-                f'</div>'
-                f'</div>'
-                f'</div>'
+            card_style = (
+                "background:radial-gradient(circle at 12% 0%,rgba(139,92,246,.14),transparent 30%),"
+                "linear-gradient(145deg,rgba(14,8,12,.98),rgba(3,6,13,.98));"
+                "border:1px solid rgba(139,92,246,.62);border-radius:28px;"
+                "padding:26px 26px 22px 26px;margin:0 0 22px 0;"
+                "box-shadow:0 18px 46px rgba(0,0,0,.42);overflow:hidden;color:white;"
+            )
+            top_style = "display:grid;grid-template-columns:1.05fr 2.25fr;gap:24px;align-items:start;"
+            name_style = "font-size:36px;line-height:1.03;font-weight:950;color:#fff;letter-spacing:-.045em;"
+            matchup_style = "margin-top:12px;color:#cbd5e1;font-size:20px;font-weight:650;"
+            chip_col = "display:flex;flex-direction:column;gap:10px;margin-top:18px;max-width:250px;"
+            chip_green = "display:inline-flex;justify-content:center;border-radius:999px;padding:12px 16px;font-size:18px;font-weight:950;background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.60);color:#bbf7d0;"
+            chip_yellow = "display:inline-flex;justify-content:center;border-radius:999px;padding:12px 16px;font-size:18px;font-weight:950;background:rgba(250,204,21,.12);border:1px solid rgba(250,204,21,.58);color:#fde68a;"
+            chip_red = "display:inline-flex;justify-content:center;border-radius:999px;padding:12px 16px;font-size:18px;font-weight:950;background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.58);color:#fecaca;"
+            chip_purple = "display:inline-flex;justify-content:center;border-radius:999px;padding:12px 16px;font-size:18px;font-weight:950;background:rgba(124,58,237,.16);border:1px solid rgba(167,139,250,.55);color:#ddd6fe;"
+            main_row = "display:grid;grid-template-columns:1fr 1fr 1.15fr;gap:0;align-items:center;margin-top:8px;"
+            main_stat = "min-height:122px;padding:10px 24px;border-right:1px solid rgba(148,163,184,.30);"
+            main_stat_last = "min-height:122px;padding:10px 24px;text-align:right;"
+            label_style = "color:#d1d5db;font-size:17px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;"
+            value_green = "margin-top:12px;color:#3bea5f;font-size:58px;font-weight:950;line-height:1;"
+            value_white = "margin-top:12px;color:#fff;font-size:58px;font-weight:950;line-height:1;"
+            edge_style = "margin-top:12px;color:#3bea5f;font-size:54px;font-weight:950;line-height:1;"
+            note_style = "margin-top:9px;color:#d1d5db;font-size:16px;line-height:1.25;"
+            divider = "height:1px;background:rgba(148,163,184,.24);margin:24px 0 20px 0;"
+            mini_grid = "display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;"
+            mini_box = "border:1px solid rgba(239,68,68,.50);border-radius:16px;background:rgba(2,6,23,.38);min-height:150px;padding:16px 12px;text-align:center;"
+            mini_label = "color:#d1d5db;font-size:15px;font-weight:900;text-transform:uppercase;letter-spacing:.05em;min-height:34px;"
+            mini_value = "margin-top:16px;color:#fff;font-size:32px;font-weight:950;line-height:1.08;"
+            mini_sub = "margin-top:13px;color:#cbd5e1;font-size:13px;line-height:1.25;"
+            why_style = "margin-top:22px;border:1px solid rgba(148,163,184,.26);border-left:5px solid #22c55e;border-radius:16px;background:rgba(15,23,42,.58);padding:17px 18px;color:#f8fafc;font-size:18px;line-height:1.45;"
+            why_title = "color:#4ade80;font-size:18px;font-weight:950;margin-bottom:6px;"
 
-                f'<div class="v7-divider"></div>'
-                f'<div class="v7-mini-grid">'
-                f'<div class="v7-mini"><div class="v7-mini-label">Whiff %</div><div class="v7-mini-value">{pct(whiff)}</div><div class="v7-mini-sub">Putaway/stuff proxy</div></div>'
-                f'<div class="v7-mini"><div class="v7-mini-label">Pitcher K%</div><div class="v7-mini-value">{pct(pitcher_k)}</div><div class="v7-mini-sub">Season/recent blend</div></div>'
-                f'<div class="v7-mini"><div class="v7-mini-label">Opp K%</div><div class="v7-mini-value">{pct(opp_k)}</div><div class="v7-mini-sub">Lineup/team matchup</div></div>'
-                f'<div class="v7-mini"><div class="v7-mini-label">Distribution</div><div class="v7-mini-value">F {fmt_num(floor)}<br>M <span style="color:#4ade80">{fmt_num(median)}</span><br>C {fmt_num(ceiling)}</div><div class="v7-mini-sub">Floor | Median | Ceiling</div></div>'
-                f'<div class="v7-mini"><div class="v7-mini-label">Form</div><div class="v7-mini-value">{fmt_num(last10)}</div><div class="v7-mini-sub">Recent trend</div></div>'
-                f'</div>'
+            cards.append(
+                f"<div style='{card_style}'>"
+                f"<div style='{top_style}'>"
+                f"<div>"
+                f"<div style='{name_style}'>{player_h}</div>"
+                f"<div style='{matchup_style}'>{matchup_h}</div>"
+                f"<div style='{chip_col}'>"
+                f"<span style='{chip_green}'>{source_h} Line</span>"
+                f"<span style='{chip_yellow}'>Lineup: {lineup_h}</span>"
+                f"<span style='{chip_red}'>{prop_h}</span>"
+                f"<span style='{chip_purple}'>Tier {tier_h}</span>"
+                f"</div>"
+                f"</div>"
 
-                f'<div class="v7-why"><div class="v7-why-title">Why {html.escape(side_word.title())}?</div>{html.escape(why)}</div>'
-                f'</div>'
+                f"<div>"
+                f"<div style='{main_row}'>"
+                f"<div style='{main_stat}'><div style='{label_style}'>Projection</div><div style='{value_green}'>{fmt_num(proj)}</div><div style='{note_style}'>Exp BF {fmt_num(expected_bf)}</div></div>"
+                f"<div style='{main_stat}'><div style='{label_style}'>Line</div><div style='{value_white}'>{fmt_num(line)}</div><div style='{note_style}'>{html.escape(need_note)}</div></div>"
+                f"<div style='{main_stat_last}'><div style='{label_style}'>Edge</div><div style='{edge_style}'>{html.escape(edge_big)}</div><div style='{note_style}'>{side_h} signal</div></div>"
+                f"</div>"
+                f"</div>"
+                f"</div>"
+
+                f"<div style='{divider}'></div>"
+                f"<div style='{mini_grid}'>"
+                f"<div style='{mini_box}'><div style='{mini_label}'>Whiff %</div><div style='{mini_value}'>{pct(whiff)}</div><div style='{mini_sub}'>Putaway/stuff proxy</div></div>"
+                f"<div style='{mini_box}'><div style='{mini_label}'>Pitcher K%</div><div style='{mini_value}'>{pct(pitcher_k)}</div><div style='{mini_sub}'>Season/recent blend</div></div>"
+                f"<div style='{mini_box}'><div style='{mini_label}'>Opp K%</div><div style='{mini_value}'>{pct(opp_k)}</div><div style='{mini_sub}'>Lineup/team matchup</div></div>"
+                f"<div style='{mini_box}'><div style='{mini_label}'>Distribution</div><div style='{mini_value}'>F {fmt_num(floor)}<br>M <span style='color:#4ade80'>{fmt_num(median)}</span><br>C {fmt_num(ceiling)}</div><div style='{mini_sub}'>Floor | Median | Ceiling</div></div>"
+                f"<div style='{mini_box}'><div style='{mini_label}'>Form</div><div style='{mini_value}'>{fmt_num(last10)}</div><div style='{mini_sub}'>Recent trend</div></div>"
+                f"</div>"
+
+                f"<div style='{why_style}'><div style='{why_title}'>Why {side_h}?</div>{why_h}</div>"
+                f"</div>"
             )
 
-        parts.append("</div>")
-        html_out = "".join(parts)
-        try:
-            st.html(str(html_out))
-        except Exception:
-            st.markdown(str(html_out), unsafe_allow_html=True)
+        html_out = "<div style='display:grid;grid-template-columns:1fr;gap:20px;margin:14px 0 22px 0;'>" + "".join(cards) + "</div>"
+        st.markdown(html_out, unsafe_allow_html=True)
 
     except Exception as e:
         try:
@@ -8622,29 +8668,40 @@ PITCHER_LINE_RANGES = {
 
 
 def pitcher_prop_market_matches_text(text, kind="outs"):
-    global PITCHER_MARKET_TERMS
-    if "PITCHER_MARKET_TERMS" not in globals():
-        PITCHER_MARKET_TERMS = {
-            "outs": ["pitching outs", "outs recorded", "pitcher outs", "recorded outs", "outs"],
-            "earned_runs": ["earned runs", "earned runs allowed", "pitcher earned runs", "er allowed"],
-            "walks": ["walks allowed", "pitcher walks", "bases on balls", "bb allowed"],
-            "pitcher_fantasy": ["pitcher fantasy", "pitcher fantasy score", "fantasy points", "fantasy score"],
-        }
-    t = str(text or "").lower()
-    if not t:
-        return False
-    if is_bad_sport_text(t) and not ("mlb" in t or "baseball" in t):
-        return False
-    terms = PITCHER_MARKET_TERMS.get(kind, [])
-    if not any(term in t for term in terms):
-        return False
-    # Keep pitcher tabs from stealing hitter fantasy/RBI markets.
-    if kind == "pitcher_fantasy" and any(x in t for x in ["batter fantasy", "hitter fantasy", "player fantasy batter"]):
-        return False
-    if any(x in t for x in ["batter", "hitter", "total bases", "hits+runs+rbi", "rbi", "stolen base"]):
-        if not any(y in t for y in ["pitcher", "pitching", "earned runs", "walks allowed", "outs recorded"]):
+    """Safe matcher for auxiliary pitcher prop markets."""
+    try:
+        global PITCHER_MARKET_TERMS
+        if "PITCHER_MARKET_TERMS" not in globals():
+            PITCHER_MARKET_TERMS = {
+                "outs": ["pitching outs", "outs recorded", "pitcher outs", "recorded outs", "outs"],
+                "earned_runs": ["earned runs", "earned runs allowed", "pitcher earned runs", "er allowed"],
+                "walks": ["walks allowed", "pitcher walks", "bases on balls", "bb allowed"],
+                "pitcher_fantasy": ["pitcher fantasy", "pitcher fantasy score", "pitching fantasy", "fantasy points", "fantasy score"],
+            }
+
+        t = str(text or "").lower()
+        if not t:
             return False
-    return True
+
+        if is_bad_sport_text(t) and not ("mlb" in t or "baseball" in t):
+            return False
+
+        terms = PITCHER_MARKET_TERMS.get(kind, [])
+        if not any(term.lower() in t for term in terms):
+            return False
+
+        # Prevent hitter/batter markets from leaking into pitcher tabs.
+        hitter_terms = ["batter", "hitter", "total bases", "hits+runs+rbi", "rbi", "stolen base"]
+        pitcher_terms = ["pitcher", "pitching", "earned runs", "walks allowed", "outs recorded", "pitcher fantasy"]
+        if any(x in t for x in hitter_terms) and not any(y in t for y in pitcher_terms):
+            return False
+
+        if kind == "pitcher_fantasy" and any(x in t for x in ["batter fantasy", "hitter fantasy"]):
+            return False
+
+        return True
+    except Exception:
+        return False
 
 
 def extract_pitcher_prop_line_from_obj(obj, kind="outs"):
