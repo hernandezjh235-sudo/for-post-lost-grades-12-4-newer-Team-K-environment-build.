@@ -7332,6 +7332,186 @@ def project_batter_fantasy_score(row):
         proj *= 0.94
     return round(float(clamp(proj, 2.0, 16.5)), 2), "season fantasy/PA"
 
+# =========================
+# BATTER UNDERDOG AUTO-LINE HELPERS (RBI + FANTASY SCORE)
+# =========================
+BATTER_RBI_MARKET_TERMS = [
+    "rbi", "runs batted in", "run batted in", "batter rbi", "player rbi"
+]
+BATTER_FANTASY_MARKET_TERMS = [
+    "fantasy points", "fantasy score", "batter fantasy", "hitter fantasy", "player fantasy"
+]
+
+BATTER_PROP_LINE_KEYS = [
+    "stat_value", "target_value", "over_under_line", "line_score", "line", "point", "points", "handicap"
+]
+BATTER_PROP_MARKET_KEYS = [
+    "stat_type", "statType", "stat", "market", "market_name", "marketName", "title",
+    "over_under_title", "over_under", "appearance_stat", "appearanceStat", "scoring_type",
+    "projection_type", "display_stat", "displayStat", "name", "description"
+]
+BATTER_PROP_NAME_KEYS = [
+    "player_name", "playerName", "display_name", "displayName", "full_name", "fullName",
+    "athlete_name", "athleteName", "participant_name", "participantName", "name", "title"
+]
+
+
+def batter_market_terms(kind="rbi"):
+    return BATTER_FANTASY_MARKET_TERMS if kind == "fantasy" else BATTER_RBI_MARKET_TERMS
+
+
+def batter_market_matches_text(text, kind="rbi"):
+    t = str(text or "").lower()
+    if not t:
+        return False
+    if is_bad_sport_text(t):
+        # Allow if MLB/baseball is explicitly present and the bad term came from unrelated embedded metadata.
+        if not ("mlb" in t or "baseball" in t):
+            return False
+    terms = batter_market_terms(kind)
+    if kind == "rbi":
+        # Avoid H+R+RBI combo being treated as pure RBI.
+        if any(x in t for x in ["hits+runs+rbi", "hits + runs + rbi", "h+r+rbi", "runs+rbi", "runs + rbi"]):
+            return False
+        return any(term in t for term in terms)
+    return any(term in t for term in terms)
+
+
+def extract_batter_prop_line_from_obj(obj):
+    if not isinstance(obj, dict):
+        return None, ""
+    for k in BATTER_PROP_LINE_KEYS:
+        if k in obj:
+            val = safe_float(obj.get(k))
+            if val is not None and 0 <= val <= 80:
+                # Underdog props are usually half lines; integers can exist for fantasy but are still real if field is direct.
+                return float(val), f"{k} from Underdog object"
+    # Text fallback: only half/decimal lines, avoids stealing IDs or ranks.
+    blob = json.dumps(obj, ensure_ascii=False).lower()
+    import re
+    nums = []
+    for m in re.finditer(r"(?<!\d)(\d{1,2}\.5|\d{1,2}\.0)(?!\d)", blob):
+        v = safe_float(m.group(1))
+        if v is not None and 0 <= v <= 80:
+            nums.append(v)
+    if nums:
+        return float(nums[0]), "decimal line from Underdog text"
+    return None, "no valid line"
+
+
+def extract_batter_candidate_name(obj):
+    if not isinstance(obj, dict):
+        return ""
+    # direct names first
+    for k in BATTER_PROP_NAME_KEYS:
+        v = obj.get(k)
+        if isinstance(v, str) and 4 <= len(v) <= 60 and not batter_market_matches_text(v, "rbi") and not batter_market_matches_text(v, "fantasy"):
+            # Avoid generic labels like "RBI" becoming player names.
+            if len(v.split()) >= 2 or "." in v:
+                return v
+    # common nested shapes
+    for k in ["player", "athlete", "participant", "appearance", "competitor"]:
+        v = obj.get(k)
+        if isinstance(v, dict):
+            nm = extract_batter_candidate_name(v)
+            if nm:
+                return nm
+    first = first_value(obj, ["first_name", "firstName", "first"])
+    last = first_value(obj, ["last_name", "lastName", "last"])
+    if first and last:
+        return f"{first} {last}"
+    return ""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_underdog_batter_prop_candidates(kind="rbi"):
+    """Collect live Underdog batter RBI/Fantasy candidates.
+
+    This is intentionally separate from the pitcher-K parser. It does not create fake lines:
+    only rows with an actual Underdog line field/text are returned. Matching to a batter is
+    done later by name_score against the candidate object blob.
+    """
+    candidates = []
+    seen = set()
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=16)
+        if not data:
+            continue
+        flat = flatten_json(data)
+        for obj in flat:
+            if not isinstance(obj, dict):
+                continue
+            blob = json.dumps(obj, ensure_ascii=False)
+            low = blob.lower()
+            if not batter_market_matches_text(low, kind):
+                continue
+            line, line_note = extract_batter_prop_line_from_obj(obj)
+            if line is None:
+                continue
+            # Fantasy lines may be larger; RBI lines should usually be small.
+            if kind == "rbi" and not (0.5 <= line <= 3.5):
+                continue
+            if kind == "fantasy" and not (1.5 <= line <= 40.5):
+                continue
+            nm = extract_batter_candidate_name(obj)
+            # Find a compact market label.
+            market = ""
+            for k in BATTER_PROP_MARKET_KEYS:
+                v = obj.get(k)
+                if isinstance(v, str) and batter_market_matches_text(v, kind):
+                    market = v
+                    break
+            key = (url, nm, round(float(line), 2), market, str(obj.get("id") or obj.get("uuid") or "")[:50])
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "Source": "Underdog",
+                "Provider": "Underdog",
+                "Kind": kind,
+                "Player Candidate": nm,
+                "Line": float(line),
+                "Market": market or ("Batter Fantasy Score" if kind == "fantasy" else "Batter RBIs"),
+                "Line Evidence": line_note,
+                "Blob": blob[:6000],
+                "URL": url,
+            })
+    log_source_request(f"Underdog Batter {kind}", "OK" if candidates else "NO_MATCH", f"{len(candidates)} candidates")
+    return candidates
+
+
+def match_underdog_batter_line(player_name, kind="rbi", min_score=0.88):
+    pname = normalize_name(player_name)
+    if not pname:
+        return None
+    candidates = fetch_underdog_batter_prop_candidates(kind)
+    best = None
+    for c in candidates:
+        cand_name = c.get("Player Candidate") or ""
+        blob = c.get("Blob") or ""
+        score = name_score(player_name, cand_name) if cand_name else 0.0
+        # Strong fallback: full normalized name in object blob.
+        if pname and pname in normalize_name(blob):
+            score = max(score, 0.94)
+        if score < min_score:
+            continue
+        row = dict(c)
+        row["Match Score"] = round(float(score), 3)
+        row["Matched Name"] = cand_name or player_name
+        if best is None or row["Match Score"] > best["Match Score"]:
+            best = row
+    return best
+
+
+def batter_live_line_for_row(row, kind="rbi", default_line=None, use_underdog=True):
+    if use_underdog:
+        m = match_underdog_batter_line(row.get("batter"), kind=kind)
+        if m and safe_float(m.get("Line")) is not None:
+            return safe_float(m.get("Line")), "Underdog", m
+    if default_line is not None:
+        return safe_float(default_line), "Manual Default", None
+    return None, "NO LINE", None
+
 def batter_distribution(proj, kind="rbi"):
     proj = safe_float(proj, 0) or 0
     if kind == "rbi":
@@ -7368,7 +7548,7 @@ def batter_decision(proj, line, kind="rbi"):
         tier = "PASS"
     return decision, side, round(gap, 2), round(confidence, 1), tier
 
-def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5):
+def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5, use_underdog=True):
     base = build_expected_batter_board(board, dates)
     out = []
     for r in base:
@@ -7376,8 +7556,9 @@ def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5):
             proj, src = project_batter_rbi(r)
         else:
             proj, src = project_batter_fantasy_score(r)
+        live_line, line_source, ud_match = batter_live_line_for_row(r, kind=kind, default_line=default_line, use_underdog=use_underdog)
         floor, median, ceiling, vol = batter_distribution(proj, kind)
-        decision, side, gap, conf, tier = batter_decision(proj, default_line, kind)
+        decision, side, gap, conf, tier = batter_decision(proj, live_line, kind)
         out.append({
             "Batter": r.get("batter"),
             "Team": r.get("team"),
@@ -7389,7 +7570,8 @@ def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5):
             "Median": median,
             "Ceiling": ceiling,
             "Volatility": vol,
-            "Line": default_line,
+            "Line": live_line,
+            "Line Source": line_source,
             "Decision": decision,
             "Model Lean": side,
             "Edge Gap": gap,
@@ -7402,6 +7584,9 @@ def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5):
             "OBP": r.get("OBP"),
             "SLG": r.get("SLG"),
             "Source": src,
+            "UD Matched Name": (ud_match or {}).get("Matched Name"),
+            "UD Market": (ud_match or {}).get("Market"),
+            "UD Match Score": (ud_match or {}).get("Match Score"),
         })
     df = pd.DataFrame(out)
     if not df.empty:
@@ -7411,30 +7596,32 @@ def build_batter_prop_table(board, dates, kind="rbi", default_line=0.5):
 
 def render_batter_rbi_tab(board, dates):
     st.markdown('<div class="section-title-pro">Batter RBIs / Run Production Model</div>', unsafe_allow_html=True)
-    st.caption("Separate test tab. Does not change K PROJ. Uses posted lineup when available; otherwise active-roster fallback. Default RBI line is adjustable.")
-    default_line = st.number_input("Default RBI line", min_value=0.5, max_value=3.5, value=0.5, step=0.5, key="batter_rbi_line")
-    df = build_batter_prop_table(board, dates, kind="rbi", default_line=default_line)
+    st.caption("Auto-pulls live Underdog RBI lines when available. Manual default is only fallback for missing lines. Does not change K PROJ.")
+    use_ud = st.toggle("Use live Underdog RBI lines", value=True, key="batter_rbi_use_ud")
+    default_line = st.number_input("Fallback RBI line if no Underdog line", min_value=0.5, max_value=3.5, value=0.5, step=0.5, key="batter_rbi_line")
+    df = build_batter_prop_table(board, dates, kind="rbi", default_line=default_line, use_underdog=use_ud)
     if df.empty:
         st.info("Refresh the board first or select a date with MLB games.")
         return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batter Rows", len(df))
-    c2.metric("True Lineups", int((df["Lineup"] == "TRUE LINEUP").sum()))
+    c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
     c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 def render_batter_fantasy_tab(board, dates):
     st.markdown('<div class="section-title-pro">Batter Fantasy Score Model</div>', unsafe_allow_html=True)
-    st.caption("Separate test tab. Fantasy projection includes hits/total bases, RBIs, runs, walks/HBP, and steals. Default fantasy line is adjustable.")
-    default_line = st.number_input("Default fantasy score line", min_value=2.5, max_value=25.5, value=7.5, step=0.5, key="batter_fs_line")
-    df = build_batter_prop_table(board, dates, kind="fantasy", default_line=default_line)
+    st.caption("Auto-pulls live Underdog fantasy score lines when available. Manual default is only fallback. Projection includes hits/total bases, RBIs, runs, walks/HBP, and steals.")
+    use_ud = st.toggle("Use live Underdog Fantasy lines", value=True, key="batter_fs_use_ud")
+    default_line = st.number_input("Fallback fantasy score line if no Underdog line", min_value=2.5, max_value=25.5, value=7.5, step=0.5, key="batter_fs_line")
+    df = build_batter_prop_table(board, dates, kind="fantasy", default_line=default_line, use_underdog=use_ud)
     if df.empty:
         st.info("Refresh the board first or select a date with MLB games.")
         return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Batter Rows", len(df))
-    c2.metric("True Lineups", int((df["Lineup"] == "TRUE LINEUP").sum()))
+    c2.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if "Line Source" in df.columns else 0)
     c3.metric("Over/Lean", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()))
     c4.metric("A/B Tier", int(df["Tier"].isin(["A", "B"]).sum()))
     st.dataframe(df, use_container_width=True, hide_index=True)
