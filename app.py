@@ -522,7 +522,13 @@ def render_terminal_hero():
     """, unsafe_allow_html=True)
 
 def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="PROP"):
-    """Unified clean card renderer for all tabs: K, Outs, ER, Walks, Pitcher Fantasy, RBI."""
+    """Render compact prop cards safely.
+
+    Fixes:
+    - Uses prop-specific Projection first, not K PROJ.
+    - Produces non-indented HTML so Streamlit does not show raw HTML as a code block.
+    - Re-sanity-checks card direction from Projection vs Line for auxiliary prop tabs.
+    """
     try:
         if df is None or len(df) == 0:
             return
@@ -534,49 +540,35 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
             dfx = dfx.sort_values(["_tier_sort"], ascending=True)
         elif "Confidence %" in dfx.columns:
             dfx = dfx.sort_values("Confidence %", ascending=False)
-        dfx = dfx.head(int(clamp(max_cards, 4, 12)))
+        dfx = dfx.head(int(clamp(max_cards, 4, 20)))
 
+        safe_title = html.escape(str(title))
         st.markdown(
-            f'<div class="section-head"><div><div class="section-title-new">{html.escape(str(title))}</div>'
-            f'<div class="section-note">Unified player-card view. Full table remains below.</div></div></div>',
+            f'<div class="section-head"><div><div class="section-title-new">{safe_title}</div>'
+            f'<div class="section-note">Card view shows strongest visible rows first. Full table remains below.</div></div></div>',
             unsafe_allow_html=True
         )
-
-        def pct(v):
-            x = safe_float(v, None)
-            if x is None:
-                return "—"
-            return f"{x:.1f}%"
 
         parts = ['<div class="board-grid">']
 
         for _, row in dfx.iterrows():
             player = _first_existing(row, ["Pitcher", "Batter", "Player", "pitcher", "batter", "player"], "Unknown")
             matchup = _first_existing(row, ["Matchup", "matchup", "Team", "team"], "")
+
+            # IMPORTANT: for non-K prop tabs, use prop Projection before K PROJ.
             proj = _first_existing(row, ["Projection", "projection", "Proj", "K PROJ"], None)
             line = _first_existing(row, ["Line", "UD/Line", "line", "active_line"], None)
             pick = _first_existing(row, ["Pick", "Decision", "decision", "bet_action", "Main Engine Action"], "—")
             conf = _first_existing(row, ["Confidence %", "Hit Rate %", "fair_probability"], None)
-            tier = _first_existing(row, ["Tier", "tier", "action_tier"], "—")
+            tier = _first_existing(row, ["Tier", "tier", "action_tier"], "")
             edge = _first_existing(row, ["Edge Gap", "edge_ks", "Lean Gap", "Model Gap"], None)
             source = _first_existing(row, ["Line Source", "line_source", "Source"], "Underdog")
 
-            floor = _first_existing(row, ["Floor", "floor"], None)
-            median = _first_existing(row, ["Median", "median"], proj)
-            ceiling = _first_existing(row, ["Ceiling", "ceiling"], None)
-
-            whiff = _first_existing(row, ["Putaway/Whiff", "putaway_whiff", "Whiff %", "whiff"], None)
-            pitcher_k = _first_existing(row, ["Pitcher K%", "pitcher_k", "K%", "Pitcher K"], None)
-            opp_k = _first_existing(row, ["Opp K%", "opp_k", "Opponent K%"], None)
-            expected_bf = _first_existing(row, ["Expected BF", "Exp BF", "expected_bf"], None)
-            lineup = _first_existing(row, ["Lineup", "lineup_status"], "")
-            upside = _first_existing(row, ["K Upside", "elite_upside_score", "Upside", "Role Score"], None)
-            last10 = _first_existing(row, ["Last 10", "last10", "recent_ks", "Hit Rate %"], None)
-
             prop_upper = str(prop_label).upper()
-            proj_num = sanitize_projection_value(proj, 0.0, 80.0) if "sanitize_projection_value" in globals() else safe_float(proj, None)
+            proj_num = sanitize_projection_value(proj, 0.0, 40.0)
             line_num = safe_float(line, None)
 
+            # Card-level direction sanity for auxiliary props.
             if proj_num is not None and line_num is not None and not any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
                 side_fix = "OVER" if proj_num > line_num else "UNDER"
                 gap_fix = abs(proj_num - line_num)
@@ -592,68 +584,64 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
                 edge = round(gap_fix, 2)
 
             pick_s = str(pick)
-            side_word = "OVER" if "OVER" in pick_s.upper() else "UNDER" if "UNDER" in pick_s.upper() else "PLAY"
-            pick_cls = "under" if side_word == "UNDER" else "warn" if "LEAN" in pick_s.upper() else "pass" if "PASS" in pick_s.upper() else "over"
-            card_cls = "under" if side_word == "UNDER" else "over"
-            if "PASS" in pick_s.upper():
-                card_cls = "pass"
+            tier_s = str(tier)
+
+            card_class = ""
+            if "PASS" in pick_s.upper() or tier_s.upper() == "PASS" or "NO LINE" in pick_s.upper():
+                card_class = "pass"
+            elif "LEAN" in pick_s.upper() or tier_s.upper() == "C":
+                card_class = "warn"
+            elif "LOSS" in pick_s.upper():
+                card_class = "bad"
+
+            try:
+                edge_float = abs(float(edge)) if edge not in [None, ""] else 0
+            except Exception:
+                edge_float = 0
+            bar_width = max(6, min(100, abs(edge_float) / 3.5 * 100))
+
+            badge_class = "good"
+            if "PASS" in pick_s.upper() or "NO LINE" in pick_s.upper():
+                badge_class = ""
             elif "LEAN" in pick_s.upper():
-                card_cls = "warn"
+                badge_class = "warn"
 
-            # K tab note vs general prop note
-            if any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
-                need_note = "Needs " + str(int((safe_float(line, 0) or 0) + 0.5)) + "+"
-                edge_display = f"+{_fmt_ui(edge)} K"
-            else:
-                need_note = f"{side_word.title()} side"
-                edge_display = f"+{_fmt_ui(edge)}"
-
-            why = f"Projection {_fmt_ui(proj)} vs line {_fmt_ui(line)}. {side_word.title()} edge {_fmt_ui(edge)} with {_fmt_ui(conf,1)}% confidence."
-            if any(x in prop_upper for x in ["K PROJ", "STRIKEOUT"]):
-                why = f"{side_word.title()} signal from projection vs line, matchup profile, expected BF, and volatility gates."
+            player_h = html.escape(str(player))
+            matchup_h = html.escape(str(matchup))
+            pick_h = html.escape(str(pick_s))
+            prop_h = html.escape(str(prop_label))
+            tier_h = html.escape(str(tier_s or "—"))
+            source_h = html.escape(str(source))
 
             parts.append(
-                f'<div class="prop-card {card_cls}">'
-                f'<div class="card-top">'
-                f'<div><div class="player-title">{html.escape(str(player))}</div>'
-                f'<div class="player-sub">{html.escape(str(matchup))}</div></div>'
-                f'<span class="pick-pill {pick_cls}">{html.escape(pick_s)}</span>'
-                f'</div>'
-
+                f'<div class="prop-card {card_class}">'
+                f'<div class="card-top"><div>'
+                f'<div class="player-title">{player_h}</div>'
+                f'<div class="player-sub">{matchup_h}</div>'
+                f'</div><span class="badge {badge_class}">{pick_h}</span></div>'
                 f'<div class="badge-row">'
-                f'<span class="badge market">{html.escape(str(source))} Line</span>'
-                f'<span class="badge lineup">Lineup: {html.escape(str(lineup or "—"))}</span>'
-                f'<span class="badge prop">{html.escape(str(prop_label).replace(" Model",""))}</span>'
-                f'<span class="badge">Tier {html.escape(str(tier or "—"))}</span>'
+                f'<span class="badge good">{prop_h}</span>'
+                f'<span class="badge">Tier {tier_h}</span>'
+                f'<span class="badge">{source_h}</span>'
                 f'</div>'
-
-                f'<div class="main-stat-row">'
-                f'<div class="main-stat"><div class="main-label">Projection</div><div class="main-value green">{_fmt_ui(proj)}</div>'
-                f'<div class="main-note">Exp BF {_fmt_ui(expected_bf)}</div></div>'
-                f'<div class="main-stat"><div class="main-label">Line</div><div class="main-value">{_fmt_ui(line)}</div>'
-                f'<div class="main-note">{html.escape(need_note)}</div></div>'
-                f'<div class="main-stat"><div class="main-label">Edge</div><div class="main-value green">{html.escape(edge_display)}</div>'
-                f'<div class="main-note">{side_word.title()} signal</div></div>'
+                f'<div class="card-stats">'
+                f'<div class="stat-box"><div class="stat-label">Projection</div><div class="stat-value">{_fmt_ui(proj)}</div></div>'
+                f'<div class="stat-box"><div class="stat-label">Line</div><div class="stat-value">{_fmt_ui(line)}</div></div>'
+                f'<div class="stat-box"><div class="stat-label">Conf</div><div class="stat-value">{_fmt_ui(conf,1)}%</div></div>'
                 f'</div>'
-
-                f'<div class="mini-grid">'
-                f'<div class="mini-box"><div class="mini-label">Whiff %</div><div class="mini-value">{pct(whiff)}</div><div class="mini-sub">Putaway/stuff proxy</div></div>'
-                f'<div class="mini-box"><div class="mini-label">Pitcher K%</div><div class="mini-value">{pct(pitcher_k)}</div><div class="mini-sub">Season/recent blend</div></div>'
-                f'<div class="mini-box"><div class="mini-label">Opp K%</div><div class="mini-value">{pct(opp_k)}</div><div class="mini-sub">Lineup/team matchup</div></div>'
-                f'<div class="mini-box"><div class="mini-label">Distribution</div><div class="mini-value">F {_fmt_ui(floor)}<br>M <span style="color:#4ade80">{_fmt_ui(median)}</span><br>C {_fmt_ui(ceiling)}</div><div class="mini-sub">Floor | Median | Ceiling</div></div>'
-                f'<div class="mini-box"><div class="mini-label">Form</div><div class="mini-value">{_fmt_ui(last10)}</div><div class="mini-sub">Recent trend</div></div>'
-                f'</div>'
-
-                f'<div class="why-box"><div class="why-title">Why {side_word.title()}?</div>{html.escape(why)}</div>'
+                f'<div class="edge-bar-wrap"><div class="edge-bar" style="width:{bar_width:.0f}%"></div></div>'
+                f'<div class="card-footer"><span>Edge: {_fmt_ui(edge)}</span><span>Live board</span></div>'
                 f'</div>'
             )
 
         parts.append("</div>")
         html_out = "".join(parts)
+
+        # st.html exists in newer Streamlit; fallback to markdown.
         try:
             st.html(str(html_out))
         except Exception:
-            st.markdown(str(html_out), unsafe_allow_html=True)
+            st.markdown(html_out, unsafe_allow_html=True)
 
     except Exception as e:
         try:
@@ -661,56 +649,6 @@ def render_prop_card_board(df, title="Official Board", max_cards=8, prop_label="
         except Exception:
             pass
 
-
-
-# =========================
-# V6 UNIFIED CLEAN PROP CARDS
-# Same visual style for ALL prop tabs.
-# =========================
-V6_UNIFIED_CARD_CSS = """
-<style>
-.board-grid{display:grid!important;grid-template-columns:1fr!important;gap:22px!important;margin:14px 0 22px 0!important;}
-.prop-card{background:radial-gradient(circle at 15% 0%,rgba(59,130,246,.10),transparent 28%),linear-gradient(145deg,rgba(7,13,25,.99),rgba(3,8,18,.99))!important;border:1px solid rgba(129,140,248,.55)!important;border-radius:26px!important;padding:24px 22px!important;box-shadow:0 20px 48px rgba(0,0,0,.44)!important;overflow:hidden!important;}
-.prop-card:before{display:none!important;}
-.prop-card.over{border-left:5px solid #22c55e!important;}
-.prop-card.under{border-left:5px solid #38bdf8!important;}
-.prop-card.warn{border-left:5px solid #facc15!important;}
-.prop-card.pass{border-left:5px solid #64748b!important;opacity:.92!important;}
-.card-top{display:grid!important;grid-template-columns:1.1fr auto!important;gap:16px!important;align-items:start!important;}
-.player-title{font-size:36px!important;font-weight:950!important;color:#fff!important;line-height:1.05!important;letter-spacing:-.045em!important;}
-.player-sub{margin-top:10px!important;color:#cbd5e1!important;font-size:20px!important;font-weight:650!important;}
-.pick-pill{display:inline-flex!important;align-items:center!important;justify-content:center!important;min-width:120px!important;padding:12px 18px!important;border-radius:999px!important;font-size:20px!important;font-weight:950!important;border:1px solid rgba(34,197,94,.55)!important;background:rgba(34,197,94,.16)!important;color:#86efac!important;}
-.pick-pill.under{border-color:rgba(56,189,248,.55)!important;background:rgba(56,189,248,.14)!important;color:#7dd3fc!important;}
-.pick-pill.warn{border-color:rgba(250,204,21,.55)!important;background:rgba(250,204,21,.14)!important;color:#fde68a!important;}
-.pick-pill.pass{border-color:rgba(148,163,184,.35)!important;background:rgba(100,116,139,.16)!important;color:#cbd5e1!important;}
-.badge-row{display:flex!important;flex-wrap:wrap!important;gap:10px!important;margin-top:20px!important;}
-.badge{border-radius:13px!important;padding:10px 14px!important;font-size:16px!important;font-weight:900!important;border:1px solid rgba(148,163,184,.22)!important;color:#e5e7eb!important;background:rgba(15,23,42,.70)!important;}
-.badge.prop{color:#fecaca!important;background:rgba(239,68,68,.14)!important;border-color:rgba(239,68,68,.42)!important;}
-.badge.market{color:#ddd6fe!important;background:rgba(124,58,237,.16)!important;border-color:rgba(167,139,250,.45)!important;}
-.badge.lineup{color:#fde68a!important;background:rgba(250,204,21,.12)!important;border-color:rgba(250,204,21,.40)!important;}
-.main-stat-row{display:grid!important;grid-template-columns:1fr 1fr 1fr!important;gap:0!important;margin-top:28px!important;padding-top:22px!important;border-top:1px solid rgba(148,163,184,.24)!important;}
-.main-stat{padding:0 20px!important;border-right:1px solid rgba(148,163,184,.25)!important;text-align:center!important;}
-.main-stat:first-child{text-align:left!important;padding-left:0!important;}
-.main-stat:last-child{border-right:0!important;text-align:right!important;padding-right:0!important;}
-.main-label{color:#cbd5e1!important;font-size:16px!important;font-weight:800!important;text-transform:uppercase!important;letter-spacing:.05em!important;}
-.main-value{margin-top:10px!important;font-size:52px!important;font-weight:950!important;line-height:1!important;color:#fff!important;}
-.main-value.green{color:#4ade80!important;}
-.main-note{margin-top:8px!important;color:#cbd5e1!important;font-size:16px!important;}
-.mini-grid{display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr))!important;gap:12px!important;margin-top:26px!important;padding-top:22px!important;border-top:1px solid rgba(148,163,184,.24)!important;}
-.mini-box{min-height:138px!important;border:1px solid rgba(239,68,68,.52)!important;border-radius:16px!important;padding:15px 12px!important;text-align:center!important;background:rgba(2,6,23,.35)!important;}
-.mini-label{color:#d1d5db!important;font-size:14px!important;text-transform:uppercase!important;font-weight:900!important;letter-spacing:.05em!important;}
-.mini-value{color:#fff!important;font-size:30px!important;font-weight:950!important;margin-top:18px!important;line-height:1.05!important;}
-.mini-sub{color:#cbd5e1!important;font-size:13px!important;margin-top:14px!important;line-height:1.25!important;}
-.why-box{margin-top:22px!important;padding:16px 18px!important;border:1px solid rgba(148,163,184,.25)!important;border-left:5px solid #22c55e!important;border-radius:15px!important;background:rgba(15,23,42,.58)!important;color:#f8fafc!important;font-size:18px!important;line-height:1.45!important;}
-.why-title{color:#4ade80!important;font-size:18px!important;font-weight:950!important;margin-bottom:6px!important;}
-@media(max-width:760px){.prop-card{padding:22px 18px!important;border-radius:24px!important;}.card-top{grid-template-columns:1fr!important;}.pick-pill{width:fit-content!important;font-size:18px!important;}.player-title{font-size:34px!important;}.player-sub{font-size:19px!important;}.main-stat{padding:0 10px!important;}.main-value{font-size:44px!important;}.main-label{font-size:13px!important;}.main-note{font-size:13px!important;}.mini-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;}.mini-box{min-height:118px!important;}}
-</style>
-"""
-def apply_v6_unified_cards_css():
-    try:
-        st.markdown(V6_UNIFIED_CARD_CSS, unsafe_allow_html=True)
-    except Exception:
-        pass
 
 # =========================
 # STORAGE
@@ -7751,10 +7689,6 @@ def render_kproj_tab(board):
     c4.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if not df.empty else 0)
 
     st.subheader("Projection Board")
-    try:
-        render_prop_card_board(pd.DataFrame(board), title="K PROJ Player Cards", max_cards=8, prop_label="K PROJ")
-    except Exception:
-        pass
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.subheader("Pitcher Cards")
