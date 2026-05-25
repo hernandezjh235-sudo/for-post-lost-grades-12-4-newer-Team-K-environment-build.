@@ -8721,9 +8721,14 @@ def project_pitcher_prop(p, kind="outs"):
     rd_level = str(p.get("run_damage_risk_level") or "").upper()
 
     if kind == "outs":
-        proj = ip * 3.0
-        src = "expected BF/IP + leash"
-        return round(float(clamp(proj, 3.0, 24.0)), 2), src
+        bf = safe_float(p.get("expected_bf"), None)
+        if bf is not None and bf > 0:
+            proj = (bf / 4.25) * 3.0
+            src = "expected BF converted to outs + leash"
+        else:
+            proj = ip * 3.0
+            src = "expected IP converted to outs + leash"
+        return round(float(clamp(proj, 6.0, 23.5)), 2), src
 
     if kind == "walks":
         season_walks = (bb9 / 9.0 * ip) if bb9 is not None else 1.75
@@ -8812,6 +8817,68 @@ def pitcher_prop_decision(proj, line, kind="outs"):
 
 
 
+
+def strict_pitching_outs_projection_from_row(row):
+    """Final safety for Pitching Outs: return OUTS, not innings/ER-style projection."""
+    try:
+        # Prefer expected_bf because the K engine already builds it from leash/BF.
+        bf = safe_float(row.get("Expected BF"), None)
+        if bf is None:
+            bf = safe_float(row.get("expected_bf"), None)
+        ip_est = safe_float(row.get("IP Estimate"), None)
+        if ip_est is None:
+            ip_est = safe_float(row.get("recent_ip"), None)
+
+        if bf is not None and bf > 0:
+            # ~4.25 batters faced per inning is already used in the app.
+            outs = (bf / 4.25) * 3.0
+        elif ip_est is not None and ip_est > 0:
+            outs = ip_est * 3.0
+        else:
+            outs = 15.0
+
+        # Leash/risk caps but never collapse true starter outs to 2–5 unless opener/short role is obvious.
+        leash = str(row.get("Leash Risk") or row.get("leash_risk") or "").upper()
+        if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"]:
+            outs *= 0.96
+        return round(float(clamp(outs, 6.0, 23.5)), 2)
+    except Exception:
+        return 15.0
+
+def enforce_pitching_outs_scale_sanity(df, kind="outs"):
+    """Prevents Pitching Outs tab from showing inning/ER-scale projections."""
+    try:
+        if kind != "outs" or df is None or df.empty:
+            return df
+        rows = []
+        for _, row in df.iterrows():
+            r = row.to_dict()
+            proj = safe_float(r.get("Projection"), None)
+            line = safe_float(r.get("Line"), None)
+
+            # Outs props are normally 10.5–21.5. If projection is < 8 while line is > 10,
+            # it is almost certainly using IP/ER scale. Recalculate to actual outs.
+            if line is not None and line >= 10 and (proj is None or proj < 8):
+                new_proj = strict_pitching_outs_projection_from_row(r)
+                r["Projection"] = new_proj
+                floor, median, ceiling, vol = pitcher_prop_distribution(new_proj, "outs")
+                r["Floor"] = floor
+                r["Median"] = median
+                r["Ceiling"] = ceiling
+                r["Volatility"] = vol
+                decision, side, gap, conf, tier = pitcher_prop_decision(new_proj, line, "outs")
+                r["Decision"] = decision
+                r["Model Lean"] = side
+                r["Edge Gap"] = gap
+                r["Confidence %"] = conf
+                r["Tier"] = tier
+                r["Source"] = str(r.get("Source") or "") + " | outs-scale safety fixed"
+            rows.append(r)
+        return pd.DataFrame(rows)
+    except Exception:
+        return df
+
+
 def enforce_prop_direction_sanity(df, kind="outs"):
     """Final safety: projection above line must be OVER; below line must be UNDER.
 
@@ -8879,6 +8946,8 @@ def build_pitcher_prop_table(board, kind="outs", default_line=None, use_underdog
             "UD Match Score": (ud_match or {}).get("Match Score"),
         })
     df = pd.DataFrame(out)
+    df = enforce_prop_direction_sanity(df, kind)
+    df = enforce_pitching_outs_scale_sanity(df, kind)
     df = enforce_prop_direction_sanity(df, kind)
     if not df.empty:
         df = df.sort_values(["Tier", "Confidence %", "Projection"], ascending=[True, False, False])
