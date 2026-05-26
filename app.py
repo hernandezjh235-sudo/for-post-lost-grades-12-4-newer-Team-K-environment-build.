@@ -7146,6 +7146,7 @@ def ee_grade_row(row):
 
 
 
+
 # =========================
 # TRUE K PROJ DISPLAY SYNC HELPERS
 # Edge Engine must use the same K projection as K PROJ / UPSIDE tab.
@@ -7154,17 +7155,11 @@ def ee_grade_row(row):
 def canonical_k_projection_value(p):
     """Return the true K PROJ display value from the main board row.
 
-    Priority:
-    - explicit K PROJ/display/mean/median fields
-    - simulation mean/median fields
-    - then raw projection only if no better field exists
-
-    It intentionally avoids floor/p10/lower-bound fields.
+    It avoids floor/p10/lower-bound fields so Edge Engine cannot flip
+    OVER/UNDER using a downside/floor projection.
     """
     if not isinstance(p, dict):
         return None
-
-    # Strong display/center keys first. These are the values the K PROJ card/table should show.
     strong_keys = [
         "K PROJ", "K_PROJ", "k_proj", "kproj",
         "display_projection", "k_projection", "true_projection",
@@ -7176,13 +7171,9 @@ def canonical_k_projection_value(p):
         v = safe_float(p.get(k), None)
         if v is not None and 0 <= v <= 20:
             return v
-
-    # If raw projection exists, use it before any floor-like values.
     v = safe_float(p.get("projection"), None)
     if v is not None and 0 <= v <= 20:
         return v
-
-    # Last resort only: search non-floor projection names.
     bad_tokens = ["floor", "p10", "low", "lower", "min", "downside"]
     for k, v0 in p.items():
         lk = str(k).lower()
@@ -7204,7 +7195,6 @@ def canonical_k_floor_value(p):
     return None
 
 def canonical_k_line_value(p):
-    """Return the exact active Underdog/main K line field from the pitcher board row."""
     if not isinstance(p, dict):
         return None
     for k in ["line", "underdog_line", "UD/Line", "Line", "active_line"]:
@@ -7287,7 +7277,7 @@ def render_edge_engine_cards(df, title="Top Edge Engine Cards", max_cards=8):
         gap = _ee_fmt(_ee_get(row, ["Edge Gap"], None))
         score = _ee_fmt(_ee_get(row, ["Edge Engine Score"], None), 1)
         flags = html.escape(str(_ee_get(row, ["Edge Flags"], "—")))
-        notes = html.escape(str(_ee_get(row, ["Edge Notes"], "—")))
+        notes = html.escape(str(_ee_get(row, ["Edge Notes","Projection Sync Note"], "—")))
         side_color = "#22c55e" if side == "OVER" else "#38bdf8" if side == "UNDER" else "#94a3b8"
         st.markdown(f"""
         <div style="background:linear-gradient(145deg,#101010,#190000);border:1px solid rgba(255,70,70,.34);border-radius:22px;padding:18px;margin:14px 0;box-shadow:0 0 22px rgba(255,0,0,.13);">
@@ -7473,8 +7463,8 @@ def ge_pitcher_team_score(p):
     try:
         if not isinstance(p, dict):
             return 50.0
-        proj = safe_float(p.get("projection"), None)
-        line = ge_line_from_pitcher_row(p)
+        proj = canonical_k_projection_value(p)
+        line = canonical_k_line_value(p)
         edge = None if proj is None or line is None else proj - line
         abs_edge = abs(edge) if edge is not None else 0.0
         fair = safe_float(p.get("fair_probability"), None)
