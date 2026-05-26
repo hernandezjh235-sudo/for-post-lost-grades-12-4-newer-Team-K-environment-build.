@@ -65,6 +65,16 @@ GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
+
+ML_ODDS_DEBUG_STATE = {
+    "key_loaded": False,
+    "status": "Not requested yet",
+    "games_returned": 0,
+    "events_with_prices": 0,
+    "books_seen": [],
+    "last_error": "",
+    "last_url": "",
+}
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
@@ -7461,29 +7471,63 @@ def ml_no_vig_edge(model_prob, price):
 
 
 def ml_fetch_oddsapi_moneyline():
-    """Fetch MLB h2h moneyline odds from OddsAPI.
+    """Moneyline-only OddsAPI fetch with visible debug state.
 
-    Prioritizes DraftKings when available, then FanDuel/BetMGM/Caesars/etc.
-    This does not scrape sportsbooks directly and does not create fake odds.
+    Uses ODDS_API_KEY from Streamlit secrets/Railway env only.
+    Does not affect K props, Underdog lines, or Edge Engine props.
     """
+    global ML_ODDS_DEBUG_STATE
     try:
-        key = get_secret("ODDS_API_KEY", "")
+        key = get_secret("ODDS_API_KEY", "") or globals().get("ODDS_API_KEY", "")
+        ML_ODDS_DEBUG_STATE = {
+            "key_loaded": bool(key),
+            "status": "Starting request" if key else "Missing ODDS_API_KEY",
+            "games_returned": 0,
+            "events_with_prices": 0,
+            "books_seen": [],
+            "last_error": "",
+            "last_url": f"{ODDS_BASE}/sports/baseball_mlb/odds",
+        }
         if not key:
             return {}
+
         url = f"{ODDS_BASE}/sports/baseball_mlb/odds"
-        data = safe_get_json(
-            url,
-            params={
-                "apiKey": key,
-                "regions": "us",
-                "markets": "h2h",
-                "oddsFormat": "american",
-            },
-            timeout=14
-        )
-        out = {}
+        params = {
+            "apiKey": key,
+            "regions": "us",
+            "markets": "h2h",
+            "oddsFormat": "american",
+        }
+
+        # Direct request here instead of safe_get_json so debug can show HTTP details.
+        h = {
+            "User-Agent": "Mozilla/5.0 MLBKPropEngine/oddsapi-moneyline",
+            "Accept": "application/json,text/plain,*/*",
+        }
+        r = requests.get(url, params=params, timeout=14, headers=h)
+        if r.status_code != 200:
+            ML_ODDS_DEBUG_STATE["status"] = f"HTTP {r.status_code}"
+            ML_ODDS_DEBUG_STATE["last_error"] = str(r.text[:350])
+            log_source_request(url, f"HTTP {r.status_code}", r.text[:250])
+            return {}
+
+        try:
+            data = r.json()
+        except Exception as e:
+            ML_ODDS_DEBUG_STATE["status"] = "BAD_JSON"
+            ML_ODDS_DEBUG_STATE["last_error"] = str(e)
+            log_source_request(url, "BAD_JSON", str(e))
+            return {}
+
         if not isinstance(data, list):
-            return out
+            ML_ODDS_DEBUG_STATE["status"] = "Unexpected response"
+            ML_ODDS_DEBUG_STATE["last_error"] = str(data)[:350]
+            return {}
+
+        preferred_books = ["draftkings", "fanduel", "betmgm", "caesars", "espnbet", "betrivers", "fanatics"]
+        out = {}
+        books_seen = set()
+        events_with_prices = 0
 
         for ev in data:
             home = ev.get("home_team")
@@ -7491,12 +7535,12 @@ def ml_fetch_oddsapi_moneyline():
             if not home or not away:
                 continue
 
-            # prices_by_book[team][book_key] = price
             prices_by_book = {}
             all_prices = {}
             for b in ev.get("bookmakers") or []:
                 book_key = str(b.get("key") or "").lower()
-                book_title = str(b.get("title") or book_key)
+                if book_key:
+                    books_seen.add(book_key)
                 for m in b.get("markets") or []:
                     if m.get("key") != "h2h":
                         continue
@@ -7507,13 +7551,12 @@ def ml_fetch_oddsapi_moneyline():
                             prices_by_book.setdefault(nm, {})[book_key] = price
                             all_prices.setdefault(nm, []).append(price)
 
-            # Choose best source price: DK first, then preferred books, then average.
             chosen = {}
             chosen_source = {}
             for team, book_prices in prices_by_book.items():
                 selected_price = None
                 selected_book = None
-                for pref in PREFERRED_ML_BOOKS:
+                for pref in preferred_books:
                     if pref in book_prices:
                         selected_price = book_prices[pref]
                         selected_book = pref
@@ -7527,30 +7570,45 @@ def ml_fetch_oddsapi_moneyline():
                     chosen[team] = selected_price
                     chosen_source[team] = selected_book or "unknown"
 
-            key_tuple = (normalize_name(away), normalize_name(home))
-            out[key_tuple] = {
+            if chosen:
+                events_with_prices += 1
+
+            out[(normalize_name(away), normalize_name(home))] = {
                 "home": home,
                 "away": away,
                 "prices": chosen,
                 "sources": chosen_source,
-                "raw_prices_by_book": prices_by_book,
+                "raw_home": home,
+                "raw_away": away,
             }
+
+        ML_ODDS_DEBUG_STATE["status"] = "OK"
+        ML_ODDS_DEBUG_STATE["games_returned"] = len(data)
+        ML_ODDS_DEBUG_STATE["events_with_prices"] = events_with_prices
+        ML_ODDS_DEBUG_STATE["books_seen"] = sorted(list(books_seen))[:20]
         return out
-    except Exception:
+
+    except Exception as e:
+        try:
+            ML_ODDS_DEBUG_STATE["status"] = "REQUEST_ERROR"
+            ML_ODDS_DEBUG_STATE["last_error"] = str(e)
+        except Exception:
+            pass
         return {}
 
 
-def ml_match_odds_for_team(odds_map, team_name, matchup):
-    """Match team abbreviation/name to sportsbook odds.
 
-    Returns price and source label like DraftKings/FanDuel/market_avg.
+def ml_match_odds_for_team(odds_map, team_name, matchup):
+    """Match team abbreviation/name to OddsAPI moneyline odds.
+
+    Returns price and source label like DraftKings/FanDuel/Market Avg.
     """
     try:
         if not odds_map:
             return None, "No OddsAPI"
 
         target = ml_normalize_team_name(team_name)
-        best = (0.0, None, "No Match")
+        best = (0.0, None, "No Match", "")
 
         for _, ev in odds_map.items():
             prices = ev.get("prices") or {}
@@ -7559,9 +7617,9 @@ def ml_match_odds_for_team(odds_map, team_name, matchup):
                 score = ml_team_match_score(target, odds_team)
                 if score > best[0]:
                     book = sources.get(odds_team, "market_avg")
-                    best = (score, price, book)
+                    best = (score, price, book, odds_team)
 
-        if best[0] >= 0.82:
+        if best[0] >= 0.78:
             book_label = {
                 "draftkings": "DraftKings",
                 "fanduel": "FanDuel",
@@ -7575,9 +7633,10 @@ def ml_match_odds_for_team(odds_map, team_name, matchup):
             }.get(str(best[2]).lower(), str(best[2]))
             return best[1], book_label
 
-        return None, "No Match"
+        return None, f"No Match ({target})"
     except Exception:
         return None, "No Match"
+
 
 
 def build_moneyline_board(board):
@@ -7880,6 +7939,25 @@ def render_moneyline_cards(df, max_cards=8):
         </div>
         """, unsafe_allow_html=True)
 
+def render_moneyline_debug_panel():
+    """Visible diagnostics for why ML odds may show NO ODDS."""
+    try:
+        d = ML_ODDS_DEBUG_STATE if isinstance(ML_ODDS_DEBUG_STATE, dict) else {}
+        with st.expander("🔎 Moneyline OddsAPI Debug", expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("ODDS_API_KEY loaded", "YES" if d.get("key_loaded") else "NO")
+            c2.metric("OddsAPI status", str(d.get("status", "—")))
+            c3.metric("Games returned", int(d.get("games_returned") or 0))
+            c4.metric("Events w/ prices", int(d.get("events_with_prices") or 0))
+            books = d.get("books_seen") or []
+            st.caption("Books seen: " + (", ".join(books) if books else "None"))
+            if d.get("last_error"):
+                st.code(str(d.get("last_error"))[:1000])
+            st.caption("If key loaded is NO: set Railway/Streamlit variable exactly as ODDS_API_KEY, then redeploy.")
+    except Exception:
+        pass
+
+
 def render_moneyline_tab(board, dates=None):
     st.markdown("### 💰 Moneyline Picks")
     st.caption("Sportsbook-style matchup cards. Pulls DraftKings first when available, then other books via OddsAPI. No fake odds.")
@@ -7892,7 +7970,7 @@ def render_moneyline_tab(board, dates=None):
     c1.metric("Games/Teams", len(df))
     c2.metric("Playable", len(playable))
     c3.metric("Best ML Edge", "—" if df["ML Edge %"].dropna().empty else f"{df['ML Edge %'].dropna().max():.1f}%")
-    c4.metric("Odds Source", "DK/Books")
+    c4.metric("Odds Source", "OddsAPI")
     render_moneyline_cards(df, max_cards=8)
     st.dataframe(df.drop(columns=[], errors="ignore"), use_container_width=True, hide_index=True)
 
