@@ -76,8 +76,6 @@ UNDERDOG_URLS = [
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
-BALLDONTLIE_MLB_BASE = "https://api.balldontlie.io/mlb/v1"
-
 SPORTSBOOK_PITCHER_K_MARKETS = [
     "pitcher_strikeouts",
     "player_pitcher_strikeouts",
@@ -224,11 +222,11 @@ def get_secret(key, default=""):
         return os.getenv(key, default)
 
 
-# MONEYLINE_KEYS_ONLY_NOTE:
-# ODDS_API_KEY and BALLDONTLIE_API_KEY are used only inside the Moneyline Picks tab.
-# They do not feed K projections, Underdog prop lines, OF2, grading, or the K Edge Engine.
+
+# ODDSAPI_ONLY_MONEYLINE_NOTE:
+# ODDS_API_KEY is used only inside the Moneyline Picks tab for sportsbook h2h odds.
+# It does not feed K projections, Underdog props, Edge Engine props, grading, or learning.
 ODDS_API_KEY = get_secret("ODDS_API_KEY", "")
-BALLDONTLIE_API_KEY = get_secret("BALLDONTLIE_API_KEY", "")
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
@@ -7458,115 +7456,8 @@ def ml_no_vig_edge(model_prob, price):
 
 
 # =========================
-# MONEYLINE-ONLY BALLDONTLIE FALLBACK
-# Uses BALLDONTLIE_API_KEY only for Moneyline Picks. No prop/K logic uses this.
 # =========================
-def ml_fetch_bdl_moneyline():
-    try:
-        key = get_secret("BALLDONTLIE_API_KEY", "") or globals().get("BALLDONTLIE_API_KEY", "")
-        if not key:
-            return {}
 
-        headers = {"Authorization": key}
-        url = f"{BALLDONTLIE_MLB_BASE}/odds"
-        data = safe_get_json(url, headers=headers, timeout=14)
-        if not isinstance(data, dict):
-            return {}
-
-        rows = data.get("data") or data.get("odds") or data.get("results") or []
-        if not isinstance(rows, list):
-            return {}
-
-        out = {}
-        for obj in rows:
-            if not isinstance(obj, dict):
-                continue
-
-            vendor = str(obj.get("vendor") or obj.get("sportsbook") or obj.get("book") or "BallDontLie")
-
-            home_team = obj.get("home_team") or obj.get("home_team_name") or obj.get("home") or obj.get("home_name")
-            away_team = obj.get("away_team") or obj.get("away_team_name") or obj.get("away") or obj.get("away_name")
-
-            game = obj.get("game") or {}
-            if isinstance(game, dict):
-                home_team = home_team or game.get("home_team") or game.get("home")
-                away_team = away_team or game.get("away_team") or game.get("away")
-
-            if isinstance(home_team, dict):
-                home_team = home_team.get("full_name") or home_team.get("name") or home_team.get("abbreviation")
-            if isinstance(away_team, dict):
-                away_team = away_team.get("full_name") or away_team.get("name") or away_team.get("abbreviation")
-
-            home_price = safe_float(
-                obj.get("moneyline_home_odds")
-                or obj.get("home_moneyline")
-                or obj.get("home_ml")
-                or obj.get("moneyline_home"),
-                None
-            )
-            away_price = safe_float(
-                obj.get("moneyline_away_odds")
-                or obj.get("away_moneyline")
-                or obj.get("away_ml")
-                or obj.get("moneyline_away"),
-                None
-            )
-
-            if not home_team or not away_team:
-                continue
-            if home_price is None and away_price is None:
-                continue
-
-            prices = {}
-            sources = {}
-            if away_price is not None:
-                prices[str(away_team)] = away_price
-                sources[str(away_team)] = f"BallDontLie {vendor}"
-            if home_price is not None:
-                prices[str(home_team)] = home_price
-                sources[str(home_team)] = f"BallDontLie {vendor}"
-
-            key_tuple = (normalize_name(away_team), normalize_name(home_team))
-            out[key_tuple] = {
-                "home": home_team,
-                "away": away_team,
-                "prices": prices,
-                "sources": sources,
-                "raw": obj,
-            }
-
-        return out
-    except Exception:
-        return {}
-
-def ml_merge_odds_sources(primary, fallback):
-    try:
-        primary = primary or {}
-        fallback = fallback or {}
-        merged = dict(primary)
-        for key, ev in fallback.items():
-            if key not in merged:
-                merged[key] = ev
-                continue
-            existing = merged[key]
-            existing_prices = existing.setdefault("prices", {})
-            existing_sources = existing.setdefault("sources", {})
-            for team, price in (ev.get("prices") or {}).items():
-                matched_existing_team = None
-                for t in list(existing_prices.keys()):
-                    try:
-                        score = difflib.SequenceMatcher(None, normalize_name(t), normalize_name(team)).ratio()
-                    except Exception:
-                        score = 0
-                    if score >= 0.88:
-                        matched_existing_team = t
-                        break
-                if matched_existing_team is None:
-                    existing_prices[team] = price
-                    existing_sources[team] = (ev.get("sources") or {}).get(team, "BallDontLie")
-        return merged
-    except Exception:
-        return primary or fallback or {}
 
 
 def ml_fetch_oddsapi_moneyline():
@@ -7697,9 +7588,7 @@ def build_moneyline_board(board):
     - no fake moneyline odds
     - model probability is conservative/capped
     """
-    oddsapi_map = ml_fetch_oddsapi_moneyline()
-    bdl_map = ml_fetch_bdl_moneyline()
-    odds_map = ml_merge_odds_sources(oddsapi_map, bdl_map)
+    odds_map = ml_fetch_oddsapi_moneyline()
     rows = []
     seen = set()
 
