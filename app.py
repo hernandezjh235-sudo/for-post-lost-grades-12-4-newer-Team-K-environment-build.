@@ -7640,11 +7640,130 @@ def render_underdog_game_edge_tab(board, dates=None):
     keep = [c for c in ["Matchup","Pick","Game Edge Grade","Tier","Away Game %","Home Game %","Game Edge %","Away SP","Home SP","Away K PROJ","Home K PROJ","Away Line","Home Line","Flags","Source"] if c in df.columns]
     st.dataframe(df[keep].head(60), use_container_width=True, hide_index=True)
 
-tab_kproj, tab_edge_engine, tab_edge_analytics, tab_game_edge, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# END DAY RESULTS / TRACKING TAB
+# Reads saved official picks + graded results. Does not change projections.
+# =========================
+def _trk_safe_date(x):
+    try:
+        return str(x or "")[:10]
+    except Exception:
+        return ""
+
+def build_end_day_tracking_frames():
+    picks = load_json(PICK_LOG, [])
+    results = load_json(RESULT_LOG, [])
+
+    picks_rows = []
+    for p in picks or []:
+        if not isinstance(p, dict):
+            continue
+        picks_rows.append({
+            "Date": _trk_safe_date(p.get("date") or p.get("saved_at") or p.get("time")),
+            "Pitcher": p.get("pitcher") or p.get("player") or p.get("Player"),
+            "Matchup": p.get("matchup") or p.get("Matchup"),
+            "Projection": safe_float(p.get("projection") or p.get("K PROJ"), None),
+            "Line": safe_float(p.get("line") or p.get("UD/Line"), None),
+            "Pick": p.get("pick_side") or p.get("side") or p.get("Decision") or p.get("bet_action"),
+            "Decision": p.get("decision") or p.get("bet_action") or p.get("Main Engine Action"),
+            "Confidence %": safe_float(p.get("fair_probability") or p.get("confidence") or p.get("hit_rate"), None),
+            "Source": p.get("line_source") or p.get("source"),
+            "Snapshot": p.get("snapshot_type") or p.get("save_type") or "Before",
+            "Pick ID": p.get("pick_id") or p.get("id"),
+        })
+
+    result_rows = []
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        actual = safe_float(r.get("actual") or r.get("actual_ks") or r.get("result"), None)
+        line = safe_float(r.get("line"), None)
+        side = str(r.get("pick_side") or r.get("side") or r.get("Pick") or "").upper()
+        graded = r.get("graded_result")
+        if not graded and actual is not None and line is not None and side in ["OVER", "UNDER"]:
+            if side == "OVER":
+                graded = "WIN" if actual > line else "LOSS"
+            elif side == "UNDER":
+                graded = "WIN" if actual < line else "LOSS"
+        result_rows.append({
+            "Date": _trk_safe_date(r.get("date") or r.get("graded_at") or r.get("time")),
+            "Pitcher": r.get("pitcher") or r.get("player") or r.get("Player"),
+            "Matchup": r.get("matchup") or r.get("Matchup"),
+            "Projection": safe_float(r.get("projection") or r.get("K PROJ"), None),
+            "Line": line,
+            "Pick": side or r.get("pick_side") or r.get("side"),
+            "Actual": actual,
+            "Result": graded or ("WIN" if r.get("win") is True else "LOSS" if r.get("win") is False else None),
+            "CLV Δ": safe_float(r.get("clv_delta") or r.get("CLV Δ"), None),
+            "Edge": safe_float(r.get("abs_edge") or r.get("edge_gap") or r.get("Edge Gap"), None),
+            "Source": r.get("line_source") or r.get("source"),
+            "Pick ID": r.get("pick_id") or r.get("id"),
+        })
+
+    picks_df = pd.DataFrame(picks_rows)
+    results_df = pd.DataFrame(result_rows)
+
+    if not results_df.empty:
+        results_df = results_df.sort_values(["Date", "Pitcher"], ascending=[False, True])
+    if not picks_df.empty:
+        picks_df = picks_df.sort_values(["Date", "Pitcher"], ascending=[False, True])
+
+    return picks_df, results_df
+
+def render_end_day_tracking_tab(board=None, dates=None):
+    st.markdown("### 📌 End Day Results / Tracking")
+    st.caption("Tracks saved before-game snapshots and graded after-game results. Display only — no projection math is changed.")
+
+    picks_df, results_df = build_end_day_tracking_frames()
+
+    wins = int((results_df["Result"].astype(str).str.upper() == "WIN").sum()) if not results_df.empty and "Result" in results_df.columns else 0
+    losses = int((results_df["Result"].astype(str).str.upper() == "LOSS").sum()) if not results_df.empty and "Result" in results_df.columns else 0
+    graded = wins + losses
+    wr = round((wins / graded) * 100, 1) if graded else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Saved Picks", 0 if picks_df.empty else len(picks_df))
+    c2.metric("Graded", graded)
+    c3.metric("Record", f"{wins}-{losses}")
+    c4.metric("Win Rate", f"{wr}%")
+
+    if not results_df.empty and "Date" in results_df.columns:
+        daily = []
+        for day, g in results_df.groupby("Date", dropna=False):
+            w = int((g["Result"].astype(str).str.upper() == "WIN").sum())
+            l = int((g["Result"].astype(str).str.upper() == "LOSS").sum())
+            t = w + l
+            daily.append({
+                "Date": day,
+                "Graded": t,
+                "Wins": w,
+                "Losses": l,
+                "Win Rate %": round((w / t) * 100, 1) if t else 0,
+                "Avg CLV Δ": round(pd.to_numeric(g.get("CLV Δ"), errors="coerce").dropna().mean(), 2) if "CLV Δ" in g.columns and len(pd.to_numeric(g.get("CLV Δ"), errors="coerce").dropna()) else None,
+            })
+        daily_df = pd.DataFrame(daily).sort_values("Date", ascending=False)
+        st.subheader("Daily Summary")
+        st.dataframe(daily_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Graded Results")
+    if results_df.empty:
+        st.info("No graded results yet. After games, use the After Games / Learning tab to grade.")
+    else:
+        st.dataframe(results_df.head(200), use_container_width=True, hide_index=True)
+
+    st.subheader("Saved Before-Game Snapshots")
+    if picks_df.empty:
+        st.info("No saved official snapshots yet.")
+    else:
+        st.dataframe(picks_df.head(200), use_container_width=True, hide_index=True)
+
+tab_kproj, tab_edge_engine, tab_edge_analytics, tab_game_edge, tab_end_day, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "EDGE ENGINE",
     "EDGE ANALYTICS",
     "UNDERDOG GAME EDGE",
+    "END DAY TRACKING",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -7665,6 +7784,9 @@ with tab_edge_analytics:
 
 with tab_game_edge:
     render_underdog_game_edge_tab(board, dates)
+
+with tab_end_day:
+    render_end_day_tracking_tab(board, dates)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
