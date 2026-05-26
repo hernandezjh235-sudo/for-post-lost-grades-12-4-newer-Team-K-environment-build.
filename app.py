@@ -7066,6 +7066,11 @@ def ee_grade_row(row):
     if canonical_side_check in ["OVER", "UNDER"]:
         side = canonical_side_check
 
+    # FORCE_TRUE_DECIMAL_KPROJ_SIDE: never let Edge Engine flip away from K PROJ / UPSIDE decimal side.
+    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
+    if canonical_side_check in ["OVER", "UNDER"]:
+        side = canonical_side_check
+
     score = 50.0
     if edge is not None:
         score += min(abs(edge), 3.75) * 9.0
@@ -7147,34 +7152,50 @@ def ee_grade_row(row):
 
 
 
-# =========================
-# TRUE K PROJ DISPLAY SYNC HELPERS
-# Edge Engine must use the same K projection as K PROJ / UPSIDE tab.
-# It must NOT use floor/p10/lower-bound values to decide side.
-# =========================
-def canonical_k_projection_value(p):
-    """Return the true K PROJ display value from the main board row.
 
-    It avoids floor/p10/lower-bound fields so Edge Engine cannot flip
-    OVER/UNDER using a downside/floor projection.
-    """
+# =========================
+# TRUE DECIMAL K PROJ LOCK HELPERS
+# This locks the exact K PROJ / UPSIDE decimal projection and prevents
+# Edge Engine/Game Edge from using floor, p10, or rounded integer values.
+# =========================
+def true_decimal_kproj_from_row(p):
     if not isinstance(p, dict):
         return None
-    strong_keys = [
-        "K PROJ", "K_PROJ", "k_proj", "kproj",
-        "display_projection", "k_projection", "true_projection",
-        "mean_projection", "proj_mean", "sim_mean", "mean",
-        "median_projection", "proj_median", "sim_median", "median",
-        "main_projection", "model_projection",
-    ]
-    for k in strong_keys:
+
+    # Highest priority: locked value created after board row is built.
+    for k in ["TRUE_K_PROJ_DISPLAY", "true_k_proj_display", "_true_k_proj_display"]:
         v = safe_float(p.get(k), None)
         if v is not None and 0 <= v <= 20:
             return v
-    v = safe_float(p.get("projection"), None)
-    if v is not None and 0 <= v <= 20:
-        return v
+
+    # K card/table style fields.
+    preferred = [
+        "K PROJ", "K_PROJ", "k_proj", "kproj",
+        "display_k_proj", "display_projection",
+        "true_projection", "main_projection", "model_projection",
+        "projection",  # main board projection in this app should be decimal
+        "Median", "median", "proj_median", "sim_median",
+        "Mean", "mean", "proj_mean", "sim_mean",
+    ]
+
+    vals = []
+    for k in preferred:
+        v = safe_float(p.get(k), None)
+        if v is not None and 0 <= v <= 20:
+            vals.append((k, v))
+
+    if vals:
+        # Prefer decimal values over whole integers because K Upside display is decimal.
+        decimal_vals = [(k, v) for k, v in vals if abs(v - round(v)) > 1e-6]
+        if decimal_vals:
+            # Usually the true projection is the larger center value, not the floor.
+            # Ex: projection 7.45, floor 5.29 -> choose 7.45.
+            return max(decimal_vals, key=lambda kv: kv[1])[1]
+        return vals[0][1]
+
+    # Last resort: search non-floor projection fields.
     bad_tokens = ["floor", "p10", "low", "lower", "min", "downside"]
+    found = []
     for k, v0 in p.items():
         lk = str(k).lower()
         if any(tok in lk for tok in bad_tokens):
@@ -7182,8 +7203,26 @@ def canonical_k_projection_value(p):
         if any(tok in lk for tok in ["proj", "mean", "median"]):
             v = safe_float(v0, None)
             if v is not None and 0 <= v <= 20:
-                return v
+                found.append((k, v))
+    if found:
+        dec = [(k, v) for k, v in found if abs(v - round(v)) > 1e-6]
+        return max(dec or found, key=lambda kv: kv[1])[1]
     return None
+
+def lock_true_kproj_display_fields(board):
+    """Add TRUE_K_PROJ_DISPLAY to all board rows without changing projection math."""
+    try:
+        for p in board or []:
+            if isinstance(p, dict):
+                v = true_decimal_kproj_from_row(p)
+                if v is not None:
+                    p["TRUE_K_PROJ_DISPLAY"] = float(v)
+        return board
+    except Exception:
+        return board
+
+def canonical_k_projection_value(p):
+    return true_decimal_kproj_from_row(p)
 
 def canonical_k_floor_value(p):
     if not isinstance(p, dict):
@@ -7224,13 +7263,14 @@ def canonical_k_sync_note(p):
     if proj is None:
         return "NO TRUE K PROJ"
     if floor is not None and abs(proj - floor) >= 0.75:
-        return f"TRUE K PROJ USED ({proj:.2f}); floor ignored ({floor:.2f})"
+        return f"LOCKED TRUE K PROJ ({proj:.2f}); floor ignored ({floor:.2f})"
     if raw is not None and abs(proj - raw) >= 0.75:
-        return f"TRUE K PROJ USED ({proj:.2f}); stale/raw ignored ({raw:.2f})"
-    return "TRUE K PROJ SYNC OK"
+        return f"LOCKED TRUE K PROJ ({proj:.2f}); stale/raw ignored ({raw:.2f})"
+    return f"LOCKED TRUE K PROJ ({proj:.2f})"
 
 
 def edge_engine_build_board(board):
+    board = lock_true_kproj_display_fields(board)
     rows = []
     for p in board or []:
         fair = p.get("fair_probability")
