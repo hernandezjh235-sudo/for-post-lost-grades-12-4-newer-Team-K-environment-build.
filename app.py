@@ -7060,6 +7060,12 @@ def ee_grade_row(row):
     if canonical_side_check in ["OVER", "UNDER"]:
         side = canonical_side_check
 
+    
+    # FORCE_TRUE_KPROJ_SIDE: never let Edge Engine flip away from K PROJ / UPSIDE side.
+    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
+    if canonical_side_check in ["OVER", "UNDER"]:
+        side = canonical_side_check
+
     score = 50.0
     if edge is not None:
         score += min(abs(edge), 3.75) * 9.0
@@ -7139,24 +7145,73 @@ def ee_grade_row(row):
     }
 
 
+
 # =========================
-# CANONICAL K PROJECTION SYNC HELPERS
-# Edge Engine must use the same projection/line as K PROJ cards.
-# It should rank/filter the main projection, not recompute a separate projection.
+# TRUE K PROJ DISPLAY SYNC HELPERS
+# Edge Engine must use the same K projection as K PROJ / UPSIDE tab.
+# It must NOT use floor/p10/lower-bound values to decide side.
 # =========================
 def canonical_k_projection_value(p):
-    """Return the exact main K projection field from the pitcher board row."""
-    return safe_float(
-        p.get("projection")
-        if isinstance(p, dict) else None,
-        None
-    )
+    """Return the true K PROJ display value from the main board row.
 
-def canonical_k_line_value(p):
-    """Return the exact main K line field from the pitcher board row."""
+    Priority:
+    - explicit K PROJ/display/mean/median fields
+    - simulation mean/median fields
+    - then raw projection only if no better field exists
+
+    It intentionally avoids floor/p10/lower-bound fields.
+    """
     if not isinstance(p, dict):
         return None
-    return safe_float(p.get("line"), None) if p.get("line") is not None else safe_float(p.get("underdog_line"), None)
+
+    # Strong display/center keys first. These are the values the K PROJ card/table should show.
+    strong_keys = [
+        "K PROJ", "K_PROJ", "k_proj", "kproj",
+        "display_projection", "k_projection", "true_projection",
+        "mean_projection", "proj_mean", "sim_mean", "mean",
+        "median_projection", "proj_median", "sim_median", "median",
+        "main_projection", "model_projection",
+    ]
+    for k in strong_keys:
+        v = safe_float(p.get(k), None)
+        if v is not None and 0 <= v <= 20:
+            return v
+
+    # If raw projection exists, use it before any floor-like values.
+    v = safe_float(p.get("projection"), None)
+    if v is not None and 0 <= v <= 20:
+        return v
+
+    # Last resort only: search non-floor projection names.
+    bad_tokens = ["floor", "p10", "low", "lower", "min", "downside"]
+    for k, v0 in p.items():
+        lk = str(k).lower()
+        if any(tok in lk for tok in bad_tokens):
+            continue
+        if any(tok in lk for tok in ["proj", "mean", "median"]):
+            v = safe_float(v0, None)
+            if v is not None and 0 <= v <= 20:
+                return v
+    return None
+
+def canonical_k_floor_value(p):
+    if not isinstance(p, dict):
+        return None
+    for k in ["Floor", "floor", "p10", "P10", "low_projection", "projection_floor"]:
+        v = safe_float(p.get(k), None)
+        if v is not None:
+            return v
+    return None
+
+def canonical_k_line_value(p):
+    """Return the exact active Underdog/main K line field from the pitcher board row."""
+    if not isinstance(p, dict):
+        return None
+    for k in ["line", "underdog_line", "UD/Line", "Line", "active_line"]:
+        v = safe_float(p.get(k), None)
+        if v is not None:
+            return v
+    return None
 
 def canonical_k_side(p):
     proj = canonical_k_projection_value(p)
@@ -7172,12 +7227,17 @@ def canonical_k_edge_gap(p):
         return None
     return round(abs(proj - line), 2)
 
-def canonical_k_decision_label(p):
-    """Preserve main card direction. Soft gates can downgrade, never flip."""
-    side = canonical_k_side(p)
-    if side == "NO LINE":
-        return "🚫 AVOID — NO LINE"
-    return side
+def canonical_k_sync_note(p):
+    proj = canonical_k_projection_value(p)
+    floor = canonical_k_floor_value(p)
+    raw = safe_float(p.get("projection"), None) if isinstance(p, dict) else None
+    if proj is None:
+        return "NO TRUE K PROJ"
+    if floor is not None and abs(proj - floor) >= 0.75:
+        return f"TRUE K PROJ USED ({proj:.2f}); floor ignored ({floor:.2f})"
+    if raw is not None and abs(proj - raw) >= 0.75:
+        return f"TRUE K PROJ USED ({proj:.2f}); stale/raw ignored ({raw:.2f})"
+    return "TRUE K PROJ SYNC OK"
 
 
 def edge_engine_build_board(board):
@@ -7197,6 +7257,7 @@ def edge_engine_build_board(board):
             "Confidence %": fair_pct,
             "Edge Gap": canonical_k_edge_gap(p),
             "Canonical Side": canonical_k_side(p),
+            "Projection Sync Note": canonical_k_sync_note(p),
             "Line Source": p.get("line_source") or p.get("source") or "Underdog" if (p.get("line") or p.get("underdog_line")) is not None else "NO LINE",
             "Lineup": p.get("lineup_status"),
             "Volatility": p.get("Volatility") or p.get("volatility"),
@@ -7262,7 +7323,7 @@ def render_edge_engine_tab(board, dates=None):
     c3.metric("Clean", len(clean))
     c4.metric("Best Score", f"{safe_float(df['Edge Engine Score'].max(), 0):.1f}")
     render_edge_engine_cards(df, "Top Edge Engine Cards", max_cards=8)
-    keep = [c for c in ["Prop","Player","Matchup","Soft Decision","Edge Pick","Main K Projection","Main Line","Edge Gap","Decision","Tier","Confidence %","Edge Engine Score","Edge Grade","Edge Flags","Edge Notes"] if c in df.columns]
+    keep = [c for c in ["Prop","Player","Matchup","Soft Decision","Edge Pick","Main K Projection","Main Line","Edge Gap","Decision","Tier","Confidence %","Edge Engine Score","Edge Grade","Edge Flags","Edge Notes","Projection Sync Note"] if c in df.columns]
     st.dataframe(df[keep].head(60), use_container_width=True, hide_index=True)
 
 def render_edge_analytics_tab(board, dates=None):
