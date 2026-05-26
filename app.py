@@ -6892,9 +6892,7 @@ def soft_gate_decision(side, score=None, conf=None, flags="", edge=None):
     edge = safe_float(edge, None)
     flags_s = str(flags or "")
 
-    hard_avoid = any(x in flags_s for x in [
-        "NO LIVE LINE", "NO LINE", "NO MONEYLINE ODDS", "LINE SOURCE CHECK"
-    ])
+    hard_avoid = any(x in flags_s for x in ["NO LIVE LINE", "NO LINE", "NO MONEYLINE ODDS", "LINE SOURCE CHECK"])
 
     if hard_avoid:
         return f"🚫 AVOID — {side}", "AVOID", "No reliable market line/source"
@@ -7053,8 +7051,15 @@ def ee_grade_row(row):
     if edge is None and proj is not None and line is not None:
         edge = abs(proj - line)
 
-    side = ee_side(proj, line)
+    side = str(_ee_get(row, ["Canonical Side"], "") or ee_side(proj, line)).upper()
     real_line_ok, real_line_note = ee_real_line_status(row)
+    
+    # Safety: if the Edge Engine ever sees a side mismatch, force main K board side.
+    # This prevents cases like main card OVER but Edge table UNDER.
+    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
+    if canonical_side_check in ["OVER", "UNDER"]:
+        side = canonical_side_check
+
     score = 50.0
     if edge is not None:
         score += min(abs(edge), 3.75) * 9.0
@@ -7124,14 +7129,56 @@ def ee_grade_row(row):
         "Soft Decision": soft_decision,
         "Soft Tier": soft_tier,
         "Soft Reason": soft_reason,
-        "Edge Projection": proj,
-        "Edge Line": line,
+        "Main K Projection": proj,
+        "Main Line": line,
         "Edge Gap": None if edge is None else round(abs(edge), 2),
         "Edge Engine Score": score,
         "Edge Grade": grade,
         "Edge Flags": "Clean" if not flags else " | ".join(dict.fromkeys(flags)),
         "Edge Notes": "—" if not notes else " | ".join(dict.fromkeys(notes)),
     }
+
+
+# =========================
+# CANONICAL K PROJECTION SYNC HELPERS
+# Edge Engine must use the same projection/line as K PROJ cards.
+# It should rank/filter the main projection, not recompute a separate projection.
+# =========================
+def canonical_k_projection_value(p):
+    """Return the exact main K projection field from the pitcher board row."""
+    return safe_float(
+        p.get("projection")
+        if isinstance(p, dict) else None,
+        None
+    )
+
+def canonical_k_line_value(p):
+    """Return the exact main K line field from the pitcher board row."""
+    if not isinstance(p, dict):
+        return None
+    return safe_float(p.get("line"), None) if p.get("line") is not None else safe_float(p.get("underdog_line"), None)
+
+def canonical_k_side(p):
+    proj = canonical_k_projection_value(p)
+    line = canonical_k_line_value(p)
+    if proj is None or line is None:
+        return "NO LINE"
+    return "OVER" if proj > line else "UNDER"
+
+def canonical_k_edge_gap(p):
+    proj = canonical_k_projection_value(p)
+    line = canonical_k_line_value(p)
+    if proj is None or line is None:
+        return None
+    return round(abs(proj - line), 2)
+
+def canonical_k_decision_label(p):
+    """Preserve main card direction. Soft gates can downgrade, never flip."""
+    side = canonical_k_side(p)
+    if side == "NO LINE":
+        return "🚫 AVOID — NO LINE"
+    return side
+
 
 def edge_engine_build_board(board):
     rows = []
@@ -7143,12 +7190,13 @@ def edge_engine_build_board(board):
             "Player": p.get("pitcher"),
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
-            "Projection": p.get("projection"),
-            "Line": p.get("line") or p.get("underdog_line"),
+            "Projection": canonical_k_projection_value(p),
+            "Line": canonical_k_line_value(p),
             "Decision": p.get("bet_action") or p.get("signal") or p.get("pick_side"),
             "Tier": p.get("action_tier"),
             "Confidence %": fair_pct,
-            "Edge Gap": p.get("edge_ks"),
+            "Edge Gap": canonical_k_edge_gap(p),
+            "Canonical Side": canonical_k_side(p),
             "Line Source": p.get("line_source") or p.get("source") or "Underdog" if (p.get("line") or p.get("underdog_line")) is not None else "NO LINE",
             "Lineup": p.get("lineup_status"),
             "Volatility": p.get("Volatility") or p.get("volatility"),
@@ -7156,6 +7204,7 @@ def edge_engine_build_board(board):
             "leash_risk": p.get("leash_risk"),
         }
         r.update(ee_grade_row(r))
+        r["Projection Sync"] = "OK" if r.get("Edge Pick") in ["OVER", "UNDER", "NO LINE"] else "CHECK"
         rows.append(r)
     df = pd.DataFrame(rows)
     if not df.empty and "Edge Engine Score" in df.columns:
@@ -7172,8 +7221,8 @@ def render_edge_engine_cards(df, title="Top Edge Engine Cards", max_cards=8):
         side = html.escape(str(_ee_get(row, ["Edge Pick"], "—")))
         soft_display = html.escape(str(_ee_get(row, ["Soft Decision"], side)))
         grade = html.escape(str(_ee_get(row, ["Edge Grade"], "—")))
-        proj = _ee_fmt(_ee_get(row, ["Edge Projection", "Projection"], None))
-        line = _ee_fmt(_ee_get(row, ["Edge Line", "Line"], None))
+        proj = _ee_fmt(_ee_get(row, ["Main K Projection", "Projection"], None))
+        line = _ee_fmt(_ee_get(row, ["Main Line", "Line"], None))
         gap = _ee_fmt(_ee_get(row, ["Edge Gap"], None))
         score = _ee_fmt(_ee_get(row, ["Edge Engine Score"], None), 1)
         flags = html.escape(str(_ee_get(row, ["Edge Flags"], "—")))
@@ -7213,7 +7262,7 @@ def render_edge_engine_tab(board, dates=None):
     c3.metric("Clean", len(clean))
     c4.metric("Best Score", f"{safe_float(df['Edge Engine Score'].max(), 0):.1f}")
     render_edge_engine_cards(df, "Top Edge Engine Cards", max_cards=8)
-    keep = [c for c in ["Prop","Player","Matchup","Soft Decision","Edge Pick","Edge Projection","Edge Line","Edge Gap","Decision","Tier","Confidence %","Edge Engine Score","Edge Grade","Edge Flags","Edge Notes"] if c in df.columns]
+    keep = [c for c in ["Prop","Player","Matchup","Soft Decision","Edge Pick","Main K Projection","Main Line","Edge Gap","Decision","Tier","Confidence %","Edge Engine Score","Edge Grade","Edge Flags","Edge Notes"] if c in df.columns]
     st.dataframe(df[keep].head(60), use_container_width=True, hide_index=True)
 
 def render_edge_analytics_tab(board, dates=None):
@@ -7233,7 +7282,7 @@ def render_edge_analytics_tab(board, dates=None):
     c4.metric("Current Edges", 0 if df is None else len(df))
     if df is not None and not df.empty:
         st.dataframe(df.groupby("Edge Grade", dropna=False).size().reset_index(name="Count"), use_container_width=True, hide_index=True)
-        cols = [c for c in ["Player","Matchup","Edge Pick","Edge Projection","Edge Line","Edge Gap","Edge Engine Score","Edge Grade","Edge Flags"] if c in df.columns]
+        cols = [c for c in ["Player","Matchup","Edge Pick","Main K Projection","Main Line","Edge Gap","Edge Engine Score","Edge Grade","Edge Flags"] if c in df.columns]
         st.dataframe(df[cols].head(60), use_container_width=True, hide_index=True)
 
 EDGE_ENGINE_MOBILE_POLISH_CSS = """
@@ -7340,645 +7389,199 @@ def ml_team_match_score(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+
 # =========================
-# MONEYLINE PICKS TAB — SAFE TEAM-LEVEL LAYER
-# Separate from K Props. Does NOT change pitcher K projections, Edge Engine, OF2, grading, or learning.
-# Uses available schedule/board context + optional OddsAPI moneyline odds when configured.
+# UNDERDOG GAME EDGE TAB
+# Self-contained game/team lean built only from existing K board + Underdog lines.
+# No sportsbook moneyline odds. No fake moneylines.
 # =========================
-def ml_american_to_implied(price):
-    try:
-        price = float(price)
-        if price > 0:
-            return 100.0 / (price + 100.0)
-        return abs(price) / (abs(price) + 100.0)
-    except Exception:
+def ge_extract_game_sides(matchup):
+    s = str(matchup or "")
+    if "@" not in s:
+        return None, None
+    away, home = [x.strip() for x in s.split("@", 1)]
+    return away, home
+
+def ge_line_from_pitcher_row(p):
+    if not isinstance(p, dict):
         return None
+    return safe_float(p.get("line"), None) if p.get("line") is not None else safe_float(p.get("underdog_line"), None)
 
-def ml_model_team_score_from_pitcher(p):
-    """Team-level moneyline score from existing board context.
-
-    Safe layer only. This does not change K projections.
-    Inputs used when available:
-    - starting pitcher K projection/edge
-    - confidence/fair probability
-    - lineup status
-    - leash/volatility risk
-    - bullpen/weather/park hints if already present
-    - home/away from matchup string
-    """
+def ge_pitcher_team_score(p):
+    """Team/game score using only app's K projection + Underdog line context."""
     try:
-        proj = safe_float(p.get("projection"), 0) or 0
-        k_edge = safe_float(p.get("edge_ks"), 0) or 0
-        fair = safe_float(p.get("fair_probability"), 0.50) or 0.50
-        if fair > 1:
-            fair = fair / 100.0
-
+        if not isinstance(p, dict):
+            return 50.0
+        proj = safe_float(p.get("projection"), None)
+        line = ge_line_from_pitcher_row(p)
+        edge = None if proj is None or line is None else proj - line
+        abs_edge = abs(edge) if edge is not None else 0.0
+        fair = safe_float(p.get("fair_probability"), None)
+        if fair is not None and fair <= 1:
+            fair *= 100
+        conf = fair if fair is not None else 55.0
         score = 50.0
-
-        # Starter quality / K dominance proxy
-        score += clamp((proj - 4.5) * 2.9, -10, 17)
-        score += clamp(k_edge * 4.2, -10, 17)
-        score += clamp((fair - 0.55) * 55, -8, 14)
-
-        # Home field boost if team appears after @ in matchup
-        team = str(p.get("team") or p.get("Team") or "").upper()
-        matchup = str(p.get("matchup") or "").upper()
-        if "@" in matchup and team:
-            try:
-                away, home = [x.strip() for x in matchup.split("@", 1)]
-                if team in home:
-                    score += 3.2
-                elif team in away:
-                    score -= 1.0
-            except Exception:
-                pass
-
-        # Lineup reliability
-        lineup = str(p.get("lineup_status") or "").upper()
+        if proj is not None:
+            score += clamp((proj - 4.5) * 2.6, -10, 16)
+        if edge is not None:
+            score += clamp(edge * 4.2, -12, 18)
+        score += clamp((conf - 56) * 0.55, -8, 12)
+        side = "NO LINE" if edge is None else ("OVER" if edge > 0 else "UNDER")
+        if side == "OVER" and abs_edge >= 1.25:
+            score += 4.0
+        elif side == "UNDER" and abs_edge >= 1.0:
+            score -= 4.0
+        lineup = str(p.get("lineup_status") or p.get("Lineup") or "").upper()
         if "TRUE" in lineup or "CONFIRMED" in lineup:
-            score += 3.5
+            score += 3.0
         elif "FALLBACK" in lineup:
-            score -= 5.5
-
-        # Role/leash / volatility risk
+            score -= 3.0
         risk = str(p.get("leash_risk") or p.get("risk_label") or p.get("manager_hook_status") or "").upper()
         if any(x in risk for x in ["EXTREME", "HIGH", "STRICT", "SHORT"]):
-            score -= 7.5
+            score -= 5.5
         elif any(x in risk for x in ["MILD", "MEDIUM"]):
-            score -= 3.5
-
-        vol = safe_float(p.get("Volatility") or p.get("volatility"), None)
-        if vol is not None:
-            if vol >= 2.4:
-                score -= 5.0
-            elif vol >= 1.8:
-                score -= 2.5
-
-        # Bullpen / weather hints if present
-        bullpen = str(p.get("bullpen_status") or "").upper()
-        if any(x in bullpen for x in ["FRESH", "RESTED", "BOOST"]):
-            score += 2.5
-        elif any(x in bullpen for x in ["TIRED", "FATIGUE", "HIGH"]):
-            score -= 3.5
-
-        weather_factor = safe_float(p.get("weather_factor"), None)
-        if weather_factor is not None:
-            # very hitter-friendly run environments make favorites less stable
-            if weather_factor < 0.975 or weather_factor > 1.025:
+            score -= 2.5
+        volatility = safe_float(p.get("Volatility") or p.get("volatility"), None)
+        if volatility is not None:
+            if volatility >= 2.4:
+                score -= 3.5
+            elif volatility >= 1.8:
                 score -= 1.5
-
-        return float(clamp(score, 24, 80))
+        return float(clamp(score, 20, 82))
     except Exception:
         return 50.0
 
-def ml_score_to_probability(score):
-    """Conservative conversion of team score to win probability."""
-    try:
-        score = safe_float(score, 50) or 50
-        # logistic-ish, capped to avoid overconfident ML plays
-        prob = 1.0 / (1.0 + math.exp(-(score - 50.0) / 13.5))
-        return float(clamp(prob, 0.34, 0.70))
-    except Exception:
-        return 0.50
-
-def ml_market_value_adjustment(price, model_prob):
-    """Favorite tax / dog value adjustment for ML edges."""
-    price = safe_float(price, None)
-    model_prob = safe_float(model_prob, None)
-    if price is None or model_prob is None:
-        return 0.0, "No odds adjustment"
-    # Expensive favorites need bigger edge.
-    if price <= -180:
-        return -2.0, "Favorite tax"
-    if price <= -145:
-        return -1.0, "Mild favorite tax"
-    # Plus-money dogs with positive model edge get a small value boost.
-    if price >= 115 and model_prob >= 0.47:
-        return 1.2, "Underdog value boost"
-    return 0.0, "Neutral price"
-
-def ml_no_vig_edge(model_prob, price):
-    implied = ml_american_to_implied(price)
-    if implied is None or model_prob is None:
-        return None
-    return round((model_prob - implied) * 100, 1)
-
-
-
-# =========================
-# =========================
-
-
-
-def ml_fetch_oddsapi_moneyline():
-    """Moneyline-only OddsAPI fetch with visible debug state.
-
-    Uses ODDS_API_KEY from Streamlit secrets/Railway env only.
-    Does not affect K props, Underdog lines, or Edge Engine props.
-    """
-    global ML_ODDS_DEBUG_STATE
-    try:
-        key = get_secret("ODDS_API_KEY", "") or globals().get("ODDS_API_KEY", "")
-        ML_ODDS_DEBUG_STATE = {
-            "key_loaded": bool(key),
-            "status": "Starting request" if key else "Missing ODDS_API_KEY",
-            "games_returned": 0,
-            "events_with_prices": 0,
-            "books_seen": [],
-            "last_error": "",
-            "last_url": f"{ODDS_BASE}/sports/baseball_mlb/odds",
-        }
-        if not key:
-            return {}
-
-        url = f"{ODDS_BASE}/sports/baseball_mlb/odds"
-        params = {
-            "apiKey": key,
-            "regions": "us",
-            "markets": "h2h",
-            "oddsFormat": "american",
-        }
-
-        # Direct request here instead of safe_get_json so debug can show HTTP details.
-        h = {
-            "User-Agent": "Mozilla/5.0 MLBKPropEngine/oddsapi-moneyline",
-            "Accept": "application/json,text/plain,*/*",
-        }
-        r = requests.get(url, params=params, timeout=14, headers=h)
-        if r.status_code != 200:
-            ML_ODDS_DEBUG_STATE["status"] = f"HTTP {r.status_code}"
-            ML_ODDS_DEBUG_STATE["last_error"] = str(r.text[:350])
-            log_source_request(url, f"HTTP {r.status_code}", r.text[:250])
-            return {}
-
-        try:
-            data = r.json()
-        except Exception as e:
-            ML_ODDS_DEBUG_STATE["status"] = "BAD_JSON"
-            ML_ODDS_DEBUG_STATE["last_error"] = str(e)
-            log_source_request(url, "BAD_JSON", str(e))
-            return {}
-
-        if not isinstance(data, list):
-            ML_ODDS_DEBUG_STATE["status"] = "Unexpected response"
-            ML_ODDS_DEBUG_STATE["last_error"] = str(data)[:350]
-            return {}
-
-        preferred_books = ["draftkings", "fanduel", "betmgm", "caesars", "espnbet", "betrivers", "fanatics"]
-        out = {}
-        books_seen = set()
-        events_with_prices = 0
-
-        for ev in data:
-            home = ev.get("home_team")
-            away = ev.get("away_team")
-            if not home or not away:
-                continue
-
-            prices_by_book = {}
-            all_prices = {}
-            for b in ev.get("bookmakers") or []:
-                book_key = str(b.get("key") or "").lower()
-                if book_key:
-                    books_seen.add(book_key)
-                for m in b.get("markets") or []:
-                    if m.get("key") != "h2h":
-                        continue
-                    for o in m.get("outcomes") or []:
-                        nm = o.get("name")
-                        price = safe_float(o.get("price"), None)
-                        if nm and price is not None:
-                            prices_by_book.setdefault(nm, {})[book_key] = price
-                            all_prices.setdefault(nm, []).append(price)
-
-            chosen = {}
-            chosen_source = {}
-            for team, book_prices in prices_by_book.items():
-                selected_price = None
-                selected_book = None
-                for pref in preferred_books:
-                    if pref in book_prices:
-                        selected_price = book_prices[pref]
-                        selected_book = pref
-                        break
-                if selected_price is None:
-                    vals = all_prices.get(team) or []
-                    if vals:
-                        selected_price = round(float(sum(vals) / len(vals)))
-                        selected_book = "market_avg"
-                if selected_price is not None:
-                    chosen[team] = selected_price
-                    chosen_source[team] = selected_book or "unknown"
-
-            if chosen:
-                events_with_prices += 1
-
-            out[(normalize_name(away), normalize_name(home))] = {
-                "home": home,
-                "away": away,
-                "prices": chosen,
-                "sources": chosen_source,
-                "raw_home": home,
-                "raw_away": away,
-            }
-
-        ML_ODDS_DEBUG_STATE["status"] = "OK"
-        ML_ODDS_DEBUG_STATE["games_returned"] = len(data)
-        ML_ODDS_DEBUG_STATE["events_with_prices"] = events_with_prices
-        ML_ODDS_DEBUG_STATE["books_seen"] = sorted(list(books_seen))[:20]
-        return out
-
-    except Exception as e:
-        try:
-            ML_ODDS_DEBUG_STATE["status"] = "REQUEST_ERROR"
-            ML_ODDS_DEBUG_STATE["last_error"] = str(e)
-        except Exception:
-            pass
-        return {}
-
-
-
-def ml_match_odds_for_team(odds_map, team_name, matchup):
-    """Match team abbreviation/name to OddsAPI moneyline odds.
-
-    Returns price and source label like DraftKings/FanDuel/Market Avg.
-    """
-    try:
-        if not odds_map:
-            return None, "No OddsAPI"
-
-        target = ml_normalize_team_name(team_name)
-        best = (0.0, None, "No Match", "")
-
-        for _, ev in odds_map.items():
-            prices = ev.get("prices") or {}
-            sources = ev.get("sources") or {}
-            for odds_team, price in prices.items():
-                score = ml_team_match_score(target, odds_team)
-                if score > best[0]:
-                    book = sources.get(odds_team, "market_avg")
-                    best = (score, price, book, odds_team)
-
-        if best[0] >= 0.78:
-            book_label = {
-                "draftkings": "DraftKings",
-                "fanduel": "FanDuel",
-                "betmgm": "BetMGM",
-                "caesars": "Caesars",
-                "espnbet": "ESPN BET",
-                "betrivers": "BetRivers",
-                "pointsbetus": "PointsBet",
-                "fanatics": "Fanatics",
-                "market_avg": "Market Avg",
-            }.get(str(best[2]).lower(), str(best[2]))
-            return best[1], book_label
-
-        return None, f"No Match ({target})"
-    except Exception:
-        return None, "No Match"
-
-
-
-def build_moneyline_board(board):
-    """Builds team-level moneyline candidates from current pitcher board.
-
-    Safe team-level layer:
-    - real odds only if OddsAPI key is available
-    - no fake moneyline odds
-    - model probability is conservative/capped
-    """
-    odds_map = ml_fetch_oddsapi_moneyline()
-    rows = []
-    seen = set()
-
+def ge_build_game_edge_board(board):
+    games = {}
     for p in board or []:
-        team = p.get("team") or p.get("Team")
-        opp = p.get("opponent") or p.get("Opponent")
-        matchup = p.get("matchup") or ""
-        pitcher = p.get("pitcher") or ""
-        if not team or not matchup:
+        if not isinstance(p, dict):
             continue
-
-        key = (str(team), str(matchup))
-        if key in seen:
+        matchup = str(p.get("matchup") or "")
+        away, home = ge_extract_game_sides(matchup)
+        team = str(p.get("team") or "")
+        if not matchup or not away or not home or not team:
             continue
-        seen.add(key)
-
-        model_score = ml_model_team_score_from_pitcher(p)
-        model_prob = ml_score_to_probability(model_score)
-
-        ml_price, price_source = ml_match_odds_for_team(odds_map, team, matchup)
-        implied = ml_american_to_implied(ml_price)
-        raw_edge = None if implied is None else round((model_prob - implied) * 100, 1)
-        price_adj, price_note = ml_market_value_adjustment(ml_price, model_prob)
-        adjusted_edge = None if raw_edge is None else round(raw_edge + price_adj, 1)
-
+        rec = games.setdefault(matchup, {"Matchup": matchup, "Away": away, "Home": home, "pitchers": []})
+        rec["pitchers"].append(p)
+    rows = []
+    for matchup, g in games.items():
+        away, home = g["Away"], g["Home"]
+        pitchers = g.get("pitchers") or []
+        away_p = next((p for p in pitchers if str(p.get("team") or "").upper() == str(away).upper()), None)
+        home_p = next((p for p in pitchers if str(p.get("team") or "").upper() == str(home).upper()), None)
+        if away_p is None and pitchers:
+            away_p = pitchers[0]
+        if home_p is None and len(pitchers) > 1:
+            home_p = pitchers[1]
+        away_score = ge_pitcher_team_score(away_p)
+        home_score = ge_pitcher_team_score(home_p)
+        total = max(1e-9, away_score + home_score)
+        away_prob = clamp((away_score / total) * 100, 25, 75)
+        home_prob = 100 - away_prob
+        pick_team = away if away_prob >= home_prob else home
+        edge_gap = abs(away_prob - home_prob)
         flags = []
-        if ml_price is None:
-            flags.append("NO MONEYLINE ODDS")
-        if implied is not None and raw_edge is not None and raw_edge < 1.5:
-            flags.append("NO REAL ML EDGE")
-        if implied is not None and raw_edge is not None and abs(raw_edge) < 2.5:
-            flags.append("SMALL ML EDGE")
-
-        lineup = str(p.get("lineup_status") or "").upper()
-        if "FALLBACK" in lineup:
+        if away_p is None or home_p is None:
+            flags.append("ONE STARTER ONLY")
+        if any("FALLBACK" in str((p or {}).get("lineup_status") or "").upper() for p in [away_p, home_p]):
             flags.append("FALLBACK LINEUP")
-
-        risk = str(p.get("leash_risk") or p.get("risk_label") or p.get("manager_hook_status") or "").upper()
-        if any(x in risk for x in ["HIGH", "EXTREME", "STRICT", "SHORT"]):
-            flags.append("PITCHER/ROLE RISK")
-
-        vol = safe_float(p.get("Volatility") or p.get("volatility"), None)
-        if vol is not None and vol >= 2.3:
-            flags.append("HIGH VOLATILITY")
-
-        # ML grade: more conservative than prop picks
-        pick = "PASS"
-        grade = "🚫 PASS"
-        if adjusted_edge is not None:
-            if adjusted_edge >= 6.0 and not flags:
-                pick = team
-                grade = "🔥 ML EDGE"
-            elif adjusted_edge >= 4.0 and "NO MONEYLINE ODDS" not in flags and "PITCHER/ROLE RISK" not in flags:
-                pick = team
-                grade = "✅ ML LEAN"
-            elif adjusted_edge >= 2.5 and "NO MONEYLINE ODDS" not in flags:
-                pick = team
-                grade = "⚠️ WATCH"
-            else:
-                grade = "🚫 PASS"
-
-        # Soft-gated ML decision: keep direction even when not official.
-        ml_side = str(team)
-        soft_ml_decision, soft_ml_tier, soft_ml_reason = soft_gate_decision(
-            ml_side,
-            50 + ((adjusted_edge or 0) * 5 if adjusted_edge is not None else 0),
-            model_prob * 100 if model_prob is not None else None,
-            " | ".join(flags) if flags else "Clean",
-            adjusted_edge
-        )
-
-        # If no odds, still avoid. If odds exist but weak edge, show WATCH/SMALL instead of blind PASS.
-        if ml_price is not None and adjusted_edge is not None and pick == "PASS" and adjusted_edge >= 1.0:
-            pick = team
-            grade = soft_gate_grade_from_score(50 + adjusted_edge * 5, " | ".join(flags) if flags else "Clean")
-
-        correlation = "Neutral"
-        k_edge = safe_float(p.get("edge_ks"), None)
-        if k_edge is not None:
-            if k_edge >= 1.25 and pick != "PASS":
-                correlation = "ML + K edge aligned"
-            elif k_edge <= -0.75 and pick != "PASS":
-                correlation = "ML vs K conflict"
-
+        if any(ge_line_from_pitcher_row(p) is None for p in [away_p, home_p] if p):
+            flags.append("MISSING UNDERDOG LINE")
+        if edge_gap < 4:
+            flags.append("SMALL GAME EDGE")
+        if edge_gap >= 12 and not flags:
+            grade = f"🔥 {pick_team} GAME EDGE"
+            tier = "OFFICIAL"
+        elif edge_gap >= 8:
+            grade = f"✅ {pick_team} STRONG LEAN"
+            tier = "STRONG"
+        elif edge_gap >= 4:
+            grade = f"⚠️ {pick_team} LEAN"
+            tier = "LEAN"
+        else:
+            grade = f"👀 {pick_team} SMALL EDGE"
+            tier = "SMALL"
         rows.append({
-            "Team": team,
-            "Opponent": opp,
-            "Matchup": matchup,
-            "Pitcher": pitcher,
-            "Moneyline": ml_price if ml_price is not None else "NO ODDS",
-            "Model Win %": round(model_prob * 100, 1),
-            "Market Implied %": None if implied is None else round(implied * 100, 1),
-            "Raw ML Edge %": raw_edge,
-            "ML Edge %": adjusted_edge,
-            "ML Score": round(model_score, 1),
-            "Price Note": price_note,
-            "Correlation": correlation,
-            "Soft ML Decision": soft_ml_decision,
-            "Soft ML Tier": soft_ml_tier,
-            "Soft ML Reason": soft_ml_reason,
-            "Pick": pick,
-            "Grade": grade,
-            "Flags": "Clean" if not flags else " | ".join(flags),
-            "Source": price_source,
+            "Matchup": matchup, "Pick": pick_team, "Game Edge Grade": grade, "Tier": tier,
+            "Away": away, "Home": home, "Away Game %": round(away_prob, 1),
+            "Home Game %": round(home_prob, 1), "Game Edge %": round(edge_gap, 1),
+            "Away SP": (away_p or {}).get("pitcher", "—"), "Home SP": (home_p or {}).get("pitcher", "—"),
+            "Away K PROJ": round(safe_float((away_p or {}).get("projection"), 0) or 0, 2) if away_p else None,
+            "Home K PROJ": round(safe_float((home_p or {}).get("projection"), 0) or 0, 2) if home_p else None,
+            "Away Line": ge_line_from_pitcher_row(away_p), "Home Line": ge_line_from_pitcher_row(home_p),
+            "Flags": "Clean" if not flags else " | ".join(dict.fromkeys(flags)),
+            "Source": "Underdog K board + MLB model",
         })
-
     df = pd.DataFrame(rows)
     if not df.empty:
-        df["_sort"] = pd.to_numeric(df["ML Edge %"], errors="coerce").fillna(-999)
-        df = df.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+        df = df.sort_values("Game Edge %", ascending=False)
     return df
 
-
-def render_moneyline_cards(df, max_cards=8):
-    """Pro sportsbook-style matchup cards for Moneyline tab. UI only."""
+def render_underdog_game_edge_cards(df, max_cards=8):
     if df is None or df.empty:
         return
-
-    st.markdown("<div class='section-title-pro'>Moneyline Matchup Cards</div>", unsafe_allow_html=True)
-
+    st.markdown("<div class='section-title-pro'>Underdog Game Edge Cards</div>", unsafe_allow_html=True)
     for _, r in df.head(max_cards).iterrows():
-        team = str(r.get("Team", "Unknown"))
-        opp = str(r.get("Opponent", "Opponent") or "Opponent")
-        matchup = str(r.get("Matchup", ""))
-        pitcher = str(r.get("Pitcher", ""))
-        grade = str(r.get("Grade", "—"))
-        pick = str(r.get("Pick", "PASS"))
-        ml = str(r.get("Moneyline", "NO ODDS"))
-        model = safe_float(r.get("Model Win %"), None)
-        implied = safe_float(r.get("Market Implied %"), None)
-        edge = safe_float(r.get("ML Edge %"), None)
+        away = str(r.get("Away", "AWY")); home = str(r.get("Home", "HME"))
+        pick = str(r.get("Pick", "—")); grade = str(r.get("Game Edge Grade", "—"))
+        away_prob = safe_float(r.get("Away Game %"), 50) or 50
+        home_prob = safe_float(r.get("Home Game %"), 50) or 50
+        edge = safe_float(r.get("Game Edge %"), 0) or 0
         flags = str(r.get("Flags", "—"))
-        source = str(r.get("Source", "—"))
-        soft_ml = html.escape(str(r.get("Soft ML Decision", pick)))
-        ml_score = str(r.get("ML Score", "—"))
-        price_note = str(r.get("Price Note", "—"))
-        correlation = str(r.get("Correlation", "—"))
-
-        model_pct = model if model is not None else 0.0
-        opp_pct = max(0, 100 - model_pct) if model is not None else 0.0
-        edge_txt = "—" if edge is None else f"{edge:+.1f}%"
-        implied_txt = "—" if implied is None else f"{implied:.1f}%"
-        model_txt = "—" if model is None else f"{model:.1f}%"
-
-        # simple team abbreviations from matchup/team names
-        team_abbr = "".join([x[:1] for x in team.split()[:2]]).upper()[:3] or team[:3].upper()
-        opp_abbr = "".join([x[:1] for x in opp.split()[:2]]).upper()[:3] or opp[:3].upper()
-
-        playable = pick != "PASS" and "NO MONEYLINE ODDS" not in flags
-        card_border = "rgba(34,197,94,.45)" if playable else "rgba(148,163,184,.22)"
-        best_label = "🔥 BEST ML EDGE" if playable and edge is not None and edge >= 5 else "⚠️ WATCH ML" if playable else "🚫 PASS / NO EDGE"
-        confidence = min(99, max(50, int((model_pct or 50) + (edge or 0) * 2))) if model is not None else 0
-        bar_w = int(max(5, min(95, model_pct))) if model is not None else 50
-
-        # colors
-        left_color = "#22c55e" if playable else "#94a3b8"
-        right_color = "#ef4444"
-        edge_color = "#22c55e" if edge is not None and edge > 0 else "#facc15" if edge is not None else "#94a3b8"
-
+        away_sp = str(r.get("Away SP", "—")); home_sp = str(r.get("Home SP", "—"))
+        away_proj = r.get("Away K PROJ", "—"); home_proj = r.get("Home K PROJ", "—")
+        away_line = r.get("Away Line", "—"); home_line = r.get("Home Line", "—")
+        bar_w = int(max(5, min(95, away_prob)))
+        pick_color = "#22c55e" if str(r.get("Tier","")) in ["OFFICIAL", "STRONG"] else "#facc15"
         st.markdown(f"""
-        <div style="
-            background:
-              radial-gradient(circle at 10% 0%, rgba(34,197,94,.10), transparent 28%),
-              radial-gradient(circle at 90% 0%, rgba(239,68,68,.11), transparent 28%),
-              linear-gradient(145deg, rgba(7,12,22,.98), rgba(3,5,10,.98));
-            border:1px solid {card_border};
-            border-radius:26px;
-            padding:22px;
-            margin:16px 0;
-            box-shadow:0 18px 46px rgba(0,0,0,.38);
-            overflow:hidden;
-        ">
+        <div style="background:linear-gradient(145deg, rgba(7,12,22,.98), rgba(3,5,10,.98));border:1px solid rgba(34,197,94,.35);border-radius:26px;padding:22px;margin:16px 0;box-shadow:0 18px 46px rgba(0,0,0,.38);overflow:hidden;">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
-                <div style="color:#94a3b8;font-size:13px;font-weight:800;">
-                    {html.escape(str(source))} • Moneyline Model
-                </div>
-                <div style="
-                    padding:7px 13px;
-                    border-radius:999px;
-                    border:1px solid rgba(250,204,21,.55);
-                    color:#fde68a;
-                    background:rgba(250,204,21,.12);
-                    font-weight:950;
-                    font-size:13px;
-                ">{html.escape(str(grade))}</div>
+                <div style="color:#94a3b8;font-size:13px;font-weight:800;">Underdog K Board • Game Edge</div>
+                <div style="padding:7px 13px;border-radius:999px;border:1px solid rgba(250,204,21,.55);color:#fde68a;background:rgba(250,204,21,.12);font-weight:950;font-size:13px;">{html.escape(str(grade))}</div>
             </div>
-
-            <div style="
-                display:grid;
-                grid-template-columns:1fr 70px 1fr;
-                gap:12px;
-                align-items:center;
-                margin-top:20px;
-                text-align:center;
-            ">
-                <div>
-                    <div style="
-                        width:74px;height:74px;border-radius:22px;
-                        display:flex;align-items:center;justify-content:center;
-                        margin:0 auto 10px auto;
-                        background:rgba(34,197,94,.12);
-                        border:1px solid rgba(34,197,94,.45);
-                        color:#22c55e;
-                        font-size:32px;font-weight:950;
-                    ">{html.escape(team_abbr)}</div>
-                    <div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(team)}</div>
-                    <div style="font-size:13px;color:#cbd5e1;margin-top:6px;">SP: {html.escape(pitcher)}</div>
-                    <div style="font-size:13px;color:#94a3b8;margin-top:4px;">ML {html.escape(ml)}</div>
-                </div>
-
+            <div style="display:grid;grid-template-columns:1fr 70px 1fr;gap:12px;align-items:center;margin-top:20px;text-align:center;">
+                <div><div style="width:74px;height:74px;border-radius:22px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px auto;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.45);color:#22c55e;font-size:32px;font-weight:950;">{html.escape(away[:3])}</div><div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(away)}</div><div style="font-size:13px;color:#cbd5e1;margin-top:6px;">SP: {html.escape(away_sp)}</div><div style="font-size:13px;color:#94a3b8;margin-top:4px;">K {away_proj} vs {away_line}</div></div>
                 <div style="font-size:18px;color:#64748b;font-weight:900;">@</div>
-
-                <div>
-                    <div style="
-                        width:74px;height:74px;border-radius:22px;
-                        display:flex;align-items:center;justify-content:center;
-                        margin:0 auto 10px auto;
-                        background:rgba(239,68,68,.10);
-                        border:1px solid rgba(239,68,68,.38);
-                        color:#f87171;
-                        font-size:32px;font-weight:950;
-                    ">{html.escape(opp_abbr)}</div>
-                    <div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(opp)}</div>
-                    <div style="font-size:13px;color:#cbd5e1;margin-top:6px;">Opponent</div>
-                    <div style="font-size:13px;color:#94a3b8;margin-top:4px;">Market implied {implied_txt}</div>
-                </div>
+                <div><div style="width:74px;height:74px;border-radius:22px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px auto;background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.38);color:#f87171;font-size:32px;font-weight:950;">{html.escape(home[:3])}</div><div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(home)}</div><div style="font-size:13px;color:#cbd5e1;margin-top:6px;">SP: {html.escape(home_sp)}</div><div style="font-size:13px;color:#94a3b8;margin-top:4px;">K {home_proj} vs {home_line}</div></div>
             </div>
-
             <div style="margin-top:22px;">
-                <div style="display:flex;justify-content:space-between;color:#cbd5e1;font-size:14px;font-weight:850;margin-bottom:8px;">
-                    <span>{html.escape(team_abbr)} {model_txt}</span>
-                    <span>Win Probability</span>
-                    <span>{html.escape(opp_abbr)} {opp_pct:.1f}%</span>
-                </div>
-                <div style="height:8px;background:rgba(148,163,184,.16);border-radius:999px;overflow:hidden;">
-                    <div style="height:100%;width:{bar_w}%;background:linear-gradient(90deg,#22c55e,#ef4444);border-radius:999px;"></div>
-                </div>
+                <div style="display:flex;justify-content:space-between;color:#cbd5e1;font-size:14px;font-weight:850;margin-bottom:8px;"><span>{html.escape(away)} {away_prob:.1f}%</span><span>App Game Lean</span><span>{html.escape(home)} {home_prob:.1f}%</span></div>
+                <div style="height:8px;background:rgba(148,163,184,.16);border-radius:999px;overflow:hidden;"><div style="height:100%;width:{bar_w}%;background:linear-gradient(90deg,#22c55e,#ef4444);border-radius:999px;"></div></div>
             </div>
-
-            <div style="
-                display:grid;
-                grid-template-columns:repeat(4,minmax(0,1fr));
-                gap:10px;
-                margin-top:18px;
-            ">
-                <div class="kpi-box"><div class="kpi-label">Model Win</div><div class="kpi-value green">{model_txt}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Market</div><div class="kpi-value">{implied_txt}</div></div>
-                <div class="kpi-box"><div class="kpi-label">ML Edge</div><div class="kpi-value" style="color:{edge_color};">{edge_txt}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Confidence</div><div class="kpi-value">{confidence}%</div></div>
+            <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:18px;">
+                <div class="kpi-box"><div class="kpi-label">Pick</div><div class="kpi-value green">{html.escape(pick)}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{edge:.1f}%</div></div>
+                <div class="kpi-box"><div class="kpi-label">Away %</div><div class="kpi-value">{away_prob:.1f}%</div></div>
+                <div class="kpi-box"><div class="kpi-label">Home %</div><div class="kpi-value">{home_prob:.1f}%</div></div>
             </div>
-
-            <div style="
-                margin-top:18px;
-                background:rgba(15,23,42,.70);
-                border:1px solid rgba(34,197,94,.24);
-                border-radius:18px;
-                padding:15px 16px;
-                display:flex;
-                justify-content:space-between;
-                align-items:center;
-                gap:14px;
-                flex-wrap:wrap;
-            ">
-                <div>
-                    <div style="color:#94a3b8;font-size:12px;font-weight:900;text-transform:uppercase;">Best Play</div>
-                    <div style="font-size:24px;font-weight:950;color:{left_color};margin-top:4px;">{soft_ml}</div>
-                </div>
-                <div style="
-                    padding:10px 14px;
-                    border-radius:14px;
-                    background:rgba(34,197,94,.12);
-                    border:1px solid rgba(34,197,94,.35);
-                    color:#86efac;
-                    font-weight:950;
-                ">{html.escape(best_label)}</div>
+            <div style="margin-top:18px;background:rgba(15,23,42,.70);border:1px solid rgba(34,197,94,.24);border-radius:18px;padding:15px 16px;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;">
+                <div><div style="color:#94a3b8;font-size:12px;font-weight:900;text-transform:uppercase;">Best Team Lean</div><div style="font-size:24px;font-weight:950;color:{pick_color};margin-top:4px;">{html.escape(str(grade))}</div></div>
+                <div style="padding:10px 14px;border-radius:14px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:#86efac;font-weight:950;">No sportsbook odds used</div>
             </div>
-
-            <div style="
-                border-left:5px solid {left_color};
-                background:rgba(2,6,23,.58);
-                border-radius:14px;
-                padding:13px 15px;
-                margin-top:14px;
-                color:#e5e7eb;
-                font-size:14px;
-            ">
-                <b>Flags:</b> {html.escape(flags)}<br><b>ML Score:</b> {html.escape(ml_score)} • <b>Price:</b> {html.escape(price_note)}<br><b>Correlation:</b> {html.escape(correlation)}
-            </div>
+            <div style="border-left:5px solid #22c55e;background:rgba(2,6,23,.58);border-radius:14px;padding:13px 15px;margin-top:14px;color:#e5e7eb;font-size:14px;"><b>Flags:</b> {html.escape(flags)}<br><b>Source:</b> Underdog K board + MLB model only</div>
         </div>
         """, unsafe_allow_html=True)
 
-def render_moneyline_debug_panel():
-    """Visible diagnostics for why ML odds may show NO ODDS."""
-    try:
-        d = ML_ODDS_DEBUG_STATE if isinstance(ML_ODDS_DEBUG_STATE, dict) else {}
-        with st.expander("🔎 Moneyline OddsAPI Debug", expanded=False):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("ODDS_API_KEY loaded", "YES" if d.get("key_loaded") else "NO")
-            c2.metric("OddsAPI status", str(d.get("status", "—")))
-            c3.metric("Games returned", int(d.get("games_returned") or 0))
-            c4.metric("Events w/ prices", int(d.get("events_with_prices") or 0))
-            books = d.get("books_seen") or []
-            st.caption("Books seen: " + (", ".join(books) if books else "None"))
-            if d.get("last_error"):
-                st.code(str(d.get("last_error"))[:1000])
-            st.caption("If key loaded is NO: set Railway/Streamlit variable exactly as ODDS_API_KEY, then redeploy.")
-    except Exception:
-        pass
-
-
-def render_moneyline_tab(board, dates=None):
-    st.markdown("### 💰 Moneyline Picks")
-    st.caption("Sportsbook-style matchup cards. Pulls DraftKings first when available, then other books via OddsAPI. No fake odds.")
-    df = build_moneyline_board(board)
+def render_underdog_game_edge_tab(board, dates=None):
+    st.markdown("### 🧭 Underdog Game Edge")
+    st.caption("Self-contained team/game lean built from your K projections + Underdog lines only. No sportsbook moneyline odds. No fake odds.")
+    df = ge_build_game_edge_board(board)
     if df is None or df.empty:
-        st.info("No moneyline board yet. Refresh live board first.")
+        st.info("No game edge board yet. Refresh the live board first.")
         return
-    playable = df[(df["Pick"] != "PASS") & (df["Flags"] == "Clean")]
+    strong = df[df["Tier"].isin(["OFFICIAL", "STRONG"])]
+    clean = df[df["Flags"].astype(str).eq("Clean")]
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Games/Teams", len(df))
-    c2.metric("Playable", len(playable))
-    c3.metric("Best ML Edge", "—" if df["ML Edge %"].dropna().empty else f"{df['ML Edge %'].dropna().max():.1f}%")
-    c4.metric("Odds Source", "OddsAPI")
-    render_moneyline_cards(df, max_cards=8)
-    st.dataframe(df.drop(columns=[], errors="ignore"), use_container_width=True, hide_index=True)
+    c1.metric("Games", len(df)); c2.metric("Official/Strong", len(strong)); c3.metric("Clean", len(clean)); c4.metric("Best Edge", f"{safe_float(df['Game Edge %'].max(), 0):.1f}%")
+    render_underdog_game_edge_cards(df, max_cards=8)
+    keep = [c for c in ["Matchup","Pick","Game Edge Grade","Tier","Away Game %","Home Game %","Game Edge %","Away SP","Home SP","Away K PROJ","Home K PROJ","Away Line","Home Line","Flags","Source"] if c in df.columns]
+    st.dataframe(df[keep].head(60), use_container_width=True, hide_index=True)
 
-tab_kproj, tab_edge_engine, tab_edge_analytics, tab_moneyline, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_edge_engine, tab_edge_analytics, tab_game_edge, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "EDGE ENGINE",
     "EDGE ANALYTICS",
-    "MONEYLINE PICKS",
+    "UNDERDOG GAME EDGE",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -7997,8 +7600,8 @@ with tab_edge_engine:
 with tab_edge_analytics:
     render_edge_analytics_tab(board, dates)
 
-with tab_moneyline:
-    render_moneyline_tab(board, dates)
+with tab_game_edge:
+    render_underdog_game_edge_tab(board, dates)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
