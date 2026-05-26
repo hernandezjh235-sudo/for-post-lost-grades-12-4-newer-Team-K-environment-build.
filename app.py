@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 + EDGE ENGINE 9.5 SAFE FILTER — CORE K PROJ UNTOUCHED"
+APP_VERSION = "v11.17 + EDGE ENGINE 9.5 SAFE FILTER — CORE K PROJ UNTOUCHED + TRUE LEASH BF"
 
 
 # Manual/fake line entry disabled. Use real market lines only.
@@ -1235,6 +1235,150 @@ def build_leash_model(recent_rows):
         "pitch_count_trend_note": pitch_trend_note,
         "source": f"{source}; {pitch_trend_note}"
     }
+
+
+# =========================
+# TRUE LEASH + BATTERS FACED ENGINE
+# Safe overlay: adjusts expected BF/opportunity only, not raw K skill.
+# =========================
+TRUE_LEASH_BF_ENGINE_ENABLED = True
+TRUE_LEASH_BF_MIN = 14.0
+TRUE_LEASH_BF_MAX = 31.5
+TRUE_LEASH_BF_MAX_CUT = 0.88
+TRUE_LEASH_BF_MAX_BOOST = 1.055
+
+def _tlbf_avg(vals):
+    vals = [safe_float(v) for v in (vals or []) if safe_float(v) is not None]
+    return float(np.mean(vals)) if vals else None
+
+def _tlbf_recent_col(recent_rows, key, n=5):
+    out = []
+    for r in (recent_rows or [])[:n]:
+        if isinstance(r, dict):
+            v = safe_float(r.get(key))
+            if v is not None:
+                out.append(v)
+    return out
+
+def true_leash_bf_engine(base_expected_bf, recent_rows=None, row=None):
+    """Improves expected batters faced without changing raw K skill."""
+    if not TRUE_LEASH_BF_ENGINE_ENABLED:
+        return base_expected_bf, {"factor": 1.0, "label": "OFF", "score": 50, "note": "True leash off", "flags": []}
+
+    bf0 = safe_float(base_expected_bf, DEFAULT_BF) or DEFAULT_BF
+    rows = recent_rows or []
+    row = row or {}
+
+    avg_bf_l3 = _tlbf_avg(_tlbf_recent_col(rows, "BF", 3))
+    avg_bf_l5 = _tlbf_avg(_tlbf_recent_col(rows, "BF", 5))
+    avg_ip_l3 = _tlbf_avg(_tlbf_recent_col(rows, "IP_float", 3))
+    avg_pitches_l3 = _tlbf_avg(_tlbf_recent_col(rows, "Pitches", 3))
+    avg_bb_l3 = _tlbf_avg(_tlbf_recent_col(rows, "BB", 3))
+    avg_er_l3 = _tlbf_avg(_tlbf_recent_col(rows, "ER", 3))
+
+    flags = []
+    factor = 1.0
+    score = 60.0
+
+    recent_anchor = None
+    if avg_bf_l3 and avg_bf_l5:
+        recent_anchor = (avg_bf_l3 * 0.62) + (avg_bf_l5 * 0.38)
+    elif avg_bf_l3:
+        recent_anchor = avg_bf_l3
+    elif avg_bf_l5:
+        recent_anchor = avg_bf_l5
+
+    if recent_anchor is not None:
+        anchor_gap = recent_anchor - bf0
+        bf0 = bf0 + clamp(anchor_gap * 0.35, -2.4, 1.8)
+        score += clamp(anchor_gap * 1.8, -10, 8)
+        flags.append(f"RECENT_BF_ANCHOR {recent_anchor:.1f}")
+
+    ppb_l3 = None
+    if avg_pitches_l3 and avg_bf_l3 and avg_bf_l3 > 0:
+        ppb_l3 = avg_pitches_l3 / avg_bf_l3
+
+    if ppb_l3 is not None:
+        if ppb_l3 >= 4.45:
+            factor *= 0.925; score -= 16; flags.append("EXTREME_PITCH_STRESS")
+        elif ppb_l3 >= 4.25:
+            factor *= 0.955; score -= 10; flags.append("HIGH_PITCH_STRESS")
+        elif ppb_l3 >= 4.05:
+            factor *= 0.975; score -= 5; flags.append("MILD_PITCH_STRESS")
+        elif ppb_l3 <= 3.55 and avg_pitches_l3 and avg_pitches_l3 >= 86:
+            factor *= 1.025; score += 5; flags.append("EFFICIENT_VOLUME")
+
+    if avg_ip_l3 is not None:
+        if avg_ip_l3 < 4.4:
+            factor *= 0.91; score -= 18; flags.append("SHORT_L3_IP")
+        elif avg_ip_l3 < 5.0:
+            factor *= 0.955; score -= 10; flags.append("LOW_L3_IP")
+        elif avg_ip_l3 >= 6.2:
+            factor *= 1.025; score += 6; flags.append("STRONG_L3_IP")
+
+    if avg_bb_l3 is not None:
+        if avg_bb_l3 >= 3.0:
+            factor *= 0.945; score -= 10; flags.append("WALK_STRESS")
+        elif avg_bb_l3 >= 2.2:
+            factor *= 0.975; score -= 5; flags.append("MILD_WALK_STRESS")
+
+    if avg_er_l3 is not None:
+        if avg_er_l3 >= 4.0:
+            factor *= 0.955; score -= 8; flags.append("RUN_DAMAGE_STRESS")
+        elif avg_er_l3 <= 1.5:
+            factor *= 1.010; score += 3; flags.append("CLEAN_RECENT_RUNS")
+
+    manager_hook = str(row.get("manager_hook_status") or row.get("manager_hook") or "").upper()
+    leash_risk = str(row.get("leash_risk") or row.get("risk_label") or "").upper()
+    if "STRICT" in manager_hook or "STRICT" in leash_risk:
+        factor *= 0.94; score -= 12; flags.append("STRICT_MANAGER_HOOK")
+    elif "SHORT" in manager_hook or "SHORT" in leash_risk:
+        factor *= 0.955; score -= 9; flags.append("SHORT_LEASH")
+
+    starter_score = safe_float(row.get("starter_score") or row.get("Starter Score"), None)
+    role_score = safe_float(row.get("role_score") or row.get("Role Score"), None)
+    if starter_score is not None:
+        if starter_score >= 78:
+            factor *= 1.012; score += 4; flags.append("STARTER_CONFIRMED")
+        elif starter_score < 55:
+            factor *= 0.94; score -= 12; flags.append("STARTER_ROLE_RISK")
+    if role_score is not None and role_score < 50:
+        factor *= 0.96; score -= 7; flags.append("ROLE_RISK")
+
+    bullpen_status = str(row.get("bullpen_status") or "").upper()
+    if any(x in bullpen_status for x in ["TIRED", "HEAVY", "TAXED", "FATIGUED"]):
+        factor *= 1.018; score += 4; flags.append("BULLPEN_NEEDS_LENGTH")
+    elif any(x in bullpen_status for x in ["FRESH", "RESTED"]):
+        factor *= 0.992; flags.append("FRESH_BULLPEN_SHORTER_HOOK")
+
+    pitcher_role = str(row.get("pitcher_role") or row.get("role") or "").upper()
+    if any(x in pitcher_role for x in ["OPENER", "BULK", "FOLLOWER"]):
+        factor *= 0.88; score -= 22; flags.append("OPENER_BULK_ROLE_RISK")
+
+    factor = clamp(factor, TRUE_LEASH_BF_MAX_CUT, TRUE_LEASH_BF_MAX_BOOST)
+    new_bf = float(clamp(bf0 * factor, TRUE_LEASH_BF_MIN, TRUE_LEASH_BF_MAX))
+    score = int(clamp(round(score), 0, 100))
+
+    if score >= 78:
+        label = "STRONG_LEASH"
+    elif score >= 62:
+        label = "STABLE_LEASH"
+    elif score >= 45:
+        label = "FRAGILE_LEASH"
+    else:
+        label = "DANGER_LEASH"
+
+    return new_bf, {
+        "factor": round(float(factor), 3),
+        "label": label,
+        "score": score,
+        "note": f"{label}: BF {safe_float(base_expected_bf, DEFAULT_BF):.1f} -> {new_bf:.1f} | factor {factor:.3f}",
+        "flags": flags[:8],
+        "avg_bf_l3": None if avg_bf_l3 is None else round(avg_bf_l3, 2),
+        "avg_ip_l3": None if avg_ip_l3 is None else round(avg_ip_l3, 2),
+        "ppb_l3": None if ppb_l3 is None else round(ppb_l3, 2),
+    }
+
 
 def apply_managerial_hook_v11_9(expected_bf, recent_rows):
     """v11.9: conservative starter-volume haircut for repeated early hooks.
@@ -4508,6 +4652,15 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     # game-script risk, before bullpen factor, so final BF still respects bullpen context.
     try:
         hooked_bf, manager_hook_status, manager_hook_note = apply_managerial_hook_v11_9(leash.get("expected_bf"), recent_rows)
+        # TRUE LEASH + BF ENGINE: volume/opportunity overlay only.
+        expected_bf, true_leash_info = true_leash_bf_engine(expected_bf, recent_rows, row if "row" in locals() else locals().get("p", {}))
+        if isinstance(locals().get("row", None), dict):
+            row["true_leash_bf"] = round(float(expected_bf), 2)
+            row["true_leash_label"] = true_leash_info.get("label")
+            row["true_leash_score"] = true_leash_info.get("score")
+            row["true_leash_factor"] = true_leash_info.get("factor")
+            row["true_leash_note"] = true_leash_info.get("note")
+            row["true_leash_flags"] = " | ".join(true_leash_info.get("flags") or [])
         leash["expected_bf"] = hooked_bf
         leash["manager_hook_status"] = manager_hook_status
         leash["manager_hook_note"] = manager_hook_note
