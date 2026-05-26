@@ -7071,6 +7071,11 @@ def ee_grade_row(row):
     if canonical_side_check in ["OVER", "UNDER"]:
         side = canonical_side_check
 
+    # KPROJ_DECISION_FORCE_SIDE: exact same side as K PROJ / UPSIDE.
+    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
+    if canonical_side_check in ["OVER", "UNDER", "NO LINE"]:
+        side = canonical_side_check
+
     score = 50.0
     if edge is not None:
         score += min(abs(edge), 3.75) * 9.0
@@ -7153,154 +7158,120 @@ def ee_grade_row(row):
 
 
 
+
 # =========================
-# TRUE DECIMAL K PROJ LOCK HELPERS
-# This locks the exact K PROJ / UPSIDE decimal projection and prevents
-# Edge Engine/Game Edge from using floor, p10, or rounded integer values.
+# KPROJ DECISION SYNC HELPERS
+# Every display layer must use kproj_decision(p), the same source as K PROJ / UPSIDE.
 # =========================
-def true_decimal_kproj_from_row(p):
-    if not isinstance(p, dict):
-        return None
-
-    # Highest priority: locked value created after board row is built.
-    for k in ["TRUE_K_PROJ_DISPLAY", "true_k_proj_display", "_true_k_proj_display"]:
-        v = safe_float(p.get(k), None)
-        if v is not None and 0 <= v <= 20:
-            return v
-
-    # K card/table style fields.
-    preferred = [
-        "K PROJ", "K_PROJ", "k_proj", "kproj",
-        "display_k_proj", "display_projection",
-        "true_projection", "main_projection", "model_projection",
-        "projection",  # main board projection in this app should be decimal
-        "Median", "median", "proj_median", "sim_median",
-        "Mean", "mean", "proj_mean", "sim_mean",
-    ]
-
-    vals = []
-    for k in preferred:
-        v = safe_float(p.get(k), None)
-        if v is not None and 0 <= v <= 20:
-            vals.append((k, v))
-
-    if vals:
-        # Prefer decimal values over whole integers because K Upside display is decimal.
-        decimal_vals = [(k, v) for k, v in vals if abs(v - round(v)) > 1e-6]
-        if decimal_vals:
-            # Usually the true projection is the larger center value, not the floor.
-            # Ex: projection 7.45, floor 5.29 -> choose 7.45.
-            return max(decimal_vals, key=lambda kv: kv[1])[1]
-        return vals[0][1]
-
-    # Last resort: search non-floor projection fields.
-    bad_tokens = ["floor", "p10", "low", "lower", "min", "downside"]
-    found = []
-    for k, v0 in p.items():
-        lk = str(k).lower()
-        if any(tok in lk for tok in bad_tokens):
-            continue
-        if any(tok in lk for tok in ["proj", "mean", "median"]):
-            v = safe_float(v0, None)
-            if v is not None and 0 <= v <= 20:
-                found.append((k, v))
-    if found:
-        dec = [(k, v) for k, v in found if abs(v - round(v)) > 1e-6]
-        return max(dec or found, key=lambda kv: kv[1])[1]
-    return None
-
-def lock_true_kproj_display_fields(board):
-    """Add TRUE_K_PROJ_DISPLAY to all board rows without changing projection math."""
+def synced_kproj_decision(p):
     try:
-        for p in board or []:
-            if isinstance(p, dict):
-                v = true_decimal_kproj_from_row(p)
-                if v is not None:
-                    p["TRUE_K_PROJ_DISPLAY"] = float(v)
-        return board
+        d = kproj_decision(p)
+        if isinstance(d, dict):
+            return d
     except Exception:
-        return board
+        pass
+    return {
+        "projection": safe_float(p.get("projection"), None) if isinstance(p, dict) else None,
+        "line": safe_float(p.get("line"), None) if isinstance(p, dict) else None,
+        "lean_side": "NO LINE",
+        "decision": "🚫 PASS",
+        "confidence": None,
+        "edge_gap": None,
+        "line_source": "NO LINE",
+    }
 
 def canonical_k_projection_value(p):
-    return true_decimal_kproj_from_row(p)
-
-def canonical_k_floor_value(p):
-    if not isinstance(p, dict):
-        return None
-    for k in ["Floor", "floor", "p10", "P10", "low_projection", "projection_floor"]:
-        v = safe_float(p.get(k), None)
-        if v is not None:
-            return v
-    return None
+    d = synced_kproj_decision(p)
+    return safe_float(d.get("projection"), None)
 
 def canonical_k_line_value(p):
-    if not isinstance(p, dict):
-        return None
-    for k in ["line", "underdog_line", "UD/Line", "Line", "active_line"]:
-        v = safe_float(p.get(k), None)
-        if v is not None:
-            return v
-    return None
+    d = synced_kproj_decision(p)
+    return safe_float(d.get("line"), None)
 
 def canonical_k_side(p):
-    proj = canonical_k_projection_value(p)
-    line = canonical_k_line_value(p)
+    d = synced_kproj_decision(p)
+    side = str(d.get("lean_side") or "").upper()
+    if side in ["OVER", "UNDER", "NO LINE"]:
+        return side
+    proj = safe_float(d.get("projection"), None)
+    line = safe_float(d.get("line"), None)
     if proj is None or line is None:
         return "NO LINE"
     return "OVER" if proj > line else "UNDER"
 
 def canonical_k_edge_gap(p):
-    proj = canonical_k_projection_value(p)
-    line = canonical_k_line_value(p)
+    d = synced_kproj_decision(p)
+    v = safe_float(d.get("edge_gap"), None)
+    if v is not None:
+        return round(abs(v), 2)
+    proj = safe_float(d.get("projection"), None)
+    line = safe_float(d.get("line"), None)
     if proj is None or line is None:
         return None
     return round(abs(proj - line), 2)
 
 def canonical_k_sync_note(p):
-    proj = canonical_k_projection_value(p)
-    floor = canonical_k_floor_value(p)
-    raw = safe_float(p.get("projection"), None) if isinstance(p, dict) else None
+    d = synced_kproj_decision(p)
+    proj = safe_float(d.get("projection"), None)
+    line = safe_float(d.get("line"), None)
+    side = str(d.get("lean_side") or "").upper()
     if proj is None:
-        return "NO TRUE K PROJ"
-    if floor is not None and abs(proj - floor) >= 0.75:
-        return f"LOCKED TRUE K PROJ ({proj:.2f}); floor ignored ({floor:.2f})"
-    if raw is not None and abs(proj - raw) >= 0.75:
-        return f"LOCKED TRUE K PROJ ({proj:.2f}); stale/raw ignored ({raw:.2f})"
-    return f"LOCKED TRUE K PROJ ({proj:.2f})"
+        return "NO KPROJ DECISION PROJECTION"
+    return f"SYNCED TO KPROJ_DECISION: {proj:.2f} vs {line if line is not None else 'NO LINE'} {side}"
 
 
 def edge_engine_build_board(board):
-    board = lock_true_kproj_display_fields(board)
     rows = []
     for p in board or []:
-        fair = p.get("fair_probability")
-        fair_pct = round(float(fair) * 100, 1) if safe_float(fair) is not None and safe_float(fair) <= 1 else fair
+        if not isinstance(p, dict):
+            continue
+
+        kd = synced_kproj_decision(p)
+        proj = safe_float(kd.get("projection"), None)
+        line = safe_float(kd.get("line"), None)
+        side = str(kd.get("lean_side") or "").upper()
+        if side not in ["OVER", "UNDER", "NO LINE"]:
+            if proj is None or line is None:
+                side = "NO LINE"
+            else:
+                side = "OVER" if proj > line else "UNDER"
+
+        conf = safe_float(kd.get("confidence"), None)
+        fair_pct = None if conf is None else round(conf * 100, 1) if conf <= 1 else round(conf, 1)
+        edge_gap = safe_float(kd.get("edge_gap"), None)
+        if edge_gap is None and proj is not None and line is not None:
+            edge_gap = round(abs(proj - line), 2)
+
         r = {
             "Prop": "K PROJ",
             "Player": p.get("pitcher"),
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
-            "Projection": canonical_k_projection_value(p),
-            "Line": canonical_k_line_value(p),
-            "Decision": p.get("bet_action") or p.get("signal") or p.get("pick_side"),
-            "Tier": p.get("action_tier"),
+            "Projection": proj,
+            "Main K Projection": proj,
+            "Line": line,
+            "Main Line": line,
+            "Decision": kd.get("decision"),
+            "Tier": kd.get("tier") or p.get("action_tier"),
             "Confidence %": fair_pct,
-            "Edge Gap": canonical_k_edge_gap(p),
-            "Canonical Side": canonical_k_side(p),
+            "Edge Gap": edge_gap,
+            "Canonical Side": side,
             "Projection Sync Note": canonical_k_sync_note(p),
-            "Line Source": p.get("line_source") or p.get("source") or "Underdog" if (p.get("line") or p.get("underdog_line")) is not None else "NO LINE",
+            "Line Source": kd.get("line_source") or "Underdog" if line is not None else "NO LINE",
             "Lineup": p.get("lineup_status"),
             "Volatility": p.get("Volatility") or p.get("volatility"),
             "Recent Conv %": p.get("Recent Conv %") or p.get("hit_rate"),
             "leash_risk": p.get("leash_risk"),
         }
         r.update(ee_grade_row(r))
-        r["Projection Sync"] = "OK" if r.get("Edge Pick") in ["OVER", "UNDER", "NO LINE"] else "CHECK"
+        r["Projection Sync"] = "KPROJ_DECISION"
         rows.append(r)
+
     df = pd.DataFrame(rows)
     if not df.empty and "Edge Engine Score" in df.columns:
         df = df.sort_values("Edge Engine Score", ascending=False)
     return df
+
 
 def render_edge_engine_cards(df, title="Top Edge Engine Cards", max_cards=8):
     if df is None or df.empty:
@@ -7503,8 +7474,9 @@ def ge_pitcher_team_score(p):
     try:
         if not isinstance(p, dict):
             return 50.0
-        proj = canonical_k_projection_value(p)
-        line = canonical_k_line_value(p)
+        kd = synced_kproj_decision(p)
+        proj = safe_float(kd.get("projection"), None)
+        line = safe_float(kd.get("line"), None)
         edge = None if proj is None or line is None else proj - line
         abs_edge = abs(edge) if edge is not None else 0.0
         fair = safe_float(p.get("fair_probability"), None)
