@@ -19,13 +19,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from math import exp, factorial
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
-APP_VERSION = "v11.17 + EDGE ENGINE 9.5 SAFE FILTER — CORE K PROJ UNTOUCHED + TRUE LEASH BF"
-
-
-# Manual/fake line entry disabled. Use real market lines only.
-MANUAL_LINES_ENABLED = False
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS"
 
 try:
     import pytz
@@ -65,16 +61,6 @@ GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
-
-ML_ODDS_DEBUG_STATE = {
-    "key_loaded": False,
-    "status": "Not requested yet",
-    "games_returned": 0,
-    "events_with_prices": 0,
-    "books_seen": [],
-    "last_error": "",
-    "last_url": "",
-}
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
@@ -86,6 +72,7 @@ UNDERDOG_URLS = [
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
+
 SPORTSBOOK_PITCHER_K_MARKETS = [
     "pitcher_strikeouts",
     "player_pitcher_strikeouts",
@@ -231,11 +218,6 @@ def get_secret(key, default=""):
     except Exception:
         return os.getenv(key, default)
 
-
-
-# ODDSAPI_ONLY_MONEYLINE_NOTE:
-# ODDS_API_KEY is used only inside the Moneyline Picks tab for sportsbook h2h odds.
-# It does not feed K projections, Underdog props, Edge Engine props, grading, or learning.
 ODDS_API_KEY = get_secret("ODDS_API_KEY", "")
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
@@ -1238,20 +1220,24 @@ def build_leash_model(recent_rows):
 
 
 # =========================
-# TRUE LEASH + BATTERS FACED ENGINE
-# Safe overlay: adjusts expected BF/opportunity only, not raw K skill.
+# LIGHT TRUE LEASH + BATTERS FACED ENGINE
+# Hot-run safe version:
+# - LIGHT overlay only
+# - adjusts expected BF/opportunity, NOT raw K skill
+# - keeps v11.17 upside personality intact
+# - designed to prevent fake overs without killing true upside
 # =========================
-TRUE_LEASH_BF_ENGINE_ENABLED = True
-TRUE_LEASH_BF_MIN = 14.0
-TRUE_LEASH_BF_MAX = 31.5
-TRUE_LEASH_BF_MAX_CUT = 0.88
-TRUE_LEASH_BF_MAX_BOOST = 1.055
+LIGHT_TRUE_LEASH_BF_ENABLED = True
+LIGHT_TRUE_LEASH_MIN_FACTOR = 0.925
+LIGHT_TRUE_LEASH_MAX_FACTOR = 1.035
+LIGHT_TRUE_LEASH_BF_MIN = 14.0
+LIGHT_TRUE_LEASH_BF_MAX = 31.5
 
-def _tlbf_avg(vals):
+def _ltl_avg(vals):
     vals = [safe_float(v) for v in (vals or []) if safe_float(v) is not None]
     return float(np.mean(vals)) if vals else None
 
-def _tlbf_recent_col(recent_rows, key, n=5):
+def _ltl_recent_col(recent_rows, key, n=5):
     out = []
     for r in (recent_rows or [])[:n]:
         if isinstance(r, dict):
@@ -1260,110 +1246,128 @@ def _tlbf_recent_col(recent_rows, key, n=5):
                 out.append(v)
     return out
 
-def true_leash_bf_engine(base_expected_bf, recent_rows=None, row=None):
-    """Improves expected batters faced without changing raw K skill."""
-    if not TRUE_LEASH_BF_ENGINE_ENABLED:
-        return base_expected_bf, {"factor": 1.0, "label": "OFF", "score": 50, "note": "True leash off", "flags": []}
+def light_true_leash_bf_engine(base_expected_bf, recent_rows=None, row=None):
+    """Light BF overlay for v11.17 Upside.
+
+    This is intentionally softer than the full TRUE LEASH engine:
+    - max cut is small
+    - max boost is small
+    - no projection nerfing
+    - only updates expected_bf before simulation/probability
+    """
+    if not LIGHT_TRUE_LEASH_BF_ENABLED:
+        return base_expected_bf, {"factor": 1.0, "label": "OFF", "score": 50, "flags": [], "note": "Light true leash off"}
 
     bf0 = safe_float(base_expected_bf, DEFAULT_BF) or DEFAULT_BF
     rows = recent_rows or []
     row = row or {}
 
-    avg_bf_l3 = _tlbf_avg(_tlbf_recent_col(rows, "BF", 3))
-    avg_bf_l5 = _tlbf_avg(_tlbf_recent_col(rows, "BF", 5))
-    avg_ip_l3 = _tlbf_avg(_tlbf_recent_col(rows, "IP_float", 3))
-    avg_pitches_l3 = _tlbf_avg(_tlbf_recent_col(rows, "Pitches", 3))
-    avg_bb_l3 = _tlbf_avg(_tlbf_recent_col(rows, "BB", 3))
-    avg_er_l3 = _tlbf_avg(_tlbf_recent_col(rows, "ER", 3))
+    avg_bf_l3 = _ltl_avg(_ltl_recent_col(rows, "BF", 3))
+    avg_bf_l5 = _ltl_avg(_ltl_recent_col(rows, "BF", 5))
+    avg_ip_l3 = _ltl_avg(_ltl_recent_col(rows, "IP_float", 3))
+    avg_pitches_l3 = _ltl_avg(_ltl_recent_col(rows, "Pitches", 3))
+    avg_bb_l3 = _ltl_avg(_ltl_recent_col(rows, "BB", 3))
 
-    flags = []
     factor = 1.0
     score = 60.0
+    flags = []
 
+    # Small anchor toward real recent BF.
     recent_anchor = None
     if avg_bf_l3 and avg_bf_l5:
-        recent_anchor = (avg_bf_l3 * 0.62) + (avg_bf_l5 * 0.38)
+        recent_anchor = avg_bf_l3 * 0.60 + avg_bf_l5 * 0.40
     elif avg_bf_l3:
         recent_anchor = avg_bf_l3
     elif avg_bf_l5:
         recent_anchor = avg_bf_l5
 
     if recent_anchor is not None:
-        anchor_gap = recent_anchor - bf0
-        bf0 = bf0 + clamp(anchor_gap * 0.35, -2.4, 1.8)
-        score += clamp(anchor_gap * 1.8, -10, 8)
-        flags.append(f"RECENT_BF_ANCHOR {recent_anchor:.1f}")
+        gap = recent_anchor - bf0
+        bf0 = bf0 + clamp(gap * 0.22, -1.35, 1.10)
+        score += clamp(gap * 1.4, -8, 6)
+        flags.append(f"RECENT_BF {recent_anchor:.1f}")
 
+    # Pitch stress: light cuts only.
     ppb_l3 = None
     if avg_pitches_l3 and avg_bf_l3 and avg_bf_l3 > 0:
         ppb_l3 = avg_pitches_l3 / avg_bf_l3
+        if ppb_l3 >= 4.40:
+            factor *= 0.955
+            score -= 10
+            flags.append("HIGH_PITCH_STRESS")
+        elif ppb_l3 >= 4.18:
+            factor *= 0.978
+            score -= 5
+            flags.append("MILD_PITCH_STRESS")
+        elif ppb_l3 <= 3.55 and avg_pitches_l3 >= 86:
+            factor *= 1.012
+            score += 3
+            flags.append("EFFICIENT_VOLUME")
 
-    if ppb_l3 is not None:
-        if ppb_l3 >= 4.45:
-            factor *= 0.925; score -= 16; flags.append("EXTREME_PITCH_STRESS")
-        elif ppb_l3 >= 4.25:
-            factor *= 0.955; score -= 10; flags.append("HIGH_PITCH_STRESS")
-        elif ppb_l3 >= 4.05:
-            factor *= 0.975; score -= 5; flags.append("MILD_PITCH_STRESS")
-        elif ppb_l3 <= 3.55 and avg_pitches_l3 and avg_pitches_l3 >= 86:
-            factor *= 1.025; score += 5; flags.append("EFFICIENT_VOLUME")
-
+    # IP trend: light.
     if avg_ip_l3 is not None:
-        if avg_ip_l3 < 4.4:
-            factor *= 0.91; score -= 18; flags.append("SHORT_L3_IP")
+        if avg_ip_l3 < 4.5:
+            factor *= 0.945
+            score -= 11
+            flags.append("SHORT_L3_IP")
         elif avg_ip_l3 < 5.0:
-            factor *= 0.955; score -= 10; flags.append("LOW_L3_IP")
+            factor *= 0.975
+            score -= 5
+            flags.append("LOW_L3_IP")
         elif avg_ip_l3 >= 6.2:
-            factor *= 1.025; score += 6; flags.append("STRONG_L3_IP")
+            factor *= 1.015
+            score += 4
+            flags.append("STRONG_L3_IP")
 
+    # Walk stress.
     if avg_bb_l3 is not None:
         if avg_bb_l3 >= 3.0:
-            factor *= 0.945; score -= 10; flags.append("WALK_STRESS")
-        elif avg_bb_l3 >= 2.2:
-            factor *= 0.975; score -= 5; flags.append("MILD_WALK_STRESS")
+            factor *= 0.965
+            score -= 7
+            flags.append("WALK_STRESS")
+        elif avg_bb_l3 >= 2.3:
+            factor *= 0.985
+            score -= 3
+            flags.append("MILD_WALK_STRESS")
 
-    if avg_er_l3 is not None:
-        if avg_er_l3 >= 4.0:
-            factor *= 0.955; score -= 8; flags.append("RUN_DAMAGE_STRESS")
-        elif avg_er_l3 <= 1.5:
-            factor *= 1.010; score += 3; flags.append("CLEAN_RECENT_RUNS")
-
+    # Existing manager/leash tags.
     manager_hook = str(row.get("manager_hook_status") or row.get("manager_hook") or "").upper()
     leash_risk = str(row.get("leash_risk") or row.get("risk_label") or "").upper()
     if "STRICT" in manager_hook or "STRICT" in leash_risk:
-        factor *= 0.94; score -= 12; flags.append("STRICT_MANAGER_HOOK")
+        factor *= 0.955
+        score -= 9
+        flags.append("STRICT_HOOK")
     elif "SHORT" in manager_hook or "SHORT" in leash_risk:
-        factor *= 0.955; score -= 9; flags.append("SHORT_LEASH")
+        factor *= 0.970
+        score -= 6
+        flags.append("SHORT_LEASH")
 
-    starter_score = safe_float(row.get("starter_score") or row.get("Starter Score"), None)
-    role_score = safe_float(row.get("role_score") or row.get("Role Score"), None)
-    if starter_score is not None:
-        if starter_score >= 78:
-            factor *= 1.012; score += 4; flags.append("STARTER_CONFIRMED")
-        elif starter_score < 55:
-            factor *= 0.94; score -= 12; flags.append("STARTER_ROLE_RISK")
-    if role_score is not None and role_score < 50:
-        factor *= 0.96; score -= 7; flags.append("ROLE_RISK")
+    # Existing role safety.
+    role_text = str(row.get("pitcher_role") or row.get("role") or "").upper()
+    if any(x in role_text for x in ["OPENER", "BULK", "FOLLOWER"]):
+        factor *= 0.925
+        score -= 18
+        flags.append("ROLE_VOLUME_RISK")
 
+    # Bullpen context: small only.
     bullpen_status = str(row.get("bullpen_status") or "").upper()
     if any(x in bullpen_status for x in ["TIRED", "HEAVY", "TAXED", "FATIGUED"]):
-        factor *= 1.018; score += 4; flags.append("BULLPEN_NEEDS_LENGTH")
+        factor *= 1.010
+        score += 3
+        flags.append("BULLPEN_NEEDS_LENGTH")
     elif any(x in bullpen_status for x in ["FRESH", "RESTED"]):
-        factor *= 0.992; flags.append("FRESH_BULLPEN_SHORTER_HOOK")
+        factor *= 0.995
+        flags.append("FRESH_BULLPEN")
 
-    pitcher_role = str(row.get("pitcher_role") or row.get("role") or "").upper()
-    if any(x in pitcher_role for x in ["OPENER", "BULK", "FOLLOWER"]):
-        factor *= 0.88; score -= 22; flags.append("OPENER_BULK_ROLE_RISK")
-
-    factor = clamp(factor, TRUE_LEASH_BF_MAX_CUT, TRUE_LEASH_BF_MAX_BOOST)
-    new_bf = float(clamp(bf0 * factor, TRUE_LEASH_BF_MIN, TRUE_LEASH_BF_MAX))
+    factor = clamp(factor, LIGHT_TRUE_LEASH_MIN_FACTOR, LIGHT_TRUE_LEASH_MAX_FACTOR)
+    new_bf = float(clamp(bf0 * factor, LIGHT_TRUE_LEASH_BF_MIN, LIGHT_TRUE_LEASH_BF_MAX))
     score = int(clamp(round(score), 0, 100))
 
-    if score >= 78:
+    if score >= 76:
         label = "STRONG_LEASH"
-    elif score >= 62:
+    elif score >= 60:
         label = "STABLE_LEASH"
-    elif score >= 45:
+    elif score >= 44:
         label = "FRAGILE_LEASH"
     else:
         label = "DANGER_LEASH"
@@ -1372,8 +1376,8 @@ def true_leash_bf_engine(base_expected_bf, recent_rows=None, row=None):
         "factor": round(float(factor), 3),
         "label": label,
         "score": score,
-        "note": f"{label}: BF {safe_float(base_expected_bf, DEFAULT_BF):.1f} -> {new_bf:.1f} | factor {factor:.3f}",
-        "flags": flags[:8],
+        "flags": flags[:6],
+        "note": f"{label}: BF {safe_float(base_expected_bf, DEFAULT_BF):.1f} -> {new_bf:.1f} | light factor {factor:.3f}",
         "avg_bf_l3": None if avg_bf_l3 is None else round(avg_bf_l3, 2),
         "avg_ip_l3": None if avg_ip_l3 is None else round(avg_ip_l3, 2),
         "ppb_l3": None if ppb_l3 is None else round(ppb_l3, 2),
@@ -4652,15 +4656,17 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     # game-script risk, before bullpen factor, so final BF still respects bullpen context.
     try:
         hooked_bf, manager_hook_status, manager_hook_note = apply_managerial_hook_v11_9(leash.get("expected_bf"), recent_rows)
-        # TRUE LEASH + BF ENGINE: volume/opportunity overlay only.
-        expected_bf, true_leash_info = true_leash_bf_engine(expected_bf, recent_rows, row if "row" in locals() else locals().get("p", {}))
+        # LIGHT TRUE LEASH + BF: opportunity-volume overlay only, keeps K skill untouched.
+        expected_bf, light_true_leash_info = light_true_leash_bf_engine(expected_bf, recent_rows, row if "row" in locals() else locals().get("p", {}))
+        # LIGHT BULLPEN TAX: final leash/BF-only nudge; K skill remains untouched.
+        expected_bf, light_bullpen_tax_info = apply_light_bullpen_tax_to_bf(expected_bf, row if "row" in locals() else locals().get("p", {}))
         if isinstance(locals().get("row", None), dict):
-            row["true_leash_bf"] = round(float(expected_bf), 2)
-            row["true_leash_label"] = true_leash_info.get("label")
-            row["true_leash_score"] = true_leash_info.get("score")
-            row["true_leash_factor"] = true_leash_info.get("factor")
-            row["true_leash_note"] = true_leash_info.get("note")
-            row["true_leash_flags"] = " | ".join(true_leash_info.get("flags") or [])
+            row["light_true_leash_bf"] = round(float(expected_bf), 2)
+            row["light_true_leash_label"] = light_true_leash_info.get("label")
+            row["light_true_leash_score"] = light_true_leash_info.get("score")
+            row["light_true_leash_factor"] = light_true_leash_info.get("factor")
+            row["light_true_leash_note"] = light_true_leash_info.get("note")
+            row["light_true_leash_flags"] = " | ".join(light_true_leash_info.get("flags") or [])
         leash["expected_bf"] = hooked_bf
         leash["manager_hook_status"] = manager_hook_status
         leash["manager_hook_note"] = manager_hook_note
@@ -6055,13 +6061,6 @@ def kproj_upside_projection(p):
     if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"] and ceiling_risk < 45 and upside < 55:
         proj -= 0.10
 
-    # v11.18 K Skill Stability / pitcher archetype refinement.
-    # Small, capped projection correction: prevents matchup-only arms from being
-    # over-amplified, while protecting volatile under-spike arms from fake UNDER confidence.
-    if globals().get("KPROJ_ARCHETYPE_ENABLED", True):
-        archetype_profile = kproj_pitcher_archetype_profile(p, projected_ks=proj, expected_bf=expected_bf)
-        proj = kproj_apply_archetype_projection_adjustment(proj, p, archetype_profile)
-
     true_floor, _floor_note = kproj_true_projection_floor(p)
     if true_floor is not None and proj < true_floor:
         proj += min(true_floor - proj, KPROJ_MAX_PROJECTION_LIFT)
@@ -6083,224 +6082,6 @@ KPROJ_MIN_LEAN_GAP_OVER = 0.55
 KPROJ_MIN_LEAN_GAP_UNDER = 1.15
 KPROJ_MIN_OFFICIAL_HIT_RATE = 0.62
 KPROJ_MIN_LEAN_HIT_RATE = 0.56
-
-# Small official-play filter tweak: projections still decide direction,
-# but official OVERs need stronger edge + simulation + volume/role context.
-# This does NOT change K PROJ math. It only downgrades medium OVERS to OL/PASS.
-KPROJ_STRICT_OVER_EDGE = 1.00
-KPROJ_STRICT_OVER_HIT_RATE = 0.65
-KPROJ_STRICT_OVER_MIN_BF = 21.0
-KPROJ_STRICT_OVER_MIN_ROLE = 60
-
-# =========================
-# v11.18 K SKILL STABILITY / ARCHETYPE SETTINGS
-# =========================
-# Small correction layer only. It does NOT rewrite the engine.
-# Goal: avoid fake matchup-driven overs on non-elite arms and avoid fake UNDER
-# confidence on volatile arms that can spike Ks.
-KPROJ_ARCHETYPE_ENABLED = True
-KPROJ_MATCHUP_TRAP_SCORE = 70
-KPROJ_HIDDEN_SPIKE_BLOCK_UNDER = 62
-KPROJ_ARCHETYPE_MAX_HAIRCUT = 0.38
-KPROJ_ARCHETYPE_MAX_SPIKE_LIFT = 0.22
-
-
-def kproj_pitcher_archetype_profile(p, projected_ks=None, expected_bf=None):
-    """K UPSIDE TAB ONLY: classify whether a pitcher truly creates Ks or is matchup-assisted.
-
-    This is intentionally conservative and capped. It helps the app distinguish:
-    - true strikeout creators who deserve full matchup boosts
-    - mid-tier arms whose projection is mostly created by opponent K%
-    - volatile/unknown arms that should not be trusted for aggressive UNDERs
-    """
-    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
-    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
-    bf = safe_float(expected_bf, safe_float(p.get("expected_bf"), DEFAULT_BF)) or DEFAULT_BF
-    k9 = kproj_historical_k9(p)
-    putaway, put_label = kproj_putaway_value(p)
-    putaway = safe_float(putaway)
-    recent_max, recent_avg, recent_n = kproj_recent_ceiling_stats(p)
-    line, _src = kproj_line_for_display(p)
-    proj = safe_float(projected_ks, safe_float(p.get("projection"), 0.0)) or 0.0
-    role_score = 60
-    starter_score = 60
-    try:
-        role_score = kproj_role_stability_score(p)[0]
-        starter_score = kproj_starter_confirmation_score(p)[0]
-    except Exception:
-        pass
-    leash = str(p.get("leash_risk") or "").upper()
-    lineup_status = str(p.get("lineup_status") or "").upper()
-
-    score = 20.0
-    if pk >= 0.300:
-        score += 30
-    elif pk >= 0.270:
-        score += 24
-    elif pk >= 0.245:
-        score += 18
-    elif pk >= 0.225:
-        score += 12
-    elif pk >= 0.205:
-        score += 6
-
-    if putaway is not None:
-        if putaway >= 31:
-            score += 22
-        elif putaway >= 28:
-            score += 17
-        elif putaway >= 24:
-            score += 10
-        elif putaway >= 21:
-            score += 5
-        else:
-            score -= 3
-
-    if k9 >= 10.0:
-        score += 16
-    elif k9 >= 9.0:
-        score += 12
-    elif k9 >= 8.0:
-        score += 7
-    elif k9 and k9 < 7.0:
-        score -= 4
-
-    if bf >= 25:
-        score += 10
-    elif bf >= 22:
-        score += 7
-    elif bf >= 20:
-        score += 3
-    elif bf <= 18:
-        score -= 8
-
-    if recent_n:
-        if recent_max >= 8:
-            score += 10
-        elif recent_max >= 6:
-            score += 6
-        if recent_avg >= 5.5:
-            score += 8
-        elif recent_avg >= 4.5:
-            score += 4
-
-    if role_score >= 75:
-        score += 7
-    elif role_score < 50:
-        score -= 7
-    if starter_score >= 75:
-        score += 5
-    elif starter_score < 50:
-        score -= 5
-    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"]:
-        score -= 6
-    if "FALLBACK" in lineup_status:
-        score -= 3
-
-    stability = int(clamp(round(score), 0, 100))
-    if stability >= 74:
-        archetype = "TRUE_K_CREATOR"
-    elif stability >= 62:
-        archetype = "STABLE_STRIKEOUT_ARM"
-    elif stability >= 45:
-        archetype = "MATCHUP_ASSISTED"
-    else:
-        archetype = "VOLATILE_UNKNOWN"
-
-    # Matchup-trap score: opponent K% is doing too much work for a pitcher whose
-    # own bat-missing skill is not strong enough to deserve a full boost.
-    matchup_trap = 0.0
-    if ok >= 0.235:
-        matchup_trap += 28
-    elif ok >= 0.225:
-        matchup_trap += 16
-    if pk < 0.235:
-        matchup_trap += 28
-    elif pk < 0.245:
-        matchup_trap += 15
-    if putaway is not None and putaway < 24:
-        matchup_trap += 22
-    if bf < 22:
-        matchup_trap += 12
-    if role_score < 60:
-        matchup_trap += 12
-    if line is not None and proj > line:
-        matchup_trap += min(14, max(0, (proj - line) * 4))
-    matchup_trap = int(clamp(round(matchup_trap), 0, 100))
-
-    # Hidden spike score: protects against fake UNDERs on volatile arms/unknowns
-    # with enough strikeout path to jump over despite a median under projection.
-    hidden_spike = 0.0
-    if recent_max >= 6:
-        hidden_spike += 22
-    if putaway is not None and putaway >= 24:
-        hidden_spike += 16
-    if ok >= 0.230:
-        hidden_spike += 16
-    if bf >= 21:
-        hidden_spike += 12
-    if pk >= 0.215:
-        hidden_spike += 10
-    if k9 >= 8.0:
-        hidden_spike += 10
-    if role_score >= 55:
-        hidden_spike += 8
-    if line is not None and proj < line and abs(line - proj) <= 1.25:
-        hidden_spike += 10
-    hidden_spike = int(clamp(round(hidden_spike), 0, 100))
-
-    return {
-        "stability_score": stability,
-        "archetype": archetype,
-        "matchup_trap_score": matchup_trap,
-        "hidden_spike_score": hidden_spike,
-        "putaway": putaway,
-        "putaway_label": put_label,
-    }
-
-
-def kproj_apply_archetype_projection_adjustment(proj, p, profile=None):
-    """Small projection adjustment for pitcher archetype.
-
-    It trims only matchup-inflated non-elite overs and gives only a tiny lift
-    to under-spike-risk arms. Elite/stable K creators are left alone.
-    """
-    if not KPROJ_ARCHETYPE_ENABLED:
-        return proj
-    proj = safe_float(proj, 0.0) or 0.0
-    line, _src = kproj_line_for_display(p)
-    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
-    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
-    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
-    profile = profile or kproj_pitcher_archetype_profile(p, projected_ks=proj, expected_bf=bf)
-    stability = safe_float(profile.get("stability_score"), 50) or 50
-    trap = safe_float(profile.get("matchup_trap_score"), 0) or 0
-    spike = safe_float(profile.get("hidden_spike_score"), 0) or 0
-    putaway = safe_float(profile.get("putaway"))
-
-    # Soft haircut: only matchup-assisted/non-elite OVER projections.
-    if line is not None and proj > line and trap >= KPROJ_MATCHUP_TRAP_SCORE and stability < 62:
-        haircut = 0.12
-        if pk < 0.235:
-            haircut += 0.08
-        if putaway is not None and putaway < 24:
-            haircut += 0.07
-        if bf < 22:
-            haircut += 0.05
-        if ok >= 0.235:
-            haircut += 0.04
-        # Bigger projected edges can keep most of their edge; cap the correction.
-        proj -= min(KPROJ_ARCHETYPE_MAX_HAIRCUT, haircut)
-
-    # Hidden over-spike guard: tiny lift only when an UNDER is close enough and
-    # real strikeout indicators say it can jump. This is NOT a forced over.
-    if line is not None and proj < line and spike >= KPROJ_HIDDEN_SPIKE_BLOCK_UNDER:
-        gap_to_line = line - proj
-        if gap_to_line <= 1.35:
-            lift = min(KPROJ_ARCHETYPE_MAX_SPIKE_LIFT, 0.06 + (spike - KPROJ_HIDDEN_SPIKE_BLOCK_UNDER) * 0.004)
-            proj += lift
-
-    return round(float(clamp(proj, 0.0, 15.0)), 2)
 
 
 # =========================
@@ -6703,15 +6484,6 @@ def kproj_confidence_tier(conf, hit_rate, gap, role_score):
     return "PASS"
 
 
-
-def soften_existing_decision_label(decision, proj=None, line=None, score=None, conf=None):
-    d = str(decision or "")
-    if "PASS" not in d.upper():
-        return d
-    side = edge_engine_side(proj, line) if "edge_engine_side" in globals() else ee_side(proj, line) if "ee_side" in globals() else "PLAY"
-    soft_decision, _, _ = soft_gate_decision(side, score, conf, "", None if proj is None or line is None else abs(float(proj)-float(line)))
-    return soft_decision
-
 def kproj_decision(p):
     """
     Projection-first decision logic for the K PROJ / Upside tab.
@@ -6758,10 +6530,6 @@ def kproj_decision(p):
     ip_floor = kproj_probable_innings_floor(p)
     ceiling_risk, ceiling_note = kproj_ceiling_risk_score(p)
     true_floor, true_floor_note = kproj_true_projection_floor(p)
-    archetype_profile = kproj_pitcher_archetype_profile(p, projected_ks=proj, expected_bf=safe_float(p.get("expected_bf"), DEFAULT_BF))
-    matchup_trap_score = safe_float(archetype_profile.get("matchup_trap_score"), 0) or 0
-    hidden_spike_score = safe_float(archetype_profile.get("hidden_spike_score"), 0) or 0
-    k_stability_score = safe_float(archetype_profile.get("stability_score"), 50) or 50
 
     # Sim probability comes after projection direction.
     hit_rate = kproj_sim_hit_rate(proj, line, model_side, p)
@@ -6787,26 +6555,11 @@ def kproj_decision(p):
         reasons.extend(bad_data_reasons)
     else:
         if model_side == "OVER":
-            # Official OVER: projection edge + sim probability + usable volume/role context.
-            # This is intentionally stricter than before to improve win rate by cutting
-            # medium-edge overs, while keeping projection math unchanged.
-            expected_bf_gate = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
-            strong_over_setup = (
-                abs_edge >= KPROJ_STRICT_OVER_EDGE
-                and hit_rate_val >= KPROJ_STRICT_OVER_HIT_RATE
-                and expected_bf_gate >= KPROJ_STRICT_OVER_MIN_BF
-                and role_score >= KPROJ_STRICT_OVER_MIN_ROLE
-                and not (matchup_trap_score >= KPROJ_MATCHUP_TRAP_SCORE and k_stability_score < 62 and abs_edge < 1.75)
-            )
-
-            if strong_over_setup:
+            # Official OVER: projection edge + sim probability. Keep it usable.
+            if abs_edge >= 0.75 and hit_rate_val >= 0.60:
                 side = "OVER"
             elif abs_edge >= 0.30 and hit_rate_val >= 0.54:
                 side = "OVER LEAN"
-                if matchup_trap_score >= KPROJ_MATCHUP_TRAP_SCORE and k_stability_score < 62:
-                    reasons.append(f"downgraded: matchup-assisted pitcher profile (K stability {int(k_stability_score)}/100)")
-                elif abs_edge >= KPROJ_STRICT_OVER_EDGE and hit_rate_val >= KPROJ_STRICT_OVER_HIT_RATE:
-                    reasons.append("downgraded: official over needs stronger BF/role context")
             else:
                 side = "PASS"
                 reasons.append("thin over edge / low sim probability")
@@ -6820,14 +6573,13 @@ def kproj_decision(p):
             # Official UNDER is stricter because ceiling arms have been nuking unders.
             dangerous_under = (
                 ceiling_risk >= KPROJ_CEILING_RISK_BLOCK_UNDER
-                or hidden_spike_score >= KPROJ_HIDDEN_SPIKE_BLOCK_UNDER
                 or upside >= 55
                 or (pk >= 0.255 and ok >= 0.220)
             )
 
             if dangerous_under:
                 side = "PASS"
-                reasons.append(f"blocked under: ceiling/talent/spike risk {max(int(ceiling_risk), int(hidden_spike_score))}/100")
+                reasons.append(f"blocked under: ceiling/talent risk {ceiling_risk}/100")
             elif abs_edge >= 1.25 and hit_rate_val >= 0.62 and role_score >= 62:
                 side = "UNDER"
             elif abs_edge >= 0.45 and hit_rate_val >= 0.55:
@@ -6862,7 +6614,6 @@ def kproj_decision(p):
 
     note_parts = [
         f"Projection-first decision",
-        f"Archetype {archetype_profile.get('archetype')} | K stability {int(k_stability_score)}/100 | trap {int(matchup_trap_score)}/100 | spike {int(hidden_spike_score)}/100",
         f"Over needs {over_needed}+",
         f"Under wins {under_max} or fewer",
         f"line edge={line_edge:+.2f}",
@@ -7033,890 +6784,852 @@ def render_kproj_tab(board):
 
 
 # =========================
-# SOFT-GATED DECISION HELPERS
-# Strict official plays remain strict, but all rows show direction.
+# LIGHT BULLPEN FATIGUE TAX
+# Leash/BF-only realism layer. Does NOT change pitcher K skill.
 # =========================
-def soft_gate_decision(side, score=None, conf=None, flags="", edge=None):
-    side = str(side or "PLAY").upper()
-    score = safe_float(score, 0) or 0
-    conf = safe_float(conf, None)
-    if conf is not None and conf <= 1:
-        conf *= 100
-    edge = safe_float(edge, None)
-    flags_s = str(flags or "")
+LIGHT_BULLPEN_TAX_ENABLED = True
+LIGHT_BULLPEN_BF_MIN_FACTOR = 0.985
+LIGHT_BULLPEN_BF_MAX_FACTOR = 1.030
 
-    hard_avoid = any(x in flags_s for x in ["NO LIVE LINE", "NO LINE", "NO MONEYLINE ODDS", "LINE SOURCE CHECK"])
+def light_bullpen_tax_factor(row=None):
+    if not LIGHT_BULLPEN_TAX_ENABLED:
+        return 1.0, "OFF", "Bullpen tax off"
+    row = row or {}
+    text = " ".join(str(row.get(k, "")) for k in [
+        "bullpen_status", "bullpen_note", "bullpen_risk", "bp_status",
+        "pen_status", "bullpen_fatigue", "bullpen_usage_note"
+    ]).upper()
+    fatigue_score = safe_float(row.get("bullpen_fatigue_score") or row.get("bp_fatigue_score"), None)
 
-    if hard_avoid:
-        return f"🚫 AVOID — {side}", "AVOID", "No reliable market line/source"
-
-    if score >= 82 and ("Clean" in flags_s or flags_s.strip() in ["", "—"]):
-        return f"🔥 OFFICIAL {side}", "OFFICIAL", "Clean high-score edge"
-
-    if score >= 74:
-        return f"✅ STRONG {side}", "STRONG", "Strong playable lean"
-
-    if score >= 64:
-        return f"⚠️ {side} LEAN", "LEAN", "Playable lean, not official"
-
-    if score >= 56 or (edge is not None and edge >= 0.75):
-        return f"👀 SMALL {side}", "SMALL", "Direction only / small edge"
-
-    return f"🚫 AVOID — {side}", "AVOID", "Weak edge"
-
-def soft_gate_grade_from_score(score, flags=""):
-    score = safe_float(score, 0) or 0
-    flags_s = str(flags or "")
-    if any(x in flags_s for x in ["NO LIVE LINE", "NO LINE", "NO MONEYLINE ODDS", "LINE SOURCE CHECK"]):
-        return "🚫 AVOID"
-    if score >= 82 and ("Clean" in flags_s or flags_s.strip() in ["", "—"]):
-        return "🔥 OFFICIAL"
-    if score >= 74:
-        return "✅ STRONG"
-    if score >= 64:
-        return "⚠️ LEAN"
-    if score >= 56:
-        return "👀 SMALL EDGE"
-    return "🚫 AVOID"
-
-# =========================
-# EDGE ENGINE 9.5 SAFE LAYER
-# Display/ranking/filtering only. Does NOT change projections, Underdog, OF2, grading, or learning.
-# =========================
-def _ee_fmt(v, nd=2):
-    try:
-        if v is None or v == "":
-            return "—"
-        f = float(v)
-        if abs(f - round(f)) < 1e-9:
-            return str(int(round(f)))
-        return f"{f:.{nd}f}"
-    except Exception:
-        return str(v) if v not in [None, ""] else "—"
-
-def _ee_get(row, keys, default=None):
-    try:
-        for k in keys:
-            if hasattr(row, "get") and row.get(k) not in [None, ""]:
-                return row.get(k)
-    except Exception:
-        pass
-    return default
-
-def ee_side(proj, line):
-    proj = safe_float(proj, None)
-    line = safe_float(line, None)
-    if proj is None or line is None:
-        return "NO LINE"
-    return "OVER" if proj > line else "UNDER"
-
-def ee_line_difficulty_tax(line, side="OVER"):
-    line = safe_float(line, None)
-    if line is None:
-        return 12, "No live line"
-    side = str(side).upper()
-    if side == "OVER" and line >= 7.5:
-        return 9, "High K line"
-    if side == "OVER" and line >= 6.5:
-        return 5, "Medium-high K line"
-    if side == "UNDER" and line <= 3.5:
-        return 7, "Low under line"
-    return 0, "Normal line difficulty"
-
-def ee_clv_score(row, side):
-    delta = safe_float(_ee_get(row, ["CLV Δ", "CLV", "clv_delta", "Line Delta", "line_delta", "line_movement"]), None)
-    if delta is None:
-        return 0, "No CLV yet"
-    side = str(side).upper()
-    good = (side == "OVER" and delta > 0) or (side == "UNDER" and delta < 0)
-    bad = (side == "OVER" and delta < 0) or (side == "UNDER" and delta > 0)
-    if good:
-        return 6, f"Positive CLV {delta:+.2f}"
-    if bad:
-        return -7, f"Line moved against {delta:+.2f}"
-    return 0, f"Flat CLV {delta:+.2f}"
-
-def ee_volatility_tax(row):
-    vol = safe_float(_ee_get(row, ["Volatility", "volatility", "Sim Std", "std"]), None)
-    risk = str(_ee_get(row, ["risk_label", "Risk", "leash_risk", "Leash Risk"], "")).upper()
-    tax = 0
-    notes = []
-    if vol is not None:
-        if vol >= 2.3:
-            tax += 9; notes.append("High volatility")
-        elif vol >= 1.7:
-            tax += 5; notes.append("Medium volatility")
-    if any(x in risk for x in ["HIGH", "EXTREME", "STRICT", "SHORT"]):
-        tax += 8; notes.append("Role/leash risk")
-    elif any(x in risk for x in ["MILD", "MEDIUM"]):
-        tax += 4; notes.append("Mild risk")
-    return tax, ", ".join(notes) if notes else "Volatility normal"
-
-def ee_recent_bonus(row):
-    val = safe_float(_ee_get(row, ["Recent Conv %", "recent_conversion", "Hit Rate %", "hit_rate", "recent_hit_rate"]), None)
-    if val is None:
-        return 0, "No recent conversion"
-    if val <= 1:
-        val *= 100
-    if val >= 70:
-        return 6, f"Strong recent conversion {val:.0f}%"
-    if val >= 60:
-        return 3, f"Solid recent conversion {val:.0f}%"
-    if val < 48:
-        return -7, f"Weak recent conversion {val:.0f}%"
-    return 0, f"Neutral recent conversion {val:.0f}%"
-
-
-def ee_real_line_status(row):
-    """Edge Engine real-line guard.
-
-    Keeps Edge Engine from treating fallback/default/manual values as official market lines.
-    Does not alter core projections.
-    """
-    line = safe_float(_ee_get(row, ["Line", "UD/Line", "line", "active_line", "underdog_line"]), None)
-    source = str(_ee_get(row, ["Line Source", "line_source", "Source", "price_source"], "")).upper()
-    decision = str(_ee_get(row, ["Decision", "Pick", "bet_action", "Main Engine Action"], "")).upper()
-
-    if line is None:
-        return False, "NO LIVE LINE"
-    if "NO LINE" in decision:
-        return False, "NO LINE DECISION"
-    # Underdog is primary; sportsbook/odds sources allowed only if app already supplied them.
-    if source and any(x in source for x in ["UNDERDOG", "UD", "ODDS", "SPORTSBOOK", "PRIZE", "OPTIC"]):
-        return True, "REAL MARKET LINE"
-    # If source is blank but the base board already has a line, allow but flag source check.
-    if not source:
-        return True, "LINE SOURCE BLANK"
-    return False, "NON-MARKET/FALLBACK LINE"
-
-
-def ee_grade_row(row):
-    proj = safe_float(_ee_get(row, ["Projection", "K PROJ", "projection", "Proj"]), None)
-    line = safe_float(_ee_get(row, ["Line", "UD/Line", "line", "active_line", "underdog_line"]), None)
-    conf = safe_float(_ee_get(row, ["Confidence %", "Hit Rate %", "fair_probability", "Fair Prob"]), None)
-    if conf is not None and conf <= 1:
-        conf *= 100
-    tier = str(_ee_get(row, ["Tier", "action_tier"], "")).upper()
-    decision = str(_ee_get(row, ["Decision", "Pick", "bet_action", "Main Engine Action"], "")).upper()
-    source = str(_ee_get(row, ["Line Source", "line_source", "Source", "price_source"], "")).upper()
-    lineup = str(_ee_get(row, ["Lineup", "lineup_status"], "")).upper()
-    edge = safe_float(_ee_get(row, ["Edge Gap", "edge_ks", "Lean Gap", "Model Gap", "abs_edge"]), None)
-    if edge is None and proj is not None and line is not None:
-        edge = abs(proj - line)
-
-    side = str(_ee_get(row, ["Canonical Side"], "") or ee_side(proj, line)).upper()
-    real_line_ok, real_line_note = ee_real_line_status(row)
-    
-    # Safety: if the Edge Engine ever sees a side mismatch, force main K board side.
-    # This prevents cases like main card OVER but Edge table UNDER.
-    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
-    if canonical_side_check in ["OVER", "UNDER"]:
-        side = canonical_side_check
-
-    
-    # FORCE_TRUE_KPROJ_SIDE: never let Edge Engine flip away from K PROJ / UPSIDE side.
-    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
-    if canonical_side_check in ["OVER", "UNDER"]:
-        side = canonical_side_check
-
-    # FORCE_TRUE_DECIMAL_KPROJ_SIDE: never let Edge Engine flip away from K PROJ / UPSIDE decimal side.
-    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
-    if canonical_side_check in ["OVER", "UNDER"]:
-        side = canonical_side_check
-
-    # KPROJ_DECISION_FORCE_SIDE: exact same side as K PROJ / UPSIDE.
-    canonical_side_check = str(_ee_get(row, ["Canonical Side"], "") or "").upper()
-    if canonical_side_check in ["OVER", "UNDER", "NO LINE"]:
-        side = canonical_side_check
-
-    score = 50.0
-    if edge is not None:
-        score += min(abs(edge), 3.75) * 9.0
-    if conf is not None:
-        score += (conf - 58) * 0.95
-    if tier == "A":
-        score += 12
-    elif tier == "B":
-        score += 6
-    elif tier == "C":
-        score -= 3
-    elif tier == "PASS":
-        score -= 30
-    if "UNDERDOG" in source or "UD" in source:
-        score += 6
-    if "TRUE" in lineup or "CONFIRMED" in lineup:
-        score += 5
-    elif "FALLBACK" in lineup:
-        score -= 7
-
-    line_tax, line_note = ee_line_difficulty_tax(line, side)
-    vol_tax, vol_note = ee_volatility_tax(row)
-    clv_bonus, clv_note = ee_clv_score(row, side)
-    recent_bonus, recent_note = ee_recent_bonus(row)
-
-    score -= line_tax
-    score -= vol_tax
-    score += clv_bonus
-    score += recent_bonus
-
-    flags = []
-    if line is None:
-        flags.append("NO LIVE LINE")
-    if not real_line_ok:
-        flags.append(real_line_note)
-    if "PASS" in decision or tier == "PASS":
-        flags.append("MODEL PASS")
-    if edge is not None and abs(edge) < 0.75:
-        flags.append("SMALL EDGE")
-    if conf is not None and conf < 63:
-        flags.append("LOW/BORDER CONF")
-    if proj is not None and line is not None and abs(proj - line) < 0.20:
-        flags.append("TOO CLOSE TO LINE")
-    if source and "UNDERDOG" not in source and "UD" not in source:
-        flags.append("LINE SOURCE CHECK")
-    if "FALLBACK" in lineup:
-        flags.append("FALLBACK LINEUP")
-
-    score -= min(len(flags) * 6, 30)
-    score = round(float(clamp(score, 0, 100)), 1)
-    if score >= 84 and not flags:
-        grade = "🔥 ELITE EDGE"
-    elif score >= 76:
-        grade = "✅ STRONG EDGE"
-    elif score >= 68:
-        grade = "⚠️ WATCH EDGE"
-    elif score >= 60:
-        grade = "🟡 LEAN ONLY"
+    factor, label, note = 1.0, "NEUTRAL", "Bullpen neutral"
+    if fatigue_score is not None:
+        if fatigue_score >= 80:
+            factor, label, note = 1.030, "TAXED_BP", f"Taxed bullpen score {fatigue_score:.0f}: starter length boost"
+        elif fatigue_score >= 65:
+            factor, label, note = 1.018, "TIRED_BP", f"Tired bullpen score {fatigue_score:.0f}: slight starter length boost"
+        elif fatigue_score <= 30:
+            factor, label, note = 0.988, "FRESH_BP", f"Fresh bullpen score {fatigue_score:.0f}: quicker hook risk"
     else:
-        grade = "🚫 PASS EDGE"
+        if any(x in text for x in ["EXHAUSTED", "EXTREME", "HEAVY", "TAXED", "OVERUSED"]):
+            factor, label, note = 1.030, "TAXED_BP", "Taxed bullpen: starter length boost"
+        elif any(x in text for x in ["TIRED", "FATIGUED", "USED", "BACK-TO-BACK", "B2B"]):
+            factor, label, note = 1.018, "TIRED_BP", "Tired bullpen: slight starter length boost"
+        elif any(x in text for x in ["FRESH", "RESTED", "AVAILABLE"]):
+            factor, label, note = 0.990, "FRESH_BP", "Fresh bullpen: quicker hook risk"
 
-    notes = [line_note, vol_note, clv_note, recent_note, real_line_note]
-    notes = [n for n in notes if n and n not in ["Normal line difficulty", "Volatility normal", "No CLV yet", "No recent conversion"]]
-    soft_decision, soft_tier, soft_reason = soft_gate_decision(side, score, conf, " | ".join(flags) if flags else "Clean", edge)
-    return {
-        "Edge Pick": side,
-        "Soft Decision": soft_decision,
-        "Soft Tier": soft_tier,
-        "Soft Reason": soft_reason,
-        "Main K Projection": proj,
-        "Main Line": line,
-        "Edge Gap": None if edge is None else round(abs(edge), 2),
-        "Edge Engine Score": score,
-        "Edge Grade": grade,
-        "Edge Flags": "Clean" if not flags else " | ".join(dict.fromkeys(flags)),
-        "Edge Notes": "—" if not notes else " | ".join(dict.fromkeys(notes)),
-    }
+    factor = clamp(factor, LIGHT_BULLPEN_BF_MIN_FACTOR, LIGHT_BULLPEN_BF_MAX_FACTOR)
+    return float(factor), label, note
 
-
-
-
+def apply_light_bullpen_tax_to_bf(expected_bf, row=None):
+    bf = safe_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
+    factor, label, note = light_bullpen_tax_factor(row)
+    new_bf = float(clamp(bf * factor, 14.0, 31.5))
+    if isinstance(row, dict):
+        row["light_bullpen_tax_factor"] = round(factor, 3)
+        row["light_bullpen_tax_label"] = label
+        row["light_bullpen_tax_note"] = note
+        row["light_bullpen_tax_bf"] = round(new_bf, 2)
+    return new_bf, {"factor": round(factor, 3), "label": label, "note": note}
 
 
 # =========================
-# KPROJ DECISION SYNC HELPERS
-# Every display layer must use kproj_decision(p), the same source as K PROJ / UPSIDE.
+# MONEYLINE EDGE TAB — ISOLATED MODULE
+# Separate ML tab only. Does NOT change K projections, Underdog props,
+# simulations, light true leash/BF, or official K decisions.
 # =========================
-def synced_kproj_decision(p):
-    try:
-        d = kproj_decision(p)
-        if isinstance(d, dict):
-            return d
-    except Exception:
-        pass
-    return {
-        "projection": safe_float(p.get("projection"), None) if isinstance(p, dict) else None,
-        "line": safe_float(p.get("line"), None) if isinstance(p, dict) else None,
-        "lean_side": "NO LINE",
-        "decision": "🚫 PASS",
-        "confidence": None,
-        "edge_gap": None,
-        "line_source": "NO LINE",
-    }
-
-def canonical_k_projection_value(p):
-    d = synced_kproj_decision(p)
-    return safe_float(d.get("projection"), None)
-
-def canonical_k_line_value(p):
-    d = synced_kproj_decision(p)
-    return safe_float(d.get("line"), None)
-
-def canonical_k_side(p):
-    d = synced_kproj_decision(p)
-    side = str(d.get("lean_side") or "").upper()
-    if side in ["OVER", "UNDER", "NO LINE"]:
-        return side
-    proj = safe_float(d.get("projection"), None)
-    line = safe_float(d.get("line"), None)
-    if proj is None or line is None:
-        return "NO LINE"
-    return "OVER" if proj > line else "UNDER"
-
-def canonical_k_edge_gap(p):
-    d = synced_kproj_decision(p)
-    v = safe_float(d.get("edge_gap"), None)
-    if v is not None:
-        return round(abs(v), 2)
-    proj = safe_float(d.get("projection"), None)
-    line = safe_float(d.get("line"), None)
-    if proj is None or line is None:
-        return None
-    return round(abs(proj - line), 2)
-
-def canonical_k_sync_note(p):
-    d = synced_kproj_decision(p)
-    proj = safe_float(d.get("projection"), None)
-    line = safe_float(d.get("line"), None)
-    side = str(d.get("lean_side") or "").upper()
-    if proj is None:
-        return "NO KPROJ DECISION PROJECTION"
-    return f"SYNCED TO KPROJ_DECISION: {proj:.2f} vs {line if line is not None else 'NO LINE'} {side}"
-
-
-def edge_engine_build_board(board):
-    rows = []
-    for p in board or []:
-        if not isinstance(p, dict):
-            continue
-
-        kd = synced_kproj_decision(p)
-        proj = safe_float(kd.get("projection"), None)
-        line = safe_float(kd.get("line"), None)
-        side = str(kd.get("lean_side") or "").upper()
-        if side not in ["OVER", "UNDER", "NO LINE"]:
-            if proj is None or line is None:
-                side = "NO LINE"
-            else:
-                side = "OVER" if proj > line else "UNDER"
-
-        conf = safe_float(kd.get("confidence"), None)
-        fair_pct = None if conf is None else round(conf * 100, 1) if conf <= 1 else round(conf, 1)
-        edge_gap = safe_float(kd.get("edge_gap"), None)
-        if edge_gap is None and proj is not None and line is not None:
-            edge_gap = round(abs(proj - line), 2)
-
-        r = {
-            "Prop": "K PROJ",
-            "Player": p.get("pitcher"),
-            "Pitcher": p.get("pitcher"),
-            "Matchup": p.get("matchup"),
-            "Projection": proj,
-            "Main K Projection": proj,
-            "Line": line,
-            "Main Line": line,
-            "Decision": kd.get("decision"),
-            "Tier": kd.get("tier") or p.get("action_tier"),
-            "Confidence %": fair_pct,
-            "Edge Gap": edge_gap,
-            "Canonical Side": side,
-            "Projection Sync Note": canonical_k_sync_note(p),
-            "Line Source": kd.get("line_source") or "Underdog" if line is not None else "NO LINE",
-            "Lineup": p.get("lineup_status"),
-            "Volatility": p.get("Volatility") or p.get("volatility"),
-            "Recent Conv %": p.get("Recent Conv %") or p.get("hit_rate"),
-            "leash_risk": p.get("leash_risk"),
-        }
-        r.update(ee_grade_row(r))
-        r["Projection Sync"] = "KPROJ_DECISION"
-        rows.append(r)
-
-    df = pd.DataFrame(rows)
-    if not df.empty and "Edge Engine Score" in df.columns:
-        df = df.sort_values("Edge Engine Score", ascending=False)
-    return df
-
-
-def render_edge_engine_cards(df, title="Top Edge Engine Cards", max_cards=8):
-    if df is None or df.empty:
-        return
-    st.markdown(f"<div class='section-title-pro'>{html.escape(title)}</div>", unsafe_allow_html=True)
-    for _, row in df.head(max_cards).iterrows():
-        player = html.escape(str(_ee_get(row, ["Player", "Pitcher"], "Unknown")))
-        matchup = html.escape(str(_ee_get(row, ["Matchup"], "")))
-        side = html.escape(str(_ee_get(row, ["Edge Pick"], "—")))
-        soft_display = html.escape(str(_ee_get(row, ["Soft Decision"], side)))
-        grade = html.escape(str(_ee_get(row, ["Edge Grade"], "—")))
-        proj = _ee_fmt(_ee_get(row, ["Main K Projection", "Projection"], None))
-        line = _ee_fmt(_ee_get(row, ["Main Line", "Line"], None))
-        gap = _ee_fmt(_ee_get(row, ["Edge Gap"], None))
-        score = _ee_fmt(_ee_get(row, ["Edge Engine Score"], None), 1)
-        flags = html.escape(str(_ee_get(row, ["Edge Flags"], "—")))
-        notes = html.escape(str(_ee_get(row, ["Edge Notes","Projection Sync Note"], "—")))
-        side_color = "#22c55e" if side == "OVER" else "#38bdf8" if side == "UNDER" else "#94a3b8"
-        st.markdown(f"""
-        <div style="background:linear-gradient(145deg,#101010,#190000);border:1px solid rgba(255,70,70,.34);border-radius:22px;padding:18px;margin:14px 0;box-shadow:0 0 22px rgba(255,0,0,.13);">
-            <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
-                <div><div style="font-size:28px;font-weight:950;color:#fff;line-height:1.05;">{player}</div><div style="font-size:14px;color:#cbd5e1;margin-top:6px;">{matchup}</div></div>
-                <div style="padding:9px 14px;border-radius:999px;border:1px solid {side_color};color:{side_color};font-weight:950;background:rgba(15,23,42,.72);">{side}</div>
-            </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;"><span class="badge good-badge">K PROJ</span><span class="badge yellow-badge">{grade}</span><span class="badge">{soft_display}</span><span class="badge">Score {score}</span></div>
-            <div class="kpi-strip" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:14px;">
-                <div class="kpi-box"><div class="kpi-label">Projection</div><div class="kpi-value green">{proj}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Line</div><div class="kpi-value">{line}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value green">+{gap}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Score</div><div class="kpi-value">{score}</div></div>
-            </div>
-            <div style="border-left:5px solid #22c55e;background:rgba(15,23,42,.58);border-radius:14px;padding:13px 15px;margin-top:12px;color:#e5e7eb;">
-                <b>Flags:</b> {flags}<br><b>Notes:</b> {notes}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-def render_edge_engine_tab(board, dates=None):
-    st.markdown("### ⚡ Edge Engine 9.5")
-    st.caption("Projection + live line + OVER/UNDER edge + safety score + false-edge warnings. Display layer only; K projection math is untouched.")
-    df = edge_engine_build_board(board)
-    if df is None or df.empty:
-        st.info("No Edge Engine board yet. Refresh the live board first.")
-        return
-    strong = df[df["Edge Grade"].astype(str).str.contains("ELITE|STRONG", regex=True, na=False)]
-    clean = df[df["Edge Flags"].astype(str).eq("Clean")]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Edges", len(df))
-    c2.metric("Elite/Strong", len(strong))
-    c3.metric("Clean", len(clean))
-    c4.metric("Best Score", f"{safe_float(df['Edge Engine Score'].max(), 0):.1f}")
-    render_edge_engine_cards(df, "Top Edge Engine Cards", max_cards=8)
-    keep = [c for c in ["Prop","Player","Matchup","Soft Decision","Edge Pick","Main K Projection","Main Line","Edge Gap","Decision","Tier","Confidence %","Edge Engine Score","Edge Grade","Edge Flags","Edge Notes","Projection Sync Note"] if c in df.columns]
-    st.dataframe(df[keep].head(60), use_container_width=True, hide_index=True)
-
-def render_edge_analytics_tab(board, dates=None):
-    st.markdown("### 📊 Edge Analytics")
-    st.caption("Shows edge distribution and grading health. Display layer only.")
-    df = edge_engine_build_board(board)
-    results = load_json(RESULT_LOG, [])
-    finished = [r for r in results if r.get("actual") is not None and (r.get("graded_result") in ["WIN","LOSS"] or r.get("win") is not None)]
-    wins = sum(1 for r in finished if r.get("graded_result") == "WIN" or r.get("win") is True)
-    losses = sum(1 for r in finished if r.get("graded_result") == "LOSS" or r.get("win") is False)
-    total = wins + losses
-    wr = round((wins / total) * 100, 1) if total else 0
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Graded", total)
-    c2.metric("Record", f"{wins}-{losses}")
-    c3.metric("Win Rate", f"{wr}%")
-    c4.metric("Current Edges", 0 if df is None else len(df))
-    if df is not None and not df.empty:
-        st.dataframe(df.groupby("Edge Grade", dropna=False).size().reset_index(name="Count"), use_container_width=True, hide_index=True)
-        cols = [c for c in ["Player","Matchup","Edge Pick","Main K Projection","Main Line","Edge Gap","Edge Engine Score","Edge Grade","Edge Flags"] if c in df.columns]
-        st.dataframe(df[cols].head(60), use_container_width=True, hide_index=True)
-
-EDGE_ENGINE_MOBILE_POLISH_CSS = """
-<style>
-@media(max-width:900px){
-    .block-container{padding-left:.65rem!important;padding-right:.65rem!important;}
-    .kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))!important;}
-    [data-testid="stMetric"]{padding:10px!important;border-radius:14px!important;}
-    .stTabs [data-baseweb="tab"]{height:38px!important;padding:7px 10px!important;font-size:12px!important;}
+ML_TEAM_MAP = {
+    "ARI":"Arizona Diamondbacks","ATL":"Atlanta Braves","BAL":"Baltimore Orioles","BOS":"Boston Red Sox",
+    "CHC":"Chicago Cubs","CWS":"Chicago White Sox","CHW":"Chicago White Sox","CIN":"Cincinnati Reds",
+    "CLE":"Cleveland Guardians","COL":"Colorado Rockies","DET":"Detroit Tigers","HOU":"Houston Astros",
+    "KC":"Kansas City Royals","LAA":"Los Angeles Angels","LAD":"Los Angeles Dodgers","MIA":"Miami Marlins",
+    "MIL":"Milwaukee Brewers","MIN":"Minnesota Twins","NYM":"New York Mets","NYY":"New York Yankees",
+    "ATH":"Athletics","OAK":"Athletics","PHI":"Philadelphia Phillies","PIT":"Pittsburgh Pirates",
+    "SD":"San Diego Padres","SF":"San Francisco Giants","SEA":"Seattle Mariners","STL":"St. Louis Cardinals",
+    "TB":"Tampa Bay Rays","TEX":"Texas Rangers","TOR":"Toronto Blue Jays","WSH":"Washington Nationals",
 }
-</style>
-"""
-try:
-    st.markdown(EDGE_ENGINE_MOBILE_POLISH_CSS, unsafe_allow_html=True)
-except Exception:
-    pass
+ML_NAME_TO_ABBR = {v.lower().replace(".",""): k for k,v in ML_TEAM_MAP.items()}
 
-
-
-
-MONEYLINE_PRO_UI_MOBILE_CSS = """
-<style>
-@media(max-width:900px){
-    div[style*="grid-template-columns:1fr 70px 1fr"]{
-        grid-template-columns:1fr!important;
-    }
-    div[style*="grid-template-columns:repeat(4,minmax(0,1fr))"]{
-        grid-template-columns:repeat(2,minmax(0,1fr))!important;
-    }
-}
-</style>
-"""
-try:
-    st.markdown(MONEYLINE_PRO_UI_MOBILE_CSS, unsafe_allow_html=True)
-except Exception:
-    pass
-
-
-# =========================
-# MLB TEAM NAME / ABBREVIATION MAP FOR MONEYLINE ODDS MATCHING
-# =========================
-MLB_TEAM_ALIASES = {
-    "ARI": "Arizona Diamondbacks", "AZ": "Arizona Diamondbacks",
-    "ATL": "Atlanta Braves",
-    "BAL": "Baltimore Orioles",
-    "BOS": "Boston Red Sox",
-    "CHC": "Chicago Cubs",
-    "CWS": "Chicago White Sox", "CHW": "Chicago White Sox",
-    "CIN": "Cincinnati Reds",
-    "CLE": "Cleveland Guardians",
-    "COL": "Colorado Rockies",
-    "DET": "Detroit Tigers",
-    "HOU": "Houston Astros",
-    "KC": "Kansas City Royals", "KCR": "Kansas City Royals",
-    "LAA": "Los Angeles Angels",
-    "LAD": "Los Angeles Dodgers",
-    "MIA": "Miami Marlins",
-    "MIL": "Milwaukee Brewers",
-    "MIN": "Minnesota Twins",
-    "NYM": "New York Mets",
-    "NYY": "New York Yankees",
-    "ATH": "Athletics", "OAK": "Athletics",
-    "PHI": "Philadelphia Phillies",
-    "PIT": "Pittsburgh Pirates",
-    "SD": "San Diego Padres", "SDP": "San Diego Padres",
-    "SF": "San Francisco Giants", "SFG": "San Francisco Giants",
-    "SEA": "Seattle Mariners",
-    "STL": "St. Louis Cardinals",
-    "TB": "Tampa Bay Rays", "TBR": "Tampa Bay Rays",
-    "TEX": "Texas Rangers",
-    "TOR": "Toronto Blue Jays",
-    "WSH": "Washington Nationals", "WSN": "Washington Nationals",
-}
-
-PREFERRED_ML_BOOKS = [
-    "draftkings",
-    "fanduel",
-    "betmgm",
-    "caesars",
-    "espnbet",
-    "betrivers",
-    "pointsbetus",
-    "fanatics",
-]
-
-def ml_normalize_team_name(name):
-    s = str(name or "").strip()
-    if not s:
-        return ""
+def ml_abbr(x):
+    s = str(x or "").strip()
     up = s.upper()
-    if up in MLB_TEAM_ALIASES:
-        return MLB_TEAM_ALIASES[up]
-    return s
+    if up in ML_TEAM_MAP:
+        return up
+    low = s.lower().replace(".","")
+    return ML_NAME_TO_ABBR.get(low, up[:3])
 
-def ml_team_match_score(a, b):
-    a = normalize_name(ml_normalize_team_name(a))
-    b = normalize_name(ml_normalize_team_name(b))
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    if a in b or b in a:
-        return 0.94
-    return difflib.SequenceMatcher(None, a, b).ratio()
+def ml_implied(price):
+    p = safe_float(price, None)
+    if p is None:
+        return None
+    return 100/(p+100) if p > 0 else abs(p)/(abs(p)+100)
 
+def ml_no_vig(a, h):
+    ap, hp = ml_implied(a), ml_implied(h)
+    if ap is None or hp is None or ap+hp <= 0:
+        return None, None
+    return ap/(ap+hp), hp/(ap+hp)
 
+@st.cache_data(ttl=180, show_spinner=False)
+def ml_fetch_oddsapi_h2h():
+    key = get_secret("ODDS_API_KEY", "")
+    if not key:
+        return []
+    data = safe_get_json(
+        f"{ODDS_BASE}/sports/baseball_mlb/odds",
+        params={"apiKey": key, "regions": "us", "markets": "h2h", "oddsFormat": "american"},
+        timeout=16
+    )
+    if not isinstance(data, list):
+        return []
+    games = []
+    for g in data:
+        away, home = g.get("away_team"), g.get("home_team")
+        price_map = {}
+        books = []
+        for b in g.get("bookmakers", []) or []:
+            books.append(b.get("title") or b.get("key") or "")
+            for m in b.get("markets", []) or []:
+                if m.get("key") != "h2h":
+                    continue
+                for o in m.get("outcomes", []) or []:
+                    nm, pr = o.get("name"), safe_float(o.get("price"), None)
+                    if nm and pr is not None:
+                        price_map.setdefault(nm.lower().replace(".",""), []).append(pr)
+        def avg_price(team):
+            vals = price_map.get(str(team or "").lower().replace(".",""), [])
+            return None if not vals else int(round(float(np.mean(vals))))
+        ap, hp = avg_price(away), avg_price(home)
+        av, hv = ml_no_vig(ap, hp)
+        games.append({
+            "away": away, "home": home, "away_abbr": ml_abbr(away), "home_abbr": ml_abbr(home),
+            "away_price": ap, "home_price": hp,
+            "away_market": None if av is None else round(av*100, 1),
+            "home_market": None if hv is None else round(hv*100, 1),
+            "books": ", ".join([x for x in sorted(set(books)) if x][:5])
+        })
+    return games
 
-# =========================
-# UNDERDOG GAME EDGE TAB
-# Self-contained game/team lean built only from existing K board + Underdog lines.
-# No sportsbook moneyline odds. No fake moneylines.
-# =========================
-def ge_extract_game_sides(matchup):
+def ml_sides(matchup):
     s = str(matchup or "")
     if "@" not in s:
         return None, None
-    away, home = [x.strip() for x in s.split("@", 1)]
-    return away, home
+    a,h = [x.strip() for x in s.split("@", 1)]
+    return a,h
 
-def ge_line_from_pitcher_row(p):
+def ml_team_score_from_pitcher(p):
     if not isinstance(p, dict):
-        return None
-    return safe_float(p.get("line"), None) if p.get("line") is not None else safe_float(p.get("underdog_line"), None)
-
-def ge_pitcher_team_score(p):
-    """Team/game score using only app's K projection + Underdog line context."""
-    try:
-        if not isinstance(p, dict):
-            return 50.0
-        kd = synced_kproj_decision(p)
-        proj = safe_float(kd.get("projection"), None)
-        line = safe_float(kd.get("line"), None)
-        edge = None if proj is None or line is None else proj - line
-        abs_edge = abs(edge) if edge is not None else 0.0
-        fair = safe_float(p.get("fair_probability"), None)
-        if fair is not None and fair <= 1:
-            fair *= 100
-        conf = fair if fair is not None else 55.0
-        score = 50.0
-        if proj is not None:
-            score += clamp((proj - 4.5) * 2.6, -10, 16)
-        if edge is not None:
-            score += clamp(edge * 4.2, -12, 18)
-        score += clamp((conf - 56) * 0.55, -8, 12)
-        side = "NO LINE" if edge is None else ("OVER" if edge > 0 else "UNDER")
-        if side == "OVER" and abs_edge >= 1.25:
-            score += 4.0
-        elif side == "UNDER" and abs_edge >= 1.0:
-            score -= 4.0
-        lineup = str(p.get("lineup_status") or p.get("Lineup") or "").upper()
-        if "TRUE" in lineup or "CONFIRMED" in lineup:
-            score += 3.0
-        elif "FALLBACK" in lineup:
-            score -= 3.0
-        risk = str(p.get("leash_risk") or p.get("risk_label") or p.get("manager_hook_status") or "").upper()
-        if any(x in risk for x in ["EXTREME", "HIGH", "STRICT", "SHORT"]):
-            score -= 5.5
-        elif any(x in risk for x in ["MILD", "MEDIUM"]):
-            score -= 2.5
-        volatility = safe_float(p.get("Volatility") or p.get("volatility"), None)
-        if volatility is not None:
-            if volatility >= 2.4:
-                score -= 3.5
-            elif volatility >= 1.8:
-                score -= 1.5
-        return float(clamp(score, 20, 82))
-    except Exception:
         return 50.0
+    proj = safe_float(p.get("projection"), None)
+    line = safe_float(p.get("line"), None) if p.get("line") is not None else safe_float(p.get("underdog_line"), None)
+    edge = 0 if proj is None or line is None else proj-line
+    conf = safe_float(p.get("fair_probability") or p.get("hit_rate"), 55) or 55
+    if conf <= 1:
+        conf *= 100
+    score = 50.0
+    if proj is not None:
+        score += clamp((proj-4.5)*2.3, -9, 14)
+    score += clamp(edge*3.4, -10, 15)
+    score += clamp((conf-56)*0.35, -6, 9)
+    leash = safe_float(p.get("light_true_leash_score") or p.get("true_leash_score"), None)
+    if leash is not None:
+        score += clamp((leash-60)*0.10, -4, 4)
+    lineup = str(p.get("lineup_status") or "").upper()
+    if "TRUE" in lineup or "CONFIRMED" in lineup:
+        score += 2
+    elif "FALLBACK" in lineup:
+        score -= 1.5
+    vol = safe_float(p.get("Volatility") or p.get("volatility"), None)
+    if vol is not None and vol >= 2.3:
+        score -= 2
+    return float(clamp(score, 25, 78))
 
-def ge_build_game_edge_board(board):
+def ml_build_board(board):
+    odds = ml_fetch_oddsapi_h2h()
     games = {}
     for p in board or []:
         if not isinstance(p, dict):
             continue
-        matchup = str(p.get("matchup") or "")
-        away, home = ge_extract_game_sides(matchup)
-        team = str(p.get("team") or "")
-        if not matchup or not away or not home or not team:
+        a,h = ml_sides(p.get("matchup"))
+        team = str(p.get("team") or "").upper()
+        if not a or not h or not team:
             continue
-        rec = games.setdefault(matchup, {"Matchup": matchup, "Away": away, "Home": home, "pitchers": []})
+        rec = games.setdefault(f"{a} @ {h}", {"away":a, "home":h, "pitchers":[]})
         rec["pitchers"].append(p)
     rows = []
-    for matchup, g in games.items():
-        away, home = g["Away"], g["Home"]
-        pitchers = g.get("pitchers") or []
-        away_p = next((p for p in pitchers if str(p.get("team") or "").upper() == str(away).upper()), None)
-        home_p = next((p for p in pitchers if str(p.get("team") or "").upper() == str(home).upper()), None)
-        if away_p is None and pitchers:
-            away_p = pitchers[0]
-        if home_p is None and len(pitchers) > 1:
-            home_p = pitchers[1]
-        away_score = ge_pitcher_team_score(away_p)
-        home_score = ge_pitcher_team_score(home_p)
-        total = max(1e-9, away_score + home_score)
-        away_prob = clamp((away_score / total) * 100, 25, 75)
-        home_prob = 100 - away_prob
-        pick_team = away if away_prob >= home_prob else home
-        edge_gap = abs(away_prob - home_prob)
-        flags = []
-        if away_p is None or home_p is None:
-            flags.append("ONE STARTER ONLY")
-        if any("FALLBACK" in str((p or {}).get("lineup_status") or "").upper() for p in [away_p, home_p]):
-            flags.append("FALLBACK LINEUP")
-        if any(ge_line_from_pitcher_row(p) is None for p in [away_p, home_p] if p):
-            flags.append("MISSING UNDERDOG LINE")
-        if edge_gap < 4:
-            flags.append("SMALL GAME EDGE")
-        if edge_gap >= 12 and not flags:
-            grade = f"🔥 {pick_team} GAME EDGE"
-            tier = "OFFICIAL"
-        elif edge_gap >= 8:
-            grade = f"✅ {pick_team} STRONG LEAN"
-            tier = "STRONG"
-        elif edge_gap >= 4:
-            grade = f"⚠️ {pick_team} LEAN"
-            tier = "LEAN"
+    for matchup,g in games.items():
+        a,h = g["away"], g["home"]
+        ps = g["pitchers"]
+        ap = next((p for p in ps if str(p.get("team") or "").upper()==a.upper()), None) or (ps[0] if ps else {})
+        hp = next((p for p in ps if str(p.get("team") or "").upper()==h.upper()), None) or (ps[1] if len(ps)>1 else {})
+        ascore, hscore = ml_team_score_from_pitcher(ap), ml_team_score_from_pitcher(hp)
+        total = max(ascore+hscore, 1e-9)
+        amodel = clamp(ascore/total*100, 25, 75)
+        hmodel = 100-amodel
+        og = next((x for x in odds if x.get("away_abbr")==a and x.get("home_abbr")==h), None)
+        amkt = og.get("away_market") if og else None
+        hmkt = og.get("home_market") if og else None
+        aedge = None if amkt is None else round(amodel-amkt,1)
+        hedge = None if hmkt is None else round(hmodel-hmkt,1)
+        if aedge is None or hedge is None:
+            pick = a if amodel >= hmodel else h
+            edge = round(abs(amodel-hmodel),1)
+            status = "MODEL ONLY"
+            grade = f"MODEL LEAN — {pick}"
         else:
-            grade = f"👀 {pick_team} SMALL EDGE"
-            tier = "SMALL"
+            pick, edge = (a, aedge) if aedge >= hedge else (h, hedge)
+            if edge >= 6:
+                status, grade = "PLAYABLE", f"🔥 ML EDGE — {pick}"
+            elif edge >= 3:
+                status, grade = "LEAN", f"✅ ML LEAN — {pick}"
+            else:
+                status, grade = "PASS", f"🚫 PASS ML — {pick}"
         rows.append({
-            "Matchup": matchup, "Pick": pick_team, "Game Edge Grade": grade, "Tier": tier,
-            "Away": away, "Home": home, "Away Game %": round(away_prob, 1),
-            "Home Game %": round(home_prob, 1), "Game Edge %": round(edge_gap, 1),
-            "Away SP": (away_p or {}).get("pitcher", "—"), "Home SP": (home_p or {}).get("pitcher", "—"),
-            "Away K PROJ": round(safe_float((away_p or {}).get("projection"), 0) or 0, 2) if away_p else None,
-            "Home K PROJ": round(safe_float((home_p or {}).get("projection"), 0) or 0, 2) if home_p else None,
-            "Away Line": ge_line_from_pitcher_row(away_p), "Home Line": ge_line_from_pitcher_row(home_p),
-            "Flags": "Clean" if not flags else " | ".join(dict.fromkeys(flags)),
-            "Source": "Underdog K board + MLB model",
+            "Matchup": matchup, "Pick": pick, "ML Grade": grade, "Status": status, "ML Edge %": edge,
+            "Away Model %": round(amodel,1), "Home Model %": round(hmodel,1),
+            "Away Market %": amkt, "Home Market %": hmkt,
+            "Away Price": og.get("away_price") if og else None, "Home Price": og.get("home_price") if og else None,
+            "Away SP": ap.get("pitcher","—") if isinstance(ap,dict) else "—",
+            "Home SP": hp.get("pitcher","—") if isinstance(hp,dict) else "—",
+            "Source": "OddsAPI + K board" if og else "K board model only"
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("Game Edge %", ascending=False)
+        df = df.sort_values("ML Edge %", ascending=False)
     return df
 
-def render_underdog_game_edge_cards(df, max_cards=8):
-    if df is None or df.empty:
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge")
+    st.caption("Separate ML module. Does not modify K projections, Underdog props, sims, or leash/BF.")
+    df = ml_build_board(board)
+    if df.empty:
+        st.info("No ML board yet. Refresh the K board first.")
         return
-    st.markdown("<div class='section-title-pro'>Underdog Game Edge Cards</div>", unsafe_allow_html=True)
-    for _, r in df.head(max_cards).iterrows():
-        away = str(r.get("Away", "AWY")); home = str(r.get("Home", "HME"))
-        pick = str(r.get("Pick", "—")); grade = str(r.get("Game Edge Grade", "—"))
-        away_prob = safe_float(r.get("Away Game %"), 50) or 50
-        home_prob = safe_float(r.get("Home Game %"), 50) or 50
-        edge = safe_float(r.get("Game Edge %"), 0) or 0
-        flags = str(r.get("Flags", "—"))
-        away_sp = str(r.get("Away SP", "—")); home_sp = str(r.get("Home SP", "—"))
-        away_proj = r.get("Away K PROJ", "—"); home_proj = r.get("Home K PROJ", "—")
-        away_line = r.get("Away Line", "—"); home_line = r.get("Home Line", "—")
-        bar_w = int(max(5, min(95, away_prob)))
-        pick_color = "#22c55e" if str(r.get("Tier","")) in ["OFFICIAL", "STRONG"] else "#facc15"
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Games", len(df))
+    c2.metric("Playable", int((df["Status"]=="PLAYABLE").sum()))
+    c3.metric("Leans", int((df["Status"]=="LEAN").sum()))
+    c4.metric("Odds", "OddsAPI" if any(df["Source"].astype(str).str.contains("OddsAPI", na=False)) else "Model Only")
+    for _,r in df.head(10).iterrows():
         st.markdown(f"""
-        <div style="background:linear-gradient(145deg, rgba(7,12,22,.98), rgba(3,5,10,.98));border:1px solid rgba(34,197,94,.35);border-radius:26px;padding:22px;margin:16px 0;box-shadow:0 18px 46px rgba(0,0,0,.38);overflow:hidden;">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
-                <div style="color:#94a3b8;font-size:13px;font-weight:800;">Underdog K Board • Game Edge</div>
-                <div style="padding:7px 13px;border-radius:999px;border:1px solid rgba(250,204,21,.55);color:#fde68a;background:rgba(250,204,21,.12);font-weight:950;font-size:13px;">{html.escape(str(grade))}</div>
-            </div>
-            <div style="display:grid;grid-template-columns:1fr 70px 1fr;gap:12px;align-items:center;margin-top:20px;text-align:center;">
-                <div><div style="width:74px;height:74px;border-radius:22px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px auto;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.45);color:#22c55e;font-size:32px;font-weight:950;">{html.escape(away[:3])}</div><div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(away)}</div><div style="font-size:13px;color:#cbd5e1;margin-top:6px;">SP: {html.escape(away_sp)}</div><div style="font-size:13px;color:#94a3b8;margin-top:4px;">K {away_proj} vs {away_line}</div></div>
-                <div style="font-size:18px;color:#64748b;font-weight:900;">@</div>
-                <div><div style="width:74px;height:74px;border-radius:22px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px auto;background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.38);color:#f87171;font-size:32px;font-weight:950;">{html.escape(home[:3])}</div><div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(home)}</div><div style="font-size:13px;color:#cbd5e1;margin-top:6px;">SP: {html.escape(home_sp)}</div><div style="font-size:13px;color:#94a3b8;margin-top:4px;">K {home_proj} vs {home_line}</div></div>
-            </div>
-            <div style="margin-top:22px;">
-                <div style="display:flex;justify-content:space-between;color:#cbd5e1;font-size:14px;font-weight:850;margin-bottom:8px;"><span>{html.escape(away)} {away_prob:.1f}%</span><span>App Game Lean</span><span>{html.escape(home)} {home_prob:.1f}%</span></div>
-                <div style="height:8px;background:rgba(148,163,184,.16);border-radius:999px;overflow:hidden;"><div style="height:100%;width:{bar_w}%;background:linear-gradient(90deg,#22c55e,#ef4444);border-radius:999px;"></div></div>
-            </div>
-            <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:18px;">
-                <div class="kpi-box"><div class="kpi-label">Pick</div><div class="kpi-value green">{html.escape(pick)}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{edge:.1f}%</div></div>
-                <div class="kpi-box"><div class="kpi-label">Away %</div><div class="kpi-value">{away_prob:.1f}%</div></div>
-                <div class="kpi-box"><div class="kpi-label">Home %</div><div class="kpi-value">{home_prob:.1f}%</div></div>
-            </div>
-            <div style="margin-top:18px;background:rgba(15,23,42,.70);border:1px solid rgba(34,197,94,.24);border-radius:18px;padding:15px 16px;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;">
-                <div><div style="color:#94a3b8;font-size:12px;font-weight:900;text-transform:uppercase;">Best Team Lean</div><div style="font-size:24px;font-weight:950;color:{pick_color};margin-top:4px;">{html.escape(str(grade))}</div></div>
-                <div style="padding:10px 14px;border-radius:14px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:#86efac;font-weight:950;">No sportsbook odds used</div>
-            </div>
-            <div style="border-left:5px solid #22c55e;background:rgba(2,6,23,.58);border-radius:14px;padding:13px 15px;margin-top:14px;color:#e5e7eb;font-size:14px;"><b>Flags:</b> {html.escape(flags)}<br><b>Source:</b> Underdog K board + MLB model only</div>
+        <div class="pick-card">
+          <div class="small-muted">Moneyline Edge • isolated from K engine</div>
+          <div class="player-name">{html.escape(str(r.get("Matchup","")))}</div>
+          <div class="big-number">{html.escape(str(r.get("Pick","—")))}</div>
+          <div><b>{html.escape(str(r.get("ML Grade","")))}</b> • Edge {r.get("ML Edge %","—")}% • {html.escape(str(r.get("Status","")))}</div>
+          <div class="small-muted">Away model {r.get("Away Model %","—")}% / Home model {r.get("Home Model %","—")}% • Source: {html.escape(str(r.get("Source","")))}</div>
         </div>
         """, unsafe_allow_html=True)
-
-def render_underdog_game_edge_tab(board, dates=None):
-    st.markdown("### 🧭 Underdog Game Edge")
-    st.caption("Self-contained team/game lean built from your K projections + Underdog lines only. No sportsbook moneyline odds. No fake odds.")
-    df = ge_build_game_edge_board(board)
-    if df is None or df.empty:
-        st.info("No game edge board yet. Refresh the live board first.")
-        return
-    strong = df[df["Tier"].isin(["OFFICIAL", "STRONG"])]
-    clean = df[df["Flags"].astype(str).eq("Clean")]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Games", len(df)); c2.metric("Official/Strong", len(strong)); c3.metric("Clean", len(clean)); c4.metric("Best Edge", f"{safe_float(df['Game Edge %'].max(), 0):.1f}%")
-    render_underdog_game_edge_cards(df, max_cards=8)
-    keep = [c for c in ["Matchup","Pick","Game Edge Grade","Tier","Away Game %","Home Game %","Game Edge %","Away SP","Home SP","Away K PROJ","Home K PROJ","Away Line","Home Line","Flags","Source"] if c in df.columns]
-    st.dataframe(df[keep].head(60), use_container_width=True, hide_index=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # =========================
-# END DAY RESULTS / TRACKING TAB
-# Reads saved official picks + graded results. Does not change projections.
+# ELITE SAFETY OVERLAYS
+# 1) Confirmed Lineup Lock / Re-Rank
+# 2) Pitch-Count Restriction Alerts
+# 3) Results Grading Dashboard
+#
+# These are display / confidence / safety overlays.
+# They do NOT change raw K skill math.
 # =========================
-def _trk_safe_date(x):
+
+def elite_lineup_lock_status(p):
+    """Classify lineup confidence from existing lineup fields."""
+    if not isinstance(p, dict):
+        return "UNKNOWN", 0, "No row data"
+    txt = " ".join(str(p.get(k, "")) for k in [
+        "lineup_status", "Lineup", "lineup", "lineup_source", "confirmed_lineup"
+    ]).upper()
+    if any(x in txt for x in ["CONFIRMED", "TRUE LINEUP", "OFFICIAL", "LOCKED"]):
+        return "CONFIRMED", 100, "Official/true lineup loaded"
+    if any(x in txt for x in ["PROJECTED", "PROBABLE"]):
+        return "PROJECTED", 70, "Projected lineup; moderate uncertainty"
+    if "FALLBACK" in txt or not txt.strip():
+        return "FALLBACK", 55, "Fallback team profile; confirm closer to first pitch"
+    return "UNKNOWN", 60, "Lineup status unclear"
+
+def elite_pitch_count_alert(p):
+    """Detect soft pitch-count / role restriction risk from existing fields."""
+    if not isinstance(p, dict):
+        return "UNKNOWN", 0, "No row data"
+
+    flags = []
+    risk_score = 0
+
+    role_text = " ".join(str(p.get(k, "")) for k in [
+        "pitcher_role", "role", "role_note", "starter_note", "leash_risk",
+        "risk_label", "manager_hook_status", "true_leash_label",
+        "light_true_leash_label"
+    ]).upper()
+
+    exp_bf = safe_float(p.get("Exp BF") or p.get("expected_bf") or p.get("light_true_leash_bf") or p.get("true_leash_bf"), None)
+    ip_floor = safe_float(p.get("IP Floor") or p.get("ip_floor"), None)
+    vol = safe_float(p.get("Volatility") or p.get("volatility"), None)
+    starter_score = safe_float(p.get("Starter Score") or p.get("starter_score"), None)
+    role_score = safe_float(p.get("Role Score") or p.get("role_score"), None)
+
+    if any(x in role_text for x in ["OPENER", "BULK", "FOLLOWER"]):
+        risk_score += 40
+        flags.append("OPENER/BULK ROLE")
+    if any(x in role_text for x in ["REHAB", "RETURN", "IL", "INJURY", "LIMIT", "CAP", "RESTRICTION"]):
+        risk_score += 35
+        flags.append("PITCH COUNT RESTRICTION")
+    if any(x in role_text for x in ["STRICT", "SHORT", "DANGER"]):
+        risk_score += 22
+        flags.append("STRICT/SHORT LEASH")
+    if exp_bf is not None and exp_bf < 17.0:
+        risk_score += 18
+        flags.append("LOW BF PATH")
+    if ip_floor is not None and ip_floor < 3.7:
+        risk_score += 16
+        flags.append("LOW IP FLOOR")
+    if vol is not None and vol >= 2.25:
+        risk_score += 12
+        flags.append("HIGH VOLATILITY")
+    if starter_score is not None and starter_score < 55:
+        risk_score += 18
+        flags.append("STARTER SCORE RISK")
+    if role_score is not None and role_score < 50:
+        risk_score += 14
+        flags.append("ROLE SCORE RISK")
+
+    risk_score = int(clamp(risk_score, 0, 100))
+    if risk_score >= 60:
+        label = "HIGH_ALERT"
+    elif risk_score >= 35:
+        label = "MEDIUM_ALERT"
+    elif risk_score >= 15:
+        label = "LOW_ALERT"
+    else:
+        label = "CLEAR"
+
+    note = " | ".join(flags) if flags else "No obvious pitch-count restriction signal"
+    return label, risk_score, note
+
+def elite_pick_safety_overlay(p):
+    """Combine lineup + pitch-count alerts into a non-destructive safety label."""
+    lineup_label, lineup_score, lineup_note = elite_lineup_lock_status(p)
+    pitch_label, pitch_score, pitch_note = elite_pitch_count_alert(p)
+
+    base_conf = safe_float(p.get("fair_probability") or p.get("hit_rate") or p.get("Confidence %"), None)
+    if base_conf is not None and base_conf <= 1:
+        base_conf *= 100
+
+    penalty = 0
+    if lineup_label == "FALLBACK":
+        penalty += 5
+    elif lineup_label == "PROJECTED":
+        penalty += 2
+    if pitch_label == "HIGH_ALERT":
+        penalty += 12
+    elif pitch_label == "MEDIUM_ALERT":
+        penalty += 6
+    elif pitch_label == "LOW_ALERT":
+        penalty += 2
+
+    safety_conf = None if base_conf is None else round(max(0, base_conf - penalty), 1)
+
+    if pitch_label == "HIGH_ALERT":
+        safety = "RECHECK / LEASH RISK"
+    elif lineup_label == "FALLBACK":
+        safety = "WAIT FOR LINEUP"
+    elif safety_conf is not None and safety_conf >= 72:
+        safety = "CLEAN"
+    elif safety_conf is not None and safety_conf >= 62:
+        safety = "OK / MONITOR"
+    else:
+        safety = "MONITOR"
+
+    return {
+        "Lineup Lock": lineup_label,
+        "Lineup Score": lineup_score,
+        "Lineup Note": lineup_note,
+        "Pitch Alert": pitch_label,
+        "Pitch Alert Score": pitch_score,
+        "Pitch Alert Note": pitch_note,
+        "Safety Confidence": safety_conf,
+        "Safety Overlay": safety,
+    }
+
+def apply_elite_safety_overlays_to_board(board):
+    """Attach safety overlay fields to board rows. Does not change projection/line/pick."""
     try:
-        return str(x or "")[:10]
+        for p in board or []:
+            if isinstance(p, dict):
+                p.update(elite_pick_safety_overlay(p))
+        return board
     except Exception:
-        return ""
+        return board
 
-def build_end_day_tracking_frames():
-    picks = load_json(PICK_LOG, [])
-    results = load_json(RESULT_LOG, [])
-
-    picks_rows = []
-    for p in picks or []:
+def render_confirmed_lineup_lock_tab(board, dates=None):
+    st.markdown("### ✅ Confirmed Lineup Lock / Re-Rank")
+    st.caption("Display-only safety layer. It highlights fallback/projected lineups and pitch-count alerts without changing K projections.")
+    board = apply_elite_safety_overlays_to_board(board)
+    rows = []
+    for p in board or []:
         if not isinstance(p, dict):
             continue
-        picks_rows.append({
-            "Date": _trk_safe_date(p.get("date") or p.get("saved_at") or p.get("time")),
-            "Pitcher": p.get("pitcher") or p.get("player") or p.get("Player"),
-            "Matchup": p.get("matchup") or p.get("Matchup"),
-            "Projection": safe_float(p.get("projection") or p.get("K PROJ"), None),
-            "Line": safe_float(p.get("line") or p.get("UD/Line"), None),
-            "Pick": p.get("pick_side") or p.get("side") or p.get("Decision") or p.get("bet_action"),
-            "Decision": p.get("decision") or p.get("bet_action") or p.get("Main Engine Action"),
-            "Confidence %": safe_float(p.get("fair_probability") or p.get("confidence") or p.get("hit_rate"), None),
-            "Source": p.get("line_source") or p.get("source"),
-            "Snapshot": p.get("snapshot_type") or p.get("save_type") or "Before",
-            "Pick ID": p.get("pick_id") or p.get("id"),
+        rows.append({
+            "Pitcher": p.get("pitcher"),
+            "Matchup": p.get("matchup"),
+            "K PROJ": p.get("projection"),
+            "Line": p.get("line") or p.get("underdog_line"),
+            "Pick": p.get("model_lean") or p.get("lean_side") or p.get("Decision"),
+            "Tier": p.get("action_tier") or p.get("Tier"),
+            "Lineup Lock": p.get("Lineup Lock"),
+            "Pitch Alert": p.get("Pitch Alert"),
+            "Safety Overlay": p.get("Safety Overlay"),
+            "Safety Confidence": p.get("Safety Confidence"),
+            "Lineup Note": p.get("Lineup Note"),
+            "Pitch Alert Note": p.get("Pitch Alert Note"),
         })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No board loaded yet.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", len(df))
+    c2.metric("Confirmed", int((df["Lineup Lock"] == "CONFIRMED").sum()))
+    c3.metric("Fallback", int((df["Lineup Lock"] == "FALLBACK").sum()))
+    c4.metric("Pitch Alerts", int(df["Pitch Alert"].astype(str).isin(["HIGH_ALERT","MEDIUM_ALERT"]).sum()))
+    order = {"CLEAN":0, "OK / MONITOR":1, "WAIT FOR LINEUP":2, "RECHECK / LEASH RISK":3, "MONITOR":4}
+    df["_rank"] = df["Safety Overlay"].map(order).fillna(9)
+    df = df.sort_values(["_rank", "Safety Confidence"], ascending=[True, False]).drop(columns=["_rank"])
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    result_rows = []
+def _grade_pick_result(side, line, actual):
+    side = str(side or "").upper()
+    line = safe_float(line, None)
+    actual = safe_float(actual, None)
+    if line is None or actual is None or side not in ["OVER", "UNDER", "O", "U"]:
+        return None
+    if side in ["OVER", "O"]:
+        return "WIN" if actual > line else "LOSS"
+    return "WIN" if actual < line else "LOSS"
+
+def build_results_grading_dashboard_frames():
+    """Read existing result/pick logs if present. Safe if logs do not exist."""
+    picks = load_json(PICK_LOG, []) if "PICK_LOG" in globals() else []
+    results = load_json(RESULT_LOG, []) if "RESULT_LOG" in globals() else []
+
+    rows = []
     for r in results or []:
         if not isinstance(r, dict):
             continue
-        actual = safe_float(r.get("actual") or r.get("actual_ks") or r.get("result"), None)
-        line = safe_float(r.get("line"), None)
-        side = str(r.get("pick_side") or r.get("side") or r.get("Pick") or "").upper()
-        graded = r.get("graded_result")
-        if not graded and actual is not None and line is not None and side in ["OVER", "UNDER"]:
-            if side == "OVER":
-                graded = "WIN" if actual > line else "LOSS"
-            elif side == "UNDER":
-                graded = "WIN" if actual < line else "LOSS"
-        result_rows.append({
-            "Date": _trk_safe_date(r.get("date") or r.get("graded_at") or r.get("time")),
-            "Pitcher": r.get("pitcher") or r.get("player") or r.get("Player"),
+        pitcher = r.get("pitcher") or r.get("player") or r.get("Player")
+        side = r.get("pick_side") or r.get("side") or r.get("Model Lean") or r.get("Pick")
+        line = safe_float(r.get("line") or r.get("Line"), None)
+        actual = safe_float(r.get("actual") or r.get("actual_ks") or r.get("Actual"), None)
+        result = r.get("graded_result") or r.get("Result") or _grade_pick_result(side, line, actual)
+        rows.append({
+            "Date": str(r.get("date") or r.get("graded_at") or "")[:10],
+            "Pitcher": pitcher,
             "Matchup": r.get("matchup") or r.get("Matchup"),
-            "Projection": safe_float(r.get("projection") or r.get("K PROJ"), None),
+            "Pick": side,
             "Line": line,
-            "Pick": side or r.get("pick_side") or r.get("side"),
             "Actual": actual,
-            "Result": graded or ("WIN" if r.get("win") is True else "LOSS" if r.get("win") is False else None),
+            "Result": result,
+            "Projection": safe_float(r.get("projection") or r.get("K PROJ"), None),
+            "Tier": r.get("tier") or r.get("Tier"),
+            "Edge": safe_float(r.get("edge_gap") or r.get("Edge Gap") or r.get("abs_edge"), None),
             "CLV Δ": safe_float(r.get("clv_delta") or r.get("CLV Δ"), None),
-            "Edge": safe_float(r.get("abs_edge") or r.get("edge_gap") or r.get("Edge Gap"), None),
-            "Source": r.get("line_source") or r.get("source"),
-            "Pick ID": r.get("pick_id") or r.get("id"),
+            "Lineup Lock": r.get("Lineup Lock") or r.get("lineup_status"),
+            "Pitch Alert": r.get("Pitch Alert"),
         })
 
-    picks_df = pd.DataFrame(picks_rows)
-    results_df = pd.DataFrame(result_rows)
+    return pd.DataFrame(rows)
 
-    if not results_df.empty:
-        results_df = results_df.sort_values(["Date", "Pitcher"], ascending=[False, True])
-    if not picks_df.empty:
-        picks_df = picks_df.sort_values(["Date", "Pitcher"], ascending=[False, True])
+def render_results_grading_dashboard_tab(board=None, dates=None):
+    st.markdown("### 📊 Results Grading Dashboard")
+    st.caption("Reads saved graded results. Shows win rate by tier, side, edge, lineup, and alert risk.")
+    df = build_results_grading_dashboard_frames()
+    if df.empty:
+        st.info("No graded results found yet. Save before-game picks and grade after games to populate this dashboard.")
+        return
 
-    return picks_df, results_df
-
-def render_end_day_tracking_tab(board=None, dates=None):
-    st.markdown("### 📌 End Day Results / Tracking")
-    st.caption("Tracks saved before-game snapshots and graded after-game results. Display only — no projection math is changed.")
-
-    picks_df, results_df = build_end_day_tracking_frames()
-
-    wins = int((results_df["Result"].astype(str).str.upper() == "WIN").sum()) if not results_df.empty and "Result" in results_df.columns else 0
-    losses = int((results_df["Result"].astype(str).str.upper() == "LOSS").sum()) if not results_df.empty and "Result" in results_df.columns else 0
+    df["Result"] = df["Result"].astype(str).str.upper()
+    wins = int((df["Result"] == "WIN").sum())
+    losses = int((df["Result"] == "LOSS").sum())
     graded = wins + losses
-    wr = round((wins / graded) * 100, 1) if graded else 0
+    wr = round(wins / graded * 100, 1) if graded else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Saved Picks", 0 if picks_df.empty else len(picks_df))
-    c2.metric("Graded", graded)
-    c3.metric("Record", f"{wins}-{losses}")
-    c4.metric("Win Rate", f"{wr}%")
+    c1.metric("Graded", graded)
+    c2.metric("Record", f"{wins}-{losses}")
+    c3.metric("Win Rate", f"{wr}%")
+    if "CLV Δ" in df.columns:
+        c4.metric("Avg CLV Δ", round(pd.to_numeric(df["CLV Δ"], errors="coerce").dropna().mean(), 2) if len(pd.to_numeric(df["CLV Δ"], errors="coerce").dropna()) else "—")
+    else:
+        c4.metric("Avg CLV Δ", "—")
 
-    if not results_df.empty and "Date" in results_df.columns:
-        daily = []
-        for day, g in results_df.groupby("Date", dropna=False):
-            w = int((g["Result"].astype(str).str.upper() == "WIN").sum())
-            l = int((g["Result"].astype(str).str.upper() == "LOSS").sum())
+    def summary(group_col):
+        if group_col not in df.columns:
+            return pd.DataFrame()
+        out = []
+        for k, g in df.groupby(group_col, dropna=False):
+            w = int((g["Result"] == "WIN").sum())
+            l = int((g["Result"] == "LOSS").sum())
             t = w + l
-            daily.append({
-                "Date": day,
-                "Graded": t,
-                "Wins": w,
-                "Losses": l,
-                "Win Rate %": round((w / t) * 100, 1) if t else 0,
-                "Avg CLV Δ": round(pd.to_numeric(g.get("CLV Δ"), errors="coerce").dropna().mean(), 2) if "CLV Δ" in g.columns and len(pd.to_numeric(g.get("CLV Δ"), errors="coerce").dropna()) else None,
-            })
-        daily_df = pd.DataFrame(daily).sort_values("Date", ascending=False)
-        st.subheader("Daily Summary")
-        st.dataframe(daily_df, use_container_width=True, hide_index=True)
+            out.append({group_col: k, "Graded": t, "Wins": w, "Losses": l, "Win Rate %": round(w/t*100, 1) if t else 0})
+        return pd.DataFrame(out).sort_values("Graded", ascending=False)
 
-    st.subheader("Graded Results")
-    if results_df.empty:
-        st.info("No graded results yet. After games, use the After Games / Learning tab to grade.")
+    st.subheader("By Tier")
+    tier_df = summary("Tier")
+    if not tier_df.empty:
+        st.dataframe(tier_df, use_container_width=True, hide_index=True)
+
+    st.subheader("By Pick Side")
+    side_df = summary("Pick")
+    if not side_df.empty:
+        st.dataframe(side_df, use_container_width=True, hide_index=True)
+
+    st.subheader("By Pitch Alert")
+    alert_df = summary("Pitch Alert")
+    if not alert_df.empty:
+        st.dataframe(alert_df, use_container_width=True, hide_index=True)
+
+    st.subheader("All Results")
+    st.dataframe(df.sort_values("Date", ascending=False).head(300), use_container_width=True, hide_index=True)
+
+
+
+# =========================
+# SAFE / VOLATILE CLASSIFIER
+# Non-destructive overlay.
+# Helps identify stable leash/volume arms vs ceiling-chaos arms.
+# Does NOT modify raw K projections.
+# =========================
+
+def elite_safe_volatile_tag(p):
+    if not isinstance(p, dict):
+        return "UNKNOWN", 50, "No row"
+
+    vol = safe_float(p.get("Volatility") or p.get("volatility"), None)
+    whip = safe_float(p.get("WHIP") or p.get("whip"), None)
+    bb = safe_float(p.get("BB%") or p.get("walk_rate") or p.get("bb_rate"), None)
+    bf = safe_float(p.get("Exp BF") or p.get("expected_bf"), None)
+    ip_floor = safe_float(p.get("IP Floor") or p.get("ip_floor"), None)
+    role_score = safe_float(p.get("Role Score") or p.get("role_score"), None)
+    starter_score = safe_float(p.get("Starter Score") or p.get("starter_score"), None)
+    conf = safe_float(p.get("fair_probability") or p.get("hit_rate") or p.get("Confidence %"), None)
+
+    if conf is not None and conf <= 1:
+        conf *= 100
+
+    stable = 0
+    volatile = 0
+    reasons = []
+
+    # Stability signals
+    if bf is not None and bf >= 22:
+        stable += 20
+        reasons.append("STRONG BF")
+    elif bf is not None and bf <= 17:
+        volatile += 20
+        reasons.append("LOW BF")
+
+    if ip_floor is not None and ip_floor >= 5:
+        stable += 18
+        reasons.append("GOOD IP FLOOR")
+    elif ip_floor is not None and ip_floor < 4:
+        volatile += 18
+        reasons.append("LOW IP FLOOR")
+
+    if starter_score is not None and starter_score >= 75:
+        stable += 14
+        reasons.append("STRONG STARTER PROFILE")
+    elif starter_score is not None and starter_score < 50:
+        volatile += 14
+        reasons.append("WEAK STARTER PROFILE")
+
+    if role_score is not None and role_score >= 75:
+        stable += 10
+    elif role_score is not None and role_score < 50:
+        volatile += 10
+
+    if conf is not None and conf >= 74:
+        stable += 10
+    elif conf is not None and conf <= 58:
+        volatile += 10
+
+    # Volatility signals
+    if vol is not None and vol >= 2.25:
+        volatile += 22
+        reasons.append("HIGH VOLATILITY")
+    elif vol is not None and vol <= 1.55:
+        stable += 12
+        reasons.append("LOW VOLATILITY")
+
+    if whip is not None and whip >= 1.35:
+        volatile += 14
+        reasons.append("HIGH WHIP")
+
+    if bb is not None and bb >= 9:
+        volatile += 12
+        reasons.append("HIGH WALK RATE")
+
+    # Safety overlays / leash alerts
+    pitch_alert = str(p.get("Pitch Alert") or "").upper()
+    if "HIGH_ALERT" in pitch_alert:
+        volatile += 20
+        reasons.append("PITCH ALERT")
+    elif "MEDIUM_ALERT" in pitch_alert:
+        volatile += 10
+        reasons.append("MEDIUM ALERT")
+
+    lineup = str(p.get("Lineup Lock") or p.get("lineup_status") or "").upper()
+    if "CONFIRMED" in lineup:
+        stable += 6
+    elif "FALLBACK" in lineup:
+        volatile += 6
+
+    score = int(clamp(50 + stable - volatile, 1, 99))
+
+    if score >= 72:
+        label = "SAFE"
+    elif score <= 42:
+        label = "VOLATILE"
     else:
-        st.dataframe(results_df.head(200), use_container_width=True, hide_index=True)
+        label = "MODERATE"
 
-    st.subheader("Saved Before-Game Snapshots")
-    if picks_df.empty:
-        st.info("No saved official snapshots yet.")
+    return label, score, " | ".join(reasons[:6])
+
+def apply_safe_volatile_tags(board):
+    try:
+        for p in board or []:
+            if isinstance(p, dict):
+                tag, score, note = elite_safe_volatile_tag(p)
+                p["Safety Tag"] = tag
+                p["Safety Score"] = score
+                p["Safety Note"] = note
+        return board
+    except Exception:
+        return board
+
+def render_safe_volatile_tab(board, dates=None):
+    st.markdown("### 🛡️ SAFE / VOLATILE CLASSIFIER")
+    st.caption("Non-destructive stability classifier. Separates stable leash/BF arms from volatility-heavy ceiling arms.")
+
+    board = apply_safe_volatile_tags(board)
+
+    rows = []
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        rows.append({
+            "Pitcher": p.get("pitcher"),
+            "Matchup": p.get("matchup"),
+            "K PROJ": p.get("projection"),
+            "Line": p.get("line") or p.get("underdog_line"),
+            "Pick": p.get("model_lean") or p.get("Decision"),
+            "Tier": p.get("action_tier") or p.get("Tier"),
+            "Safety Tag": p.get("Safety Tag"),
+            "Safety Score": p.get("Safety Score"),
+            "Volatility": p.get("Volatility") or p.get("volatility"),
+            "Exp BF": p.get("Exp BF") or p.get("expected_bf"),
+            "IP Floor": p.get("IP Floor") or p.get("ip_floor"),
+            "Pitch Alert": p.get("Pitch Alert"),
+            "Safety Note": p.get("Safety Note"),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No board loaded yet.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", len(df))
+    c2.metric("SAFE", int((df["Safety Tag"] == "SAFE").sum()))
+    c3.metric("VOLATILE", int((df["Safety Tag"] == "VOLATILE").sum()))
+    c4.metric("MODERATE", int((df["Safety Tag"] == "MODERATE").sum()))
+
+    rank = {"SAFE":0, "MODERATE":1, "VOLATILE":2}
+    df["_r"] = df["Safety Tag"].map(rank).fillna(9)
+    df = df.sort_values(["_r", "Safety Score"], ascending=[True, False]).drop(columns=["_r"])
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+
+# =========================
+# AUTO MLB RESULTS GRADER
+# Pulls final box scores from MLB StatsAPI and grades saved K picks automatically.
+# Safe module: does NOT alter projection math.
+# =========================
+AUTO_RESULTS_GRADE_FILE = "auto_graded_k_results.json"
+
+def _auto_norm_name(x):
+    return re.sub(r"[^a-z]", "", str(x or "").lower())
+
+def _auto_pick_side(p):
+    side = str(p.get("model_lean") or p.get("pick_side") or p.get("side") or p.get("Pick") or p.get("Decision") or "").upper()
+    if "UNDER" in side or side.startswith("U") or "PU" in side:
+        return "UNDER"
+    if "OVER" in side or side.startswith("O") or "PO" in side:
+        return "OVER"
+    return "NO LINE"
+
+def _auto_pick_line(p):
+    return safe_float(p.get("line") or p.get("underdog_line") or p.get("Line") or p.get("UD/Line"), None)
+
+def _auto_grade_result(side, line, actual):
+    side = str(side or "").upper()
+    line = safe_float(line, None)
+    actual = safe_float(actual, None)
+    if side == "OVER":
+        return "WIN" if actual > line else "LOSS"
+    if side == "UNDER":
+        return "WIN" if actual < line else "LOSS"
+    return "NO GRADE"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def auto_fetch_mlb_schedule_results(date_str):
+    """Return final games with pitcher pitching stats from MLB StatsAPI."""
+    try:
+        data = safe_get_json(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId": 1, "date": date_str, "hydrate": "probablePitcher,team"},
+            timeout=20
+        )
+        games = []
+        for d in data.get("dates", []) or []:
+            for g in d.get("games", []) or []:
+                status = ((g.get("status") or {}).get("detailedState") or "").lower()
+                if "final" not in status and "completed" not in status:
+                    continue
+                game_pk = g.get("gamePk")
+                teams = g.get("teams") or {}
+                away_abbr = ((teams.get("away") or {}).get("team") or {}).get("abbreviation")
+                home_abbr = ((teams.get("home") or {}).get("team") or {}).get("abbreviation")
+                games.append({"gamePk": game_pk, "away": away_abbr, "home": home_abbr})
+        return games
+    except Exception:
+        return []
+
+@st.cache_data(ttl=300, show_spinner=False)
+def auto_fetch_boxscore_pitcher_ks(game_pk):
+    """Map normalized pitcher names to strikeouts from MLB boxscore."""
+    try:
+        data = safe_get_json(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore", timeout=20)
+        out = {}
+        teams = data.get("teams") or {}
+        for side in ["away", "home"]:
+            team = teams.get(side) or {}
+            players = team.get("players") or {}
+            for _, pl in players.items():
+                stats = ((pl.get("stats") or {}).get("pitching") or {})
+                if not stats:
+                    continue
+                name = ((pl.get("person") or {}).get("fullName") or "")
+                so = safe_float(stats.get("strikeOuts"), None)
+                if name and so is not None:
+                    out[_auto_norm_name(name)] = int(so)
+        return out
+    except Exception:
+        return {}
+
+def auto_grade_saved_picks_for_date(date_str):
+    """Grades PICK_LOG saved picks for one date using final MLB boxscores."""
+    picks = load_json(PICK_LOG, []) if "PICK_LOG" in globals() else []
+    schedule = auto_fetch_mlb_schedule_results(date_str)
+    all_pitcher_ks = {}
+    for g in schedule:
+        all_pitcher_ks.update(auto_fetch_boxscore_pitcher_ks(g.get("gamePk")))
+
+    graded = []
+    for p in picks or []:
+        if not isinstance(p, dict):
+            continue
+        pdate = str(p.get("date") or p.get("saved_at") or p.get("time") or "")[:10]
+        if pdate and pdate != date_str:
+            continue
+        pitcher = p.get("pitcher") or p.get("player") or p.get("Player")
+        if not pitcher:
+            continue
+        key = _auto_norm_name(pitcher)
+        actual = all_pitcher_ks.get(key)
+        if actual is None:
+            # Try contains match for accents/nickname mismatches
+            for k, v in all_pitcher_ks.items():
+                if key and (key in k or k in key):
+                    actual = v
+                    break
+        side = _auto_pick_side(p)
+        line = _auto_pick_line(p)
+        result = _auto_grade_result(side, line, actual) if actual is not None and line is not None else "PENDING"
+        graded.append({
+            "Date": date_str,
+            "Pitcher": pitcher,
+            "Matchup": p.get("matchup") or p.get("Matchup"),
+            "Pick": side,
+            "Line": line,
+            "Projection": safe_float(p.get("projection") or p.get("K PROJ"), None),
+            "Actual Ks": actual,
+            "Result": result,
+            "Tier": p.get("tier") or p.get("Tier") or p.get("action_tier"),
+            "Saved Decision": p.get("decision") or p.get("Decision") or p.get("bet_action"),
+            "Auto Match": "YES" if actual is not None else "NO MATCH",
+        })
+    return graded
+
+def render_auto_results_grader_tab(board=None, dates=None):
+    st.markdown("### 🤖 Auto Results Grader")
+    st.caption("Pulls final MLB box scores and auto-grades saved K picks. No manual K entry needed.")
+
+    today_default = str(date.today())
+    grade_date = st.date_input("Grade date", value=date.today(), key="auto_grade_date")
+    date_str = str(grade_date)
+
+    c1, c2 = st.columns(2)
+    run = c1.button("🔄 Pull MLB Results + Grade Saved Picks", use_container_width=True)
+    save = c2.button("💾 Save Auto-Graded Results", use_container_width=True)
+
+    if run or save:
+        graded = auto_grade_saved_picks_for_date(date_str)
+        st.session_state["auto_graded_results_preview"] = graded
     else:
-        st.dataframe(picks_df.head(200), use_container_width=True, hide_index=True)
+        graded = st.session_state.get("auto_graded_results_preview", [])
 
-tab_kproj, tab_edge_engine, tab_edge_analytics, tab_game_edge, tab_end_day, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    if save and graded:
+        existing = load_json(AUTO_RESULTS_GRADE_FILE, [])
+        # Deduplicate by date/pitcher/line/pick
+        seen = set()
+        merged = []
+        for row in (existing or []) + graded:
+            key = (row.get("Date"), row.get("Pitcher"), row.get("Pick"), row.get("Line"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+        save_json(AUTO_RESULTS_GRADE_FILE, merged)
+        st.success(f"Saved {len(graded)} auto-graded rows.")
+
+    if not graded:
+        st.info("No auto-graded rows yet. Save official picks before games, then run this after games finish.")
+        return
+
+    df = pd.DataFrame(graded)
+    wins = int((df["Result"].astype(str).str.upper() == "WIN").sum()) if "Result" in df.columns else 0
+    losses = int((df["Result"].astype(str).str.upper() == "LOSS").sum()) if "Result" in df.columns else 0
+    pending = int((df["Result"].astype(str).str.upper() == "PENDING").sum()) if "Result" in df.columns else 0
+    total = wins + losses
+    wr = round(wins / total * 100, 1) if total else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Wins", wins)
+    m2.metric("Losses", losses)
+    m3.metric("Pending/No Match", pending)
+    m4.metric("Win Rate", f"{wr}%")
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+tab_kproj, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
-    "EDGE ENGINE",
-    "EDGE ANALYTICS",
-    "UNDERDOG GAME EDGE",
-    "END DAY TRACKING",
+    "MONEYLINE EDGE",
+    "LINEUP LOCK",
+    "RESULTS DASHBOARD",
+    "AUTO RESULTS",
+    "SAFE/VOLATILE",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -7929,17 +7642,20 @@ tab_kproj, tab_edge_engine, tab_edge_analytics, tab_game_edge, tab_end_day, tab1
 with tab_kproj:
     render_kproj_tab(board)
 
-with tab_edge_engine:
-    render_edge_engine_tab(board, dates)
+with tab_moneyline_edge:
+    render_moneyline_edge_tab(board, dates)
 
-with tab_edge_analytics:
-    render_edge_analytics_tab(board, dates)
+with tab_lineup_lock:
+    render_confirmed_lineup_lock_tab(board, dates)
 
-with tab_game_edge:
-    render_underdog_game_edge_tab(board, dates)
+with tab_results_dash:
+    render_results_grading_dashboard_tab(board, dates)
 
-with tab_end_day:
-    render_end_day_tracking_tab(board, dates)
+with tab_auto_results:
+    render_auto_results_grader_tab(board, dates)
+
+with tab_safe_vol:
+    render_safe_volatile_tab(board, dates)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
