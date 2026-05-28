@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI"
 
 try:
     import pytz
@@ -7623,13 +7623,342 @@ def render_auto_results_grader_tab(board=None, dates=None):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-tab_kproj, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# ELITE REFINEMENT LAYERS
+# 1) Advanced Pitch-Type Matchup Layer
+# 2) Advanced Umpire K Refinement
+# 3) UI Polish Helpers
+#
+# Safe design:
+# - light caps only
+# - does not rewrite raw pitcher K skill
+# - creates display fields + small projection-quality notes
+# =========================
+
+PITCH_TYPE_MATCHUP_ENABLED = True
+PITCH_TYPE_K_FACTOR_MIN = 0.965
+PITCH_TYPE_K_FACTOR_MAX = 1.040
+PITCH_TYPE_MAX_KS_SHIFT_DISPLAY = 0.45
+
+ADV_UMPIRE_REFINEMENT_ENABLED = True
+ADV_UMPIRE_FACTOR_MIN = 0.980
+ADV_UMPIRE_FACTOR_MAX = 1.020
+
+def _pt_safe_pct(x, default=None):
+    v = safe_float(x, default)
+    if v is None:
+        return default
+    if v > 1.0:
+        return v / 100.0
+    return v
+
+def normalize_pitch_type_key(x):
+    t = str(x or "").upper().strip()
+    aliases = {
+        "4-SEAM": "FF", "4SEAM": "FF", "FOUR-SEAM": "FF", "FASTBALL": "FF", "FB": "FF",
+        "SINKER": "SI", "TWO-SEAM": "SI", "2-SEAM": "SI",
+        "SLIDER": "SL", "SWEEPER": "ST",
+        "CURVE": "CU", "CURVEBALL": "CU", "KNUCKLE CURVE": "KC",
+        "CHANGEUP": "CH", "CHANGE": "CH",
+        "SPLITTER": "FS", "SPLIT": "FS", "SPL": "FS",
+        "CUTTER": "FC", "CUT": "FC",
+    }
+    return aliases.get(t, t)
+
+def extract_pitch_mix_from_row(row):
+    """Return pitch mix list from existing fields if present.
+    Expected supported formats:
+    - row['pitch_mix'] list/dict
+    - row['pitch_type_rows'] list
+    - columns like FF%, SL%, CH%
+    """
+    row = row or {}
+    mix = []
+
+    raw = row.get("pitch_mix") or row.get("arsenal") or row.get("pitch_type_mix")
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            usage = _pt_safe_pct(v, None)
+            if usage is not None:
+                mix.append({"pitch": normalize_pitch_type_key(k), "usage": usage})
+    elif isinstance(raw, list):
+        for r in raw:
+            if isinstance(r, dict):
+                pt = r.get("pitch") or r.get("pitch_type") or r.get("type") or r.get("name")
+                usage = _pt_safe_pct(r.get("usage") or r.get("usage_pct") or r.get("pct") or r.get("percent"), None)
+                whiff = _pt_safe_pct(r.get("whiff") or r.get("whiff_pct") or r.get("whiff_rate"), None)
+                if pt and usage is not None:
+                    mix.append({"pitch": normalize_pitch_type_key(pt), "usage": usage, "whiff": whiff})
+    ptr = row.get("pitch_type_rows")
+    if isinstance(ptr, list):
+        for r in ptr:
+            if isinstance(r, dict):
+                pt = r.get("pitch_type") or r.get("pitch") or r.get("type")
+                usage = _pt_safe_pct(r.get("usage") or r.get("usage_pct") or r.get("pitch_pct"), None)
+                whiff = _pt_safe_pct(r.get("whiff") or r.get("whiff_pct") or r.get("whiff_rate"), None)
+                if pt and usage is not None:
+                    mix.append({"pitch": normalize_pitch_type_key(pt), "usage": usage, "whiff": whiff})
+
+    # Column fallback.
+    for key in ["FF","SI","FC","SL","ST","CU","KC","CH","FS","SPL","CRV","CUT","FB"]:
+        for suffix in ["%", "_pct", "_usage", " usage"]:
+            val = row.get(f"{key}{suffix}")
+            usage = _pt_safe_pct(val, None)
+            if usage is not None:
+                mix.append({"pitch": normalize_pitch_type_key(key), "usage": usage})
+
+    # Deduplicate by pitch type, keep max usage.
+    dedup = {}
+    for r in mix:
+        pt = normalize_pitch_type_key(r.get("pitch"))
+        usage = _pt_safe_pct(r.get("usage"), None)
+        if not pt or usage is None or usage <= 0:
+            continue
+        old = dedup.get(pt, {})
+        if usage > old.get("usage", -1):
+            dedup[pt] = {"pitch": pt, "usage": usage, "whiff": r.get("whiff")}
+    out = sorted(dedup.values(), key=lambda x: x.get("usage", 0), reverse=True)
+    return out[:6]
+
+def opponent_pitch_type_weakness(row, pitch):
+    """Light opponent weakness lookup. Falls back to neutral if not available."""
+    row = row or {}
+    pt = normalize_pitch_type_key(pitch)
+    keys = [
+        f"opp_whiff_vs_{pt}", f"opp_k_vs_{pt}", f"lineup_whiff_vs_{pt}",
+        f"team_whiff_vs_{pt}", f"opp_contact_vs_{pt}", f"opp_slg_vs_{pt}",
+    ]
+    whiff = None
+    contact = None
+    slg = None
+    for k in keys:
+        lk = k.lower()
+        v = _pt_safe_pct(row.get(k) or row.get(lk), None)
+        if v is None:
+            continue
+        if "contact" in lk:
+            contact = v
+        elif "slg" in lk:
+            slg = safe_float(row.get(k) or row.get(lk), None)
+        else:
+            whiff = v
+    # Convert known attributes into weakness score around neutral 0.
+    score = 0.0
+    if whiff is not None:
+        score += clamp((whiff - 0.25) / 0.10, -1.0, 1.0)
+    if contact is not None:
+        score += clamp((0.76 - contact) / 0.10, -1.0, 1.0)
+    if slg is not None:
+        score += clamp((0.430 - slg) / 0.120, -1.0, 1.0)
+    return clamp(score, -1.5, 1.5)
+
+def advanced_pitch_type_matchup_factor(row):
+    """Small arsenal-vs-lineup factor.
+    Uses available pitch mix + opponent pitch-type weakness. Neutral if no data.
+    """
+    if not PITCH_TYPE_MATCHUP_ENABLED:
+        return 1.0, "OFF", "Pitch-type matchup off", []
+    mix = extract_pitch_mix_from_row(row)
+    if not mix:
+        return 1.0, "UNKNOWN", "No pitch-type mix available", []
+
+    weighted = 0.0
+    total_usage = 0.0
+    details = []
+    for r in mix:
+        pt = normalize_pitch_type_key(r.get("pitch"))
+        usage = _pt_safe_pct(r.get("usage"), 0) or 0
+        whiff = _pt_safe_pct(r.get("whiff"), None)
+        opp = opponent_pitch_type_weakness(row, pt)
+
+        # Pitcher's own pitch whiff vs rough league baseline, light.
+        own_pitch_edge = 0.0
+        league = LEAGUE_AVG_WHIFF_BY_PITCH_TYPE.get(pt, 0.25) if "LEAGUE_AVG_WHIFF_BY_PITCH_TYPE" in globals() else 0.25
+        if whiff is not None:
+            own_pitch_edge = clamp((whiff - league) / 0.10, -1.0, 1.0)
+
+        pitch_score = (opp * 0.70) + (own_pitch_edge * 0.30)
+        weighted += usage * pitch_score
+        total_usage += usage
+        details.append(f"{pt} {usage*100:.0f}% score {pitch_score:+.2f}")
+
+    if total_usage <= 0:
+        return 1.0, "UNKNOWN", "No usable pitch mix", []
+
+    matchup_score = weighted / total_usage
+    factor = clamp(1.0 + matchup_score * 0.026, PITCH_TYPE_K_FACTOR_MIN, PITCH_TYPE_K_FACTOR_MAX)
+
+    if factor >= 1.020:
+        label = "ARSENAL_EDGE"
+    elif factor <= 0.985:
+        label = "ARSENAL_RISK"
+    else:
+        label = "ARSENAL_NEUTRAL"
+
+    note = f"{label}: pitch-type matchup factor x{factor:.3f}"
+    return float(factor), label, note, details[:5]
+
+def advanced_umpire_k_refinement_factor(row):
+    """Light advanced umpire K refinement using existing umpire fields if available."""
+    if not ADV_UMPIRE_REFINEMENT_ENABLED:
+        return 1.0, "OFF", "Advanced umpire off"
+
+    row = row or {}
+    ump_factor_existing = safe_float(row.get("ump_factor") or row.get("umpire_factor"), None)
+    called_strike = _pt_safe_pct(row.get("ump_called_strike_rate") or row.get("called_strike_rate"), None)
+    zone = _pt_safe_pct(row.get("ump_zone_boost") or row.get("zone_boost"), None)
+    walk = _pt_safe_pct(row.get("ump_walk_rate") or row.get("walk_rate_allowed"), None)
+    text = " ".join(str(row.get(k, "")) for k in ["umpire", "umpire_note", "umpire_profile", "umpire_label"]).upper()
+
+    factor = 1.0
+    reasons = []
+
+    if ump_factor_existing is not None:
+        factor *= clamp(ump_factor_existing, 0.985, 1.015)
+        reasons.append(f"base {ump_factor_existing:.3f}")
+
+    if called_strike is not None:
+        if called_strike >= 0.175:
+            factor *= 1.010
+            reasons.append("high called strikes")
+        elif called_strike <= 0.155:
+            factor *= 0.990
+            reasons.append("low called strikes")
+
+    if walk is not None:
+        if walk >= 0.095:
+            factor *= 0.990
+            reasons.append("walk-prone zone")
+        elif walk <= 0.070:
+            factor *= 1.006
+            reasons.append("low-walk zone")
+
+    if any(x in text for x in ["WIDE", "STRIKE", "PITCHER", "K BOOST"]):
+        factor *= 1.008
+        reasons.append("pitcher-friendly")
+    elif any(x in text for x in ["TIGHT", "HITTER", "LOW K", "SMALL ZONE"]):
+        factor *= 0.992
+        reasons.append("hitter-friendly")
+
+    factor = clamp(factor, ADV_UMPIRE_FACTOR_MIN, ADV_UMPIRE_FACTOR_MAX)
+
+    if factor >= 1.008:
+        label = "UMP_K_BOOST"
+    elif factor <= 0.992:
+        label = "UMP_K_DRAG"
+    else:
+        label = "UMP_NEUTRAL"
+    note = f"{label}: x{factor:.3f}" + (f" ({', '.join(reasons[:3])})" if reasons else "")
+    return float(factor), label, note
+
+def apply_elite_refinement_overlays(board):
+    """Attach pitch-type and advanced umpire fields only. Does not change raw projections."""
+    try:
+        for p in board or []:
+            if not isinstance(p, dict):
+                continue
+            pt_factor, pt_label, pt_note, pt_details = advanced_pitch_type_matchup_factor(p)
+            ump_factor, ump_label, ump_note = advanced_umpire_k_refinement_factor(p)
+            p["Pitch-Type Factor"] = round(pt_factor, 3)
+            p["Pitch-Type Label"] = pt_label
+            p["Pitch-Type Note"] = pt_note
+            p["Pitch-Type Details"] = " | ".join(pt_details)
+            p["Advanced Umpire Factor"] = round(ump_factor, 3)
+            p["Advanced Umpire Label"] = ump_label
+            p["Advanced Umpire Note"] = ump_note
+
+            # Display-only refined read, capped. Does not replace K PROJ.
+            proj = safe_float(p.get("projection") or p.get("K PROJ"), None)
+            if proj is not None:
+                factor = clamp(pt_factor * ump_factor, 0.955, 1.055)
+                refined = proj * factor
+                shift = clamp(refined - proj, -PITCH_TYPE_MAX_KS_SHIFT_DISPLAY, PITCH_TYPE_MAX_KS_SHIFT_DISPLAY)
+                p["Refined Read"] = round(proj + shift, 2)
+                p["Refined Shift"] = round(shift, 2)
+        return board
+    except Exception:
+        return board
+
+def render_pitchtype_umpire_refinement_tab(board, dates=None):
+    st.markdown("### 🎯 Pitch-Type + Umpire Refinement")
+    st.caption("Display-only refinement layer. Shows arsenal matchup and umpire K influence without rewriting the base K projection.")
+    board = apply_elite_refinement_overlays(board)
+
+    rows = []
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        rows.append({
+            "Pitcher": p.get("pitcher"),
+            "Matchup": p.get("matchup"),
+            "K PROJ": p.get("projection"),
+            "Refined Read": p.get("Refined Read"),
+            "Refined Shift": p.get("Refined Shift"),
+            "Line": p.get("line") or p.get("underdog_line"),
+            "Pick": p.get("model_lean") or p.get("Decision"),
+            "Tier": p.get("action_tier") or p.get("Tier"),
+            "Safety Tag": p.get("Safety Tag"),
+            "Pitch-Type Label": p.get("Pitch-Type Label"),
+            "Pitch-Type Factor": p.get("Pitch-Type Factor"),
+            "Advanced Umpire Label": p.get("Advanced Umpire Label"),
+            "Advanced Umpire Factor": p.get("Advanced Umpire Factor"),
+            "Pitch-Type Note": p.get("Pitch-Type Note"),
+            "Pitch-Type Details": p.get("Pitch-Type Details"),
+            "Advanced Umpire Note": p.get("Advanced Umpire Note"),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No board loaded yet.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", len(df))
+    c2.metric("Arsenal Edges", int((df["Pitch-Type Label"] == "ARSENAL_EDGE").sum()))
+    c3.metric("Arsenal Risks", int((df["Pitch-Type Label"] == "ARSENAL_RISK").sum()))
+    c4.metric("Ump K Boosts", int((df["Advanced Umpire Label"] == "UMP_K_BOOST").sum()))
+
+    df["_abs_shift"] = pd.to_numeric(df["Refined Shift"], errors="coerce").abs()
+    df = df.sort_values("_abs_shift", ascending=False).drop(columns=["_abs_shift"])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+def render_elite_ui_polish_header(board):
+    """Compact visual readout for safest/most volatile profile. UI-only."""
+    try:
+        board = apply_safe_volatile_tags(board) if "apply_safe_volatile_tags" in globals() else board
+        board = apply_elite_refinement_overlays(board)
+        rows = [p for p in (board or []) if isinstance(p, dict)]
+        if not rows:
+            return
+        safe_count = sum(1 for p in rows if p.get("Safety Tag") == "SAFE")
+        volatile_count = sum(1 for p in rows if p.get("Safety Tag") == "VOLATILE")
+        arsenal_edges = sum(1 for p in rows if p.get("Pitch-Type Label") == "ARSENAL_EDGE")
+        lineup_confirmed = sum(1 for p in rows if str(p.get("Lineup Lock") or "").upper() == "CONFIRMED")
+        st.markdown(f"""
+        <div class="hero-panel">
+            <div class="big-title">Elite Board Control Center</div>
+            <div class="sub-title">SAFE/VOLATILE • Pitch-Type Matchup • Umpire Refinement • Lineup Lock</div>
+            <div class="kpi-strip">
+                <div class="kpi-box"><div class="kpi-label">SAFE</div><div class="kpi-value green">{safe_count}</div><div class="kpi-sub">stable profiles</div></div>
+                <div class="kpi-box"><div class="kpi-label">VOLATILE</div><div class="kpi-value red">{volatile_count}</div><div class="kpi-sub">chaos watch</div></div>
+                <div class="kpi-box"><div class="kpi-label">ARSENAL EDGE</div><div class="kpi-value green">{arsenal_edges}</div><div class="kpi-sub">pitch-type boost</div></div>
+                <div class="kpi-box"><div class="kpi-label">LINEUP LOCK</div><div class="kpi-value orange">{lineup_confirmed}</div><div class="kpi-sub">confirmed</div></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    except Exception:
+        return
+
+
+tab_kproj, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "MONEYLINE EDGE",
     "LINEUP LOCK",
     "RESULTS DASHBOARD",
     "AUTO RESULTS",
     "SAFE/VOLATILE",
+    "PITCH TYPE / UMP",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -7656,6 +7985,9 @@ with tab_auto_results:
 
 with tab_safe_vol:
     render_safe_volatile_tab(board, dates)
+
+with tab_pitch_ump:
+    render_pitchtype_umpire_refinement_tab(board, dates)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
