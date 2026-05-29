@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + MOBILE CLEAN K UI"
 
 try:
     import pytz
@@ -225,6 +225,146 @@ OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 # =========================
 # PAGE CONFIG + UI
 # =========================
+
+# =========================
+# MOBILE CLEAN K UPSIDE UI
+# UI-only CSS. Does NOT touch projections, simulations, picks, lines, or Final Board math.
+# =========================
+def inject_mobile_clean_k_ui():
+    st.markdown("""
+    <style>
+    /* Mobile-first cleanup for K Upside / player cards */
+    @media (max-width: 760px) {
+        .block-container {
+            padding-left: 0.55rem !important;
+            padding-right: 0.55rem !important;
+            max-width: 100% !important;
+        }
+
+        /* Main card: no sideways overflow */
+        .pick-card,
+        .hero-panel,
+        div[data-testid="stVerticalBlock"] > div {
+            max-width: 100% !important;
+            overflow-x: hidden !important;
+        }
+
+        /* Player card internal layout */
+        .pick-card {
+            padding: 18px 16px !important;
+            border-radius: 22px !important;
+        }
+
+        .player-name {
+            font-size: 30px !important;
+            line-height: 1.05 !important;
+            word-break: normal !important;
+            overflow-wrap: anywhere !important;
+        }
+
+        .small-muted {
+            font-size: 14px !important;
+            line-height: 1.25 !important;
+        }
+
+        .big-number {
+            font-size: 42px !important;
+            line-height: 1.0 !important;
+        }
+
+        .badge {
+            font-size: 14px !important;
+            padding: 8px 11px !important;
+            border-radius: 999px !important;
+            white-space: normal !important;
+        }
+
+        /* KPI strips become readable 2-column cards */
+        .kpi-strip {
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            gap: 10px !important;
+            width: 100% !important;
+        }
+
+        .kpi-box {
+            min-width: 0 !important;
+            padding: 12px 10px !important;
+            border-radius: 16px !important;
+            overflow-wrap: anywhere !important;
+            word-break: normal !important;
+            text-align: center !important;
+        }
+
+        .kpi-label {
+            font-size: 11px !important;
+            letter-spacing: .04em !important;
+            line-height: 1.15 !important;
+            white-space: normal !important;
+        }
+
+        .kpi-value {
+            font-size: 28px !important;
+            line-height: 1.05 !important;
+            white-space: normal !important;
+        }
+
+        .kpi-sub {
+            font-size: 12px !important;
+            line-height: 1.2 !important;
+            white-space: normal !important;
+        }
+
+        /* Prevent skinny unreadable stat columns */
+        [class*="metric"],
+        div[data-testid="stMetric"] {
+            min-width: 0 !important;
+            overflow-wrap: anywhere !important;
+        }
+
+        div[data-testid="stMetricValue"] {
+            font-size: 28px !important;
+            line-height: 1.05 !important;
+        }
+
+        div[data-testid="stMetricLabel"] {
+            font-size: 13px !important;
+            white-space: normal !important;
+        }
+
+        /* Tables still scroll horizontally instead of squeezing text */
+        div[data-testid="stDataFrame"] {
+            overflow-x: auto !important;
+        }
+
+        /* Make columns stack better on phone */
+        div[data-testid="column"] {
+            min-width: 0 !important;
+        }
+    }
+
+    /* Extra tiny phone width */
+    @media (max-width: 430px) {
+        .kpi-strip {
+            grid-template-columns: 1fr 1fr !important;
+        }
+        .player-name {
+            font-size: 28px !important;
+        }
+        .big-number {
+            font-size: 38px !important;
+        }
+        .kpi-value {
+            font-size: 25px !important;
+        }
+        .pick-card {
+            padding: 16px 13px !important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
 st.set_page_config(
     page_title="MLB K Prop Engine — Refresh Then Save",
     layout="wide",
@@ -7073,24 +7213,76 @@ def render_moneyline_logo_card(r):
     """, unsafe_allow_html=True)
 
 
+
+ML_TEAM_COLORS = {"ARI":"#A71930","ATL":"#CE1141","BAL":"#DF4601","BOS":"#BD3039","CHC":"#0E3386","CWS":"#C4CED4","CHW":"#C4CED4","CIN":"#C6011F","CLE":"#E31937","COL":"#33006F","DET":"#0C2340","HOU":"#EB6E1F","KC":"#004687","KCR":"#004687","LAA":"#BA0021","LAD":"#005A9C","MIA":"#00A3E0","MIL":"#FFC52F","MIN":"#D31145","NYM":"#FF5910","NYY":"#003087","ATH":"#003831","OAK":"#003831","PHI":"#E81828","PIT":"#FDB827","SD":"#2F241D","SDP":"#2F241D","SF":"#FD5A1E","SFG":"#FD5A1E","SEA":"#005C5C","STL":"#C41E3A","TB":"#8FBCE6","TBR":"#8FBCE6","TEX":"#003278","TOR":"#134A8E","WSH":"#AB0003","WSN":"#AB0003"}
+
+def ml_team_color(abbr):
+    return ML_TEAM_COLORS.get(str(abbr or "").upper().strip(), "#3fa2ff")
+
+def ml_ring(edge, color):
+    val = safe_float(edge, 0) or 0
+    pct = max(8, min(100, val * 4.5))
+    dash = 2.64 * pct
+    return f'<svg width="48" height="48" viewBox="0 0 54 54"><circle cx="27" cy="27" r="21" stroke="rgba(255,255,255,.25)" stroke-width="8" fill="none"/><circle cx="27" cy="27" r="21" stroke="{color}" stroke-width="8" fill="none" stroke-dasharray="{dash:.1f} 264" stroke-linecap="round" transform="rotate(-90 27 27)"/><circle cx="27" cy="27" r="11" fill="#05070d"/></svg>'
+
+def render_moneyline_pro_board(df):
+    css = """
+    <style>
+    .ml-board{border:1px solid rgba(80,145,255,.45);border-radius:18px;overflow:hidden;background:#05070d;box-shadow:0 0 28px rgba(45,125,255,.20);margin:12px 0 22px;}
+    .ml-head,.ml-row{display:grid;grid-template-columns:2.1fr 1.05fr 1.75fr 1.05fr;}
+    .ml-head div{font-weight:900;color:white;text-align:center;padding:13px;border-right:1px solid rgba(80,145,255,.28);background:#0a1022;letter-spacing:.08em;}
+    .ml-row{min-height:76px;border-top:1px solid rgba(80,145,255,.22);background:linear-gradient(90deg,var(--away),rgba(8,13,30,.94),var(--pick));}
+    .ml-cell{display:flex;align-items:center;justify-content:center;gap:12px;padding:10px 12px;border-right:1px solid rgba(80,145,255,.18);}
+    .ml-logo{width:52px;height:52px;object-fit:contain;filter:drop-shadow(0 0 8px rgba(255,255,255,.25));}
+    .ml-abbr{font-size:29px;font-weight:950;color:#fff;text-shadow:0 0 12px rgba(255,255,255,.16);}
+    .ml-pick{font-size:32px;font-weight:950;font-style:italic;text-shadow:0 0 12px currentColor;}
+    .ml-grade{font-size:22px;font-weight:950;font-style:italic;color:#fff;text-align:center;}
+    .ml-edge{font-size:34px;font-weight:950;color:#fff;font-style:italic;}
+    .ml-at{font-size:26px;font-weight:900;color:#fff;}
+    .ml-sp{font-size:10px;color:rgba(255,255,255,.65);max-width:90px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+    @media(max-width:900px){.ml-head{display:none}.ml-row{grid-template-columns:1fr}.ml-cell{border-right:0;border-bottom:1px solid rgba(80,145,255,.18)}}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+    html_rows = ['<div class="ml-board"><div class="ml-head"><div>MATCHUP</div><div>PICK</div><div>ML GRADE</div><div>ML EDGE %</div></div>']
+    for _, r in df.iterrows():
+        away, home = ml_split_matchup(r.get("Matchup",""))
+        pick = str(r.get("Pick","")).upper().strip()
+        edge = r.get("ML Edge %","—")
+        grade = str(r.get("ML Grade","—"))
+        ac, pc = ml_team_color(away), ml_team_color(pick)
+        edge_val = safe_float(edge,0) or 0
+        ring_color = "#3fa2ff" if edge_val >= 4 else "#ff415f" if edge_val >= 2 else "#b8c2d8"
+        def logo(abbr):
+            url = ml_team_logo_url(abbr)
+            return f'<img class="ml-logo" src="{url}" alt="{abbr}">' if url else f'<div class="ml-logo ml-abbr">{abbr}</div>'
+        grade_colored = grade.replace(pick, f'<span style="color:{pc};">{pick}</span>')
+        row_html = f"""
+        <div class="ml-row" style="--away:{ac}55;--pick:{pc}55;">
+          <div class="ml-cell">{logo(away)}<div><div class="ml-abbr">{away}</div><div class="ml-sp">{r.get("Away SP","—")}</div></div><div class="ml-at">@</div>{logo(home)}<div><div class="ml-abbr">{home}</div><div class="ml-sp">{r.get("Home SP","—")}</div></div></div>
+          <div class="ml-cell">{logo(pick)}<div class="ml-pick" style="color:{pc};">{pick}</div></div>
+          <div class="ml-cell"><div class="ml-grade">{grade_colored}</div></div>
+          <div class="ml-cell">{ml_ring(edge, ring_color)}<div class="ml-edge">{edge}%</div></div>
+        </div>"""
+        html_rows.append(row_html)
+    html_rows.append("</div>")
+    st.markdown("".join(html_rows), unsafe_allow_html=True)
+
+
 def render_moneyline_edge_tab(board, dates=None):
     st.markdown("### 💰 Moneyline Edge")
-    st.caption("Separate ML module. Logo-card UI only; it does not modify K projections or ML math.")
+    st.caption("Separate ML module. Pro-board UI only; it does not modify K projections or ML math.")
     df = ml_build_board(board)
     if df.empty:
         st.info("No ML board yet. Refresh the K board first.")
         return
-
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Games", len(df))
     c2.metric("Playable", int((df["Status"]=="PLAYABLE").sum()))
     c3.metric("Leans", int((df["Status"]=="LEAN").sum()))
     c4.metric("Odds", "OddsAPI" if any(df["Source"].astype(str).str.contains("OddsAPI", na=False)) else "Model Only")
-
-    st.markdown('<div class="section-title-pro">Top Moneyline Cards</div>', unsafe_allow_html=True)
-    for _, r in df.head(10).iterrows():
-        render_moneyline_logo_card(r)
-
+    st.markdown('<div class="section-title-pro">Moneyline Pro Board</div>', unsafe_allow_html=True)
+    render_moneyline_pro_board(df.head(15))
     st.markdown('<div class="section-title-pro">Moneyline Table</div>', unsafe_allow_html=True)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
