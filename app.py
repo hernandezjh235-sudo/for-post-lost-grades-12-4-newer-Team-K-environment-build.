@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD | " +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -225,6 +225,235 @@ OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 # =========================
 # PAGE CONFIG + UI
 # =========================
+
+# =========================
+# TRUE MOBILE K UPSIDE UI PATCH
+# UI-only patch.
+# Does NOT touch projections, sims, Over/Under decisions, Final Board, Moneyline, or grading.
+# Goal: readable phone layout, no skinny stat columns, no sideways squeeze.
+# =========================
+def inject_true_mobile_k_ui():
+    st.markdown("""
+    <style>
+    /* -------------------------------------------------
+       PHONE K UPSIDE CLEANUP
+       ------------------------------------------------- */
+    @media (max-width: 780px) {
+
+        .block-container {
+            padding-left: .55rem !important;
+            padding-right: .55rem !important;
+            padding-top: .75rem !important;
+            max-width: 100% !important;
+        }
+
+        h1, h2, h3 {
+            line-height: 1.12 !important;
+        }
+
+        /* Stop cards from becoming wider than the phone */
+        .pick-card,
+        .green-card,
+        .warn-card,
+        .hero-panel {
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow-x: hidden !important;
+            box-sizing: border-box !important;
+            padding: 16px !important;
+            border-radius: 20px !important;
+        }
+
+        /* Big readable player header */
+        .player-name {
+            font-size: 30px !important;
+            line-height: 1.05 !important;
+            word-break: normal !important;
+            overflow-wrap: anywhere !important;
+        }
+
+        .big-title {
+            font-size: 31px !important;
+            line-height: 1.05 !important;
+        }
+
+        .sub-title,
+        .small-muted {
+            font-size: 13px !important;
+            line-height: 1.25 !important;
+        }
+
+        .badge {
+            font-size: 13px !important;
+            padding: 7px 10px !important;
+            white-space: normal !important;
+        }
+
+        /* Streamlit columns on phone: make them stack instead of squeezing */
+        div[data-testid="column"] {
+            width: 100% !important;
+            min-width: 100% !important;
+            flex: 1 1 100% !important;
+        }
+
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: .65rem !important;
+        }
+
+        /* KPI grid = readable two-column mobile cards */
+        .kpi-strip {
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            gap: 10px !important;
+            width: 100% !important;
+            margin: 10px 0 14px 0 !important;
+        }
+
+        .kpi-box {
+            min-width: 0 !important;
+            width: 100% !important;
+            padding: 12px 10px !important;
+            min-height: 92px !important;
+            border-radius: 16px !important;
+            text-align: center !important;
+            overflow-wrap: anywhere !important;
+            word-break: normal !important;
+        }
+
+        .kpi-label {
+            font-size: 10.5px !important;
+            letter-spacing: .035em !important;
+            line-height: 1.15 !important;
+            white-space: normal !important;
+        }
+
+        .kpi-value {
+            font-size: 25px !important;
+            line-height: 1.05 !important;
+            white-space: normal !important;
+            margin-top: 6px !important;
+        }
+
+        .kpi-sub {
+            font-size: 11.5px !important;
+            line-height: 1.18 !important;
+            white-space: normal !important;
+        }
+
+        /* Main numbers remain large but not overflowing */
+        .big-number {
+            font-size: 38px !important;
+            line-height: .98 !important;
+            overflow-wrap: normal !important;
+        }
+
+        /* Metrics should not create vertical letter wrapping */
+        div[data-testid="stMetric"] {
+            width: 100% !important;
+            min-width: 0 !important;
+            padding: 12px !important;
+            box-sizing: border-box !important;
+            overflow-wrap: normal !important;
+            word-break: normal !important;
+        }
+
+        div[data-testid="stMetricLabel"] {
+            font-size: 12px !important;
+            line-height: 1.15 !important;
+            white-space: normal !important;
+            overflow-wrap: normal !important;
+            word-break: normal !important;
+        }
+
+        div[data-testid="stMetricValue"] {
+            font-size: 27px !important;
+            line-height: 1.05 !important;
+            white-space: normal !important;
+            overflow-wrap: normal !important;
+            word-break: normal !important;
+        }
+
+        div[data-testid="stMetricDelta"] {
+            font-size: 12px !important;
+            line-height: 1.15 !important;
+            white-space: normal !important;
+        }
+
+        /* Dataframes scroll instead of crushing columns */
+        div[data-testid="stDataFrame"],
+        div[data-testid="stTable"] {
+            overflow-x: auto !important;
+            max-width: 100% !important;
+        }
+
+        /* Plotly / charts mobile protection */
+        .js-plotly-plot,
+        .plot-container {
+            max-width: 100% !important;
+            overflow-x: auto !important;
+        }
+
+        /* Last 10 bars stay readable */
+        .mini-k-bars {
+            gap: 7px !important;
+            overflow-x: auto !important;
+            padding-bottom: 4px !important;
+        }
+
+        .mini-k-bar-wrap {
+            min-width: 22px !important;
+        }
+
+        .mini-k-bar {
+            width: 18px !important;
+        }
+
+        /* Tabs are scrollable on phone */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 4px !important;
+            overflow-x: auto !important;
+            flex-wrap: nowrap !important;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            white-space: nowrap !important;
+            font-size: 12px !important;
+            padding-left: 8px !important;
+            padding-right: 8px !important;
+        }
+    }
+
+    /* Extra small iPhone width */
+    @media (max-width: 430px) {
+        .player-name {
+            font-size: 28px !important;
+        }
+
+        .big-title {
+            font-size: 29px !important;
+        }
+
+        .big-number {
+            font-size: 35px !important;
+        }
+
+        .kpi-value {
+            font-size: 23px !important;
+        }
+
+        .kpi-label {
+            font-size: 10px !important;
+        }
+
+        .kpi-box {
+            padding: 11px 8px !important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
 st.set_page_config(
     page_title="MLB K Prop Engine — Refresh Then Save",
     layout="wide",
