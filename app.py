@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI"
 
 try:
     import pytz
@@ -6997,30 +6997,102 @@ def ml_build_board(board):
         df = df.sort_values("ML Edge %", ascending=False)
     return df
 
+
+# =========================
+# MONEYLINE LOGO CARD UI
+# UI-only upgrade. Does not touch K projections or ML math.
+# =========================
+ML_LOGO_IDS = {
+    "ARI":109,"ATL":144,"BAL":110,"BOS":111,"CHC":112,"CWS":145,"CHW":145,
+    "CIN":113,"CLE":114,"COL":115,"DET":116,"HOU":117,"KC":118,"KCR":118,
+    "LAA":108,"LAD":119,"MIA":146,"MIL":158,"MIN":142,"NYM":121,"NYY":147,
+    "ATH":133,"OAK":133,"PHI":143,"PIT":134,"SD":135,"SDP":135,"SF":137,
+    "SFG":137,"SEA":136,"STL":138,"TB":139,"TBR":139,"TEX":140,"TOR":141,
+    "WSH":120,"WSN":120
+}
+
+def ml_team_logo_url(abbr):
+    team_id = ML_LOGO_IDS.get(str(abbr or "").upper().strip())
+    return "" if not team_id else f"https://www.mlbstatic.com/team-logos/{team_id}.svg"
+
+def ml_split_matchup(matchup):
+    s = str(matchup or "")
+    if "@" not in s:
+        return "", ""
+    a, h = [x.strip().upper() for x in s.split("@", 1)]
+    return a, h
+
+def render_moneyline_logo_card(r):
+    matchup = str(r.get("Matchup", ""))
+    away, home = ml_split_matchup(matchup)
+    pick = str(r.get("Pick", "—")).upper()
+    edge = r.get("ML Edge %", "—")
+    status = str(r.get("Status", "—"))
+    grade = str(r.get("ML Grade", "—"))
+    away_logo = ml_team_logo_url(away)
+    home_logo = ml_team_logo_url(home)
+    badge_cls = "good-badge" if status == "PLAYABLE" else "yellow-badge" if status == "LEAN" or "MODEL" in status else "red-badge"
+    edge_val = safe_float(edge, 0) or 0
+    edge_color = "#31e84f" if edge_val >= 6 else "#ffbe3c" if edge_val >= 3 else "#ff5f5f"
+
+    def logo_html(url, abbr):
+        if url:
+            return f'<img src="{url}" style="width:72px;height:72px;object-fit:contain;filter:drop-shadow(0 0 10px rgba(255,255,255,.20));" alt="{html.escape(abbr)}">'
+        return f'<div style="width:72px;height:72px;border-radius:50%;background:#151515;border:1px solid rgba(255,255,255,.15);display:flex;align-items:center;justify-content:center;font-weight:900;">{html.escape(abbr[:3])}</div>'
+
+    st.markdown(f"""
+    <div class="pick-card">
+      <div style="display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap;">
+        <div>
+          <div class="small-muted">Moneyline Edge • Logo Card</div>
+          <div class="player-name">{html.escape(matchup)}</div>
+          <div class="small-muted">Source: {html.escape(str(r.get("Source","—")))}</div>
+        </div>
+        <div class="badge {badge_cls}">{html.escape(grade)}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:18px;align-items:center;margin-top:18px;">
+        <div style="text-align:center;">
+          {logo_html(away_logo, away)}
+          <div class="big-number" style="font-size:34px;margin-top:4px;">{html.escape(away)}</div>
+          <div class="small-muted">SP: {html.escape(str(r.get("Away SP","—")))}</div>
+          <div class="small-muted">Model {r.get("Away Model %","—")}% • Market {r.get("Away Market %","—")}% • {r.get("Away Price","—")}</div>
+        </div>
+        <div style="text-align:center;">
+          <div class="small-muted">PICK</div>
+          <div class="big-number" style="font-size:40px;color:{edge_color};">{html.escape(pick)}</div>
+          <div class="badge {badge_cls}">Edge {edge}%</div>
+        </div>
+        <div style="text-align:center;">
+          {logo_html(home_logo, home)}
+          <div class="big-number" style="font-size:34px;margin-top:4px;">{html.escape(home)}</div>
+          <div class="small-muted">SP: {html.escape(str(r.get("Home SP","—")))}</div>
+          <div class="small-muted">Model {r.get("Home Model %","—")}% • Market {r.get("Home Market %","—")}% • {r.get("Home Price","—")}</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def render_moneyline_edge_tab(board, dates=None):
     st.markdown("### 💰 Moneyline Edge")
-    st.caption("Separate ML module. Does not modify K projections, Underdog props, sims, or leash/BF.")
+    st.caption("Separate ML module. Logo-card UI only; it does not modify K projections or ML math.")
     df = ml_build_board(board)
     if df.empty:
         st.info("No ML board yet. Refresh the K board first.")
         return
+
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Games", len(df))
     c2.metric("Playable", int((df["Status"]=="PLAYABLE").sum()))
     c3.metric("Leans", int((df["Status"]=="LEAN").sum()))
     c4.metric("Odds", "OddsAPI" if any(df["Source"].astype(str).str.contains("OddsAPI", na=False)) else "Model Only")
-    for _,r in df.head(10).iterrows():
-        st.markdown(f"""
-        <div class="pick-card">
-          <div class="small-muted">Moneyline Edge • isolated from K engine</div>
-          <div class="player-name">{html.escape(str(r.get("Matchup","")))}</div>
-          <div class="big-number">{html.escape(str(r.get("Pick","—")))}</div>
-          <div><b>{html.escape(str(r.get("ML Grade","")))}</b> • Edge {r.get("ML Edge %","—")}% • {html.escape(str(r.get("Status","")))}</div>
-          <div class="small-muted">Away model {r.get("Away Model %","—")}% / Home model {r.get("Home Model %","—")}% • Source: {html.escape(str(r.get("Source","")))}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    st.dataframe(df, use_container_width=True, hide_index=True)
 
+    st.markdown('<div class="section-title-pro">Top Moneyline Cards</div>', unsafe_allow_html=True)
+    for _, r in df.head(10).iterrows():
+        render_moneyline_logo_card(r)
+
+    st.markdown('<div class="section-title-pro">Moneyline Table</div>', unsafe_allow_html=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 # =========================
 # ELITE SAFETY OVERLAYS
