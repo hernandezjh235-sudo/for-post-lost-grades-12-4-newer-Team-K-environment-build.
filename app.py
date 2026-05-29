@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -8444,6 +8444,27 @@ def final_board_ml_context(p, board=None):
     }
 
 
+
+def final_board_true_kproj(p):
+    """Return the exact K Upside projection source when available.
+
+    This prevents Final Board from showing an adjusted/risk projection as Raw K PROJ.
+    Priority is the same displayed K PROJ used by the K Upside tab.
+    """
+    p = p or {}
+    for key in [
+        "K PROJ", "k_proj", "kproj", "k_projection",
+        "raw_k_proj", "raw_projection", "base_k_proj",
+        "mean", "sim_mean", "upside_projection", "projection_mean"
+    ]:
+        v = safe_float(p.get(key), None)
+        if v is not None:
+            return v
+
+    # Last fallback only: existing projection field.
+    return safe_float(p.get("projection"), None)
+
+
 def _fb_score_row(p, board=None):
     """Balanced Final Board scorer.
 
@@ -8451,7 +8472,9 @@ def _fb_score_row(p, board=None):
     Final Board adjusts confidence/trust, not raw projection direction.
     Refinement is capped small so it does not over-suppress elite upside.
     """
-    proj = safe_float(p.get("projection") or p.get("K PROJ"), None)
+    risk_proj = safe_float(p.get("projection") or p.get("K PROJ"), None)
+    raw_kproj = final_board_true_kproj(p)
+    proj = raw_kproj if raw_kproj is not None else risk_proj
     line = safe_float(p.get("line") or p.get("underdog_line") or p.get("Line"), None)
 
     # Small pitch-type/umpire read only. Never allow huge suppression.
@@ -8459,10 +8482,13 @@ def _fb_score_row(p, board=None):
     ump_factor = safe_float(p.get("Advanced Umpire Factor"), 1.0) or 1.0
     raw_factor = clamp(pt_factor * ump_factor, 0.970, 1.035)
 
-    if proj is not None:
-        refined_raw = proj * raw_factor
+    # Risk Read starts from the risk-adjusted projection source when available.
+    # Raw K PROJ remains the true K Upside projection.
+    risk_base = risk_proj if risk_proj is not None else proj
+    if risk_base is not None:
+        refined_raw = risk_base * raw_factor
         max_shift = 0.35
-        refined = proj + clamp(refined_raw - proj, -max_shift, max_shift)
+        refined = risk_base + clamp(refined_raw - risk_base, -max_shift, max_shift)
     else:
         refined = None
 
@@ -8715,7 +8741,7 @@ def render_final_pick_card(r):
 
 def render_final_board_tab(board, dates=None):
     st.markdown("### 🧠 FINAL BOARD — Final Decision Center")
-    st.caption("Final Board uses Raw K PROJ as projection truth. Risk Read/Final Score are confidence layers only.")
+    st.caption("Raw K PROJ is synced from the K Upside tab. Risk Read/Final Score are confidence layers only.")
     rows = build_final_board_rows(board)
     if not rows:
         st.info("No board loaded yet. Refresh the live board first.")
