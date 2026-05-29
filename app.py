@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -8632,6 +8632,8 @@ def _fb_score_row(p, board=None):
         "Side": side,
         "Line": line,
         "Projection": None if proj is None else round(proj, 2),
+        "Raw K PROJ": None if proj is None else round(proj, 2),
+        "Risk Read": None if refined is None else round(refined, 2),
         "Refined": None if refined is None else round(refined, 2),
         "Refined Shift": None if proj is None or refined is None else round(refined - proj, 2),
         "Edge": None if edge is None else round(edge, 2),
@@ -8691,8 +8693,8 @@ def render_final_pick_card(r):
       </div>
       <div class="kpi-strip" style="grid-template-columns:repeat(5,minmax(0,1fr));">
         <div class="kpi-box"><div class="kpi-label">Pick</div><div class="kpi-value">{html.escape(str(r.get("Side","—")))} {line_txt}</div><div class="kpi-sub">line</div></div>
-        <div class="kpi-box"><div class="kpi-label">K Proj</div><div class="kpi-value">{proj if proj is not None else "—"}</div><div class="kpi-sub">base</div></div>
-        <div class="kpi-box"><div class="kpi-label">Refined</div><div class="kpi-value">{ref if ref is not None else "—"}</div><div class="kpi-sub">shift {shift:+.2f}</div></div>
+        <div class="kpi-box"><div class="kpi-label">Raw K PROJ</div><div class="kpi-value">{proj if proj is not None else "—"}</div><div class="kpi-sub">true projection</div></div>
+        <div class="kpi-box"><div class="kpi-label">Risk Read</div><div class="kpi-value">{ref if ref is not None else "—"}</div><div class="kpi-sub">shift {shift:+.2f}</div></div>
         <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{r.get("Edge","—")}</div><div class="kpi-sub">vs line</div></div>
         <div class="kpi-box"><div class="kpi-label">Final Score</div><div class="kpi-value" style="color:{color};">{int(score)}</div><div class="kpi-sub">0-100</div></div>
       </div>
@@ -8713,7 +8715,7 @@ def render_final_pick_card(r):
 
 def render_final_board_tab(board, dates=None):
     st.markdown("### 🧠 FINAL BOARD — Final Decision Center")
-    st.caption("Use this after lineups post. It merges all tabs into one final pick board.")
+    st.caption("Final Board uses Raw K PROJ as projection truth. Risk Read/Final Score are confidence layers only.")
     rows = build_final_board_rows(board)
     if not rows:
         st.info("No board loaded yet. Refresh the live board first.")
@@ -8728,7 +8730,7 @@ def render_final_board_tab(board, dates=None):
     for r in rows[:10]:
         render_final_pick_card(r)
     st.markdown('<div class="section-title-pro">Final Board Table</div>', unsafe_allow_html=True)
-    keep = ["Pitcher","Matchup","Side","Line","Projection","Refined","Refined Shift","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","ML Context","ML Context Score","ML Context Pick","ML Context Edge","Exp BF","IP Floor","Warnings","Positives"]
+    keep = ["Pitcher","Matchup","Side","Line","Raw K PROJ","Risk Read","Refined Shift","Edge","Final Score","Final Label","Safety Tag","Lineup","Pitch Alert","Arsenal","Umpire","ML Context","ML Context Score","ML Context Pick","ML Context Edge","Exp BF","IP Floor","Warnings","Positives"]
     st.dataframe(df[[c for c in keep if c in df.columns]], use_container_width=True, hide_index=True)
 
 tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6 = st.tabs([
