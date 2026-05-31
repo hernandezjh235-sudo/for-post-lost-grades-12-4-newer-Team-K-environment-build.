@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -21,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -7389,6 +7390,79 @@ def apply_projection_first_confidence_to_row(row):
     return row
 
 
+
+# =========================
+# CLOSE-LINE ACE CEILING PROTECTION
+# Classification only. No global projection boost.
+# =========================
+ACE_CEILING_PROTECTION_ENABLED = True
+ACE_CLOSE_UNDER_GAP_MAX = 0.60
+ACE_MIN_CEILING_OVER_LINE = 2.00
+ACE_MIN_K_PCT = 0.265
+ACE_MIN_EXP_BF = 20.5
+ACE_MIN_IP_FLOOR = 4.8
+ACE_PROTECTION_SCORE_BOOST = 6
+
+def ace_ceiling_under_protection(row=None, base_decision=None, base_tier=None):
+    row = row or {}
+    if not ACE_CEILING_PROTECTION_ENABLED:
+        return base_decision, base_tier, 0, "OFF", "Ace ceiling protection disabled"
+
+    proj = safe_float(row.get("K PROJ") or row.get("Raw K PROJ") or row.get("projection") or row.get("k_proj"), None)
+    line = safe_float(row.get("line") or row.get("UD/Line") or row.get("Line") or row.get("underdog_line"), None)
+    if proj is None or line is None:
+        return base_decision, base_tier, 0, "NO_LINE", "No usable projection/line"
+
+    if not (proj < line):
+        return base_decision, base_tier, 0, "NOT_UNDER", "Projection is not below line"
+
+    gap = line - proj
+    if gap > ACE_CLOSE_UNDER_GAP_MAX:
+        return base_decision, base_tier, 0, "UNDER_GAP_OK", f"Under gap {gap:.2f} not close enough"
+
+    ceiling = safe_float(row.get("Ceiling") or row.get("ceiling") or row.get("p90") or row.get("P90"), None)
+    pitcher_k = safe_float(row.get("Pitcher K%") or row.get("pitcher_k") or row.get("pitcher_k_pct"), None)
+    if pitcher_k is not None and pitcher_k > 1:
+        pitcher_k /= 100.0
+    exp_bf = safe_float(row.get("Exp BF") or row.get("expected_bf"), None)
+    ip_floor = safe_float(row.get("IP Floor") or row.get("ip_floor"), None)
+    leash_score = safe_float(row.get("Leash Score") or row.get("smart_leash_score"), 50) or 50
+    pitch_count_score = safe_float(row.get("Pitch Count Score") or row.get("smart_pitch_count_score"), 50) or 50
+
+    elite_k = pitcher_k is not None and pitcher_k >= ACE_MIN_K_PCT
+    ceiling_ok = ceiling is not None and ceiling >= line + ACE_MIN_CEILING_OVER_LINE
+    workload_ok = (
+        (exp_bf is not None and exp_bf >= ACE_MIN_EXP_BF) or
+        (ip_floor is not None and ip_floor >= ACE_MIN_IP_FLOOR) or
+        leash_score >= 58 or
+        pitch_count_score >= 65
+    )
+
+    if elite_k and ceiling_ok and workload_ok:
+        new_decision = f"⚠️ ACE OVER LEAN — O {line}"
+        new_tier = "C" if base_tier in [None, "", "PASS"] else base_tier
+        note = f"Close under gap {gap:.2f}; elite K ceiling risk; ceiling {ceiling}"
+        return new_decision, new_tier, ACE_PROTECTION_SCORE_BOOST, "ACE_OVER_LEAN", note
+
+    if ceiling_ok and workload_ok and gap <= 0.35:
+        return "🚫 PASS — UNDER / CEILING RISK", "PASS", 3, "UNDER_CEILING_RISK", f"Close under gap {gap:.2f}; ceiling clears line"
+
+    return base_decision, base_tier, 0, "UNCHANGED", f"Close under checked; elite={elite_k}, ceiling={ceiling_ok}, workload={workload_ok}"
+
+def apply_ace_ceiling_protection_to_row(row):
+    if not isinstance(row, dict):
+        return row
+    base_decision = row.get("Projection First Decision") or row.get("Decision") or row.get("decision") or row.get("bet_action")
+    base_tier = row.get("Projection First Tier") or row.get("Tier") or row.get("tier")
+    new_decision, new_tier, boost, label, note = ace_ceiling_under_protection(row, base_decision, base_tier)
+    row["Ace Ceiling Label"] = label
+    row["Ace Ceiling Note"] = note
+    row["Ace Ceiling Boost"] = boost
+    row["Ace Ceiling Decision"] = new_decision
+    row["Ace Ceiling Tier"] = new_tier
+    return row
+
+
 def build_kproj_table(board):
     rows = []
     for p in board or []:
@@ -7400,6 +7474,7 @@ def build_kproj_table(board):
         p["Tier"] = d.get("tier")
         p["Decision"] = d.get("decision")
         apply_projection_first_confidence_to_row(p)
+        apply_ace_ceiling_protection_to_row(p)
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
@@ -7412,7 +7487,7 @@ def build_kproj_table(board):
             "Under Sim %": None if dist.get("under_prob") is None else round(dist.get("under_prob") * 100, 1),
             "UD/Line": d.get("line"),
             "Line Source": d.get("line_source"),
-            "Decision": p.get("Projection First Decision") or d.get("decision"),
+            "Decision": p.get("Ace Ceiling Decision") or p.get("Projection First Decision") or d.get("decision"),
             "Base Decision": d.get("decision"),
             "Model Lean": d.get("lean_side"),
             "Lean Gap": d.get("lean_gap"),
@@ -7424,9 +7499,11 @@ def build_kproj_table(board):
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
             "Lineup": p.get("lineup_status"),
             "Hit Rate %": None if d.get("hit_rate") is None else round(d.get("hit_rate") * 100, 1),
-            "Tier": p.get("Projection First Tier") or d.get("tier"),
+            "Tier": p.get("Ace Ceiling Tier") or p.get("Projection First Tier") or d.get("tier"),
             "Confidence Mode": p.get("Projection First Label"),
             "Confidence Note": p.get("Projection First Note"),
+            "Ace Ceiling Label": p.get("Ace Ceiling Label"),
+            "Ace Ceiling Note": p.get("Ace Ceiling Note"),
             "Base Tier": d.get("tier"),
             "Role Score": d.get("role_score"),
             "Starter Score": d.get("starter_score"),
@@ -9462,6 +9539,8 @@ def render_settings_visible_tab(board=None, dates=None):
         "DYNAMIC_LEASH_BF_ENABLED": globals().get("DYNAMIC_LEASH_BF_ENABLED", "—"),
         "SMART_EDGE_UPGRADES_ENABLED": globals().get("SMART_EDGE_UPGRADES_ENABLED", "—"),
         "PROJECTION_FIRST_CONFIDENCE_ENABLED": globals().get("PROJECTION_FIRST_CONFIDENCE_ENABLED", "—"),
+        "ACE_CEILING_PROTECTION_ENABLED": globals().get("ACE_CEILING_PROTECTION_ENABLED", "—"),
+        "ACE_CLOSE_UNDER_GAP_MAX": globals().get("ACE_CLOSE_UNDER_GAP_MAX", "—"),
         "PASS_OVER_UPGRADE_EDGE": globals().get("PASS_OVER_UPGRADE_EDGE", "—"),
         "PASS_UNDER_UPGRADE_EDGE": globals().get("PASS_UNDER_UPGRADE_EDGE", "—"),
         "SMART_EDGE_MAX_PROJ_NUDGE": globals().get("SMART_EDGE_MAX_PROJ_NUDGE", "—"),
