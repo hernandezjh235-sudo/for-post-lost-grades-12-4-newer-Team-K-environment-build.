@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + WORKLOAD LEASH 2.0 + ROTOWIRE PRELINEUP + TRUE PROJECTION PLUS + TOMORROW UD FALLBACK" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + WORKLOAD LEASH 2.0 + ROTOWIRE PRELINEUP + TRUE PROJECTION PLUS + TOMORROW UD FALLBACK + TOMORROW FIX 2" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -1250,6 +1250,138 @@ def get_schedule(date_str):
         params={"sportId": 1, "date": date_str, "hydrate": "probablePitcher,venue,team"}
     ) or {"dates": []}
 
+
+# =========================
+# TOMORROW UNDERDOG PITCHER FALLBACK
+# Solves issue where MLB schedule has no probablePitcher yet but Underdog already has pitcher K lines.
+# Pitchers still come from pitcher-K markets only; Rotowire remains batter-lineup fallback only.
+# =========================
+ALLOW_UNDERDOG_TOMORROW_PITCHER_FALLBACK = True
+
+def _line_date_matches_target(line_row, target_date_strs):
+    targets = set(str(x) for x in (target_date_strs or []))
+    if not targets:
+        return True
+    date_keys = ["date", "game_date", "scheduled_at", "scheduledAt", "start_time", "startTime", "commence_time", "game_time", "Game Time"]
+    raw_vals = []
+    for k in date_keys:
+        v = line_row.get(k) if isinstance(line_row, dict) else None
+        if v not in [None, ""]:
+            raw_vals.append(str(v))
+    # If Underdog row has no reliable date metadata, keep it; name/market filters still protect it.
+    if not raw_vals:
+        return True
+    return any(any(t in rv for t in targets) for rv in raw_vals)
+
+def _team_from_ud_matchup_text(row):
+    txt = " ".join(str(row.get(k) or "") for k in ["Matchup", "matchup", "game", "Game", "event", "Event"])
+    if "@" in txt:
+        parts = [p.strip() for p in txt.split("@")]
+        if len(parts) >= 2:
+            return parts[0][:3].upper(), parts[1][:3].upper(), txt
+    return None, None, txt
+
+def search_mlb_player_id_by_name(player_name):
+    try:
+        return mlb_player_search_id_by_name(player_name)
+    except Exception:
+        nm = str(player_name or "").strip()
+        if not nm:
+            return None
+        try:
+            data = safe_get_json(f"{MLB_BASE}/people/search", params={"names": nm, "sportId": 1}, timeout=10)
+            people = (data or {}).get("people") or []
+            if people:
+                best = max(people, key=lambda p: name_score(nm, p.get("fullName")))
+                if name_score(nm, best.get("fullName")) >= 0.72:
+                    return best.get("id")
+        except Exception:
+            pass
+        return None
+
+def _get_underdog_rows_safe():
+    try:
+        if "get_underdog_lines" in globals():
+            return get_underdog_lines() or []
+    except Exception:
+        pass
+    try:
+        if "get_underdog_pitcher_k_lines" in globals():
+            return get_underdog_pitcher_k_lines() or []
+    except Exception:
+        pass
+    try:
+        if "fetch_underdog_lines" in globals():
+            return fetch_underdog_lines() or []
+    except Exception:
+        pass
+    return []
+
+def build_pitcher_rows_from_underdog_lines(target_date_strs=None, max_rows=80):
+    if not globals().get("ALLOW_UNDERDOG_TOMORROW_PITCHER_FALLBACK", True):
+        return []
+    ud_rows = _get_underdog_rows_safe()
+    out = []
+    seen = set()
+    for r in ud_rows or []:
+        if not isinstance(r, dict):
+            continue
+        if not _line_date_matches_target(r, target_date_strs):
+            continue
+        stat_txt = " ".join(str(r.get(k) or "") for k in ["Stat", "stat", "Market", "market", "Title", "title", "Description", "description", "prop_type"])
+        player_name = (
+            r.get("Player") or r.get("player") or r.get("Player Name") or r.get("player_name") or
+            r.get("athlete") or r.get("name") or r.get("pitcher")
+        )
+        line_val = safe_float(r.get("Line") or r.get("line") or r.get("Value") or r.get("value"))
+        if not player_name or line_val is None:
+            continue
+        if not is_pitcher_k_text(stat_txt):
+            continue
+        if is_bad_k_market_text(stat_txt) or is_bad_sport_text(stat_txt):
+            continue
+        nm = normalize_name(player_name)
+        if nm in seen:
+            continue
+        seen.add(nm)
+        pid = search_mlb_player_id_by_name(player_name)
+        hand = "R"
+        try:
+            if pid:
+                pdata = safe_get_json(f"{MLB_BASE}/people/{pid}", timeout=10) or {}
+                people = pdata.get("people") or []
+                if people:
+                    hand = people[0].get("pitchHand", {}).get("code", "R") or "R"
+        except Exception:
+            pass
+        away_abbr, home_abbr, matchup_txt = _team_from_ud_matchup_text(r)
+        out.append({
+            "date": (target_date_strs or [""])[0],
+            "game_pk": None,
+            "game_time": r.get("game_time") or r.get("scheduled_at") or r.get("start_time") or "",
+            "status": "Underdog Line Posted",
+            "venue": "",
+            "pitcher_id": pid,
+            "pitcher": player_name,
+            "hand": hand,
+            "team": away_abbr or "",
+            "team_id": None,
+            "opponent": home_abbr or "",
+            "opp_team_id": None,
+            "home_team": home_abbr or "",
+            "away_team": away_abbr or "",
+            "opp_side": "",
+            "matchup": matchup_txt or "Underdog listed",
+            "pitcher_confirmed": False,
+            "underdog_fallback_pitcher": True,
+            "fallback_ud_line": line_val,
+            "fallback_ud_source": r.get("Source") or r.get("source") or "Underdog",
+        })
+        if len(out) >= max_rows:
+            break
+    return out
+
+
 def extract_probable_pitchers(date_str):
     sched = get_schedule(date_str)
     rows = []
@@ -1308,7 +1440,7 @@ def extract_probable_pitchers(date_str):
     for _p in locals().get("board", locals().get("rows", locals().get("out", []))):
         if isinstance(_p, dict) and "prop_rows" in _p:
             _p["prop_rows"] = clean_real_prop_debug_rows(_p.get("prop_rows", []))
-    if ALLOW_UNDERDOG_TOMORROW_PITCHER_FALLBACK and not rows:
+    if globals().get("ALLOW_UNDERDOG_TOMORROW_PITCHER_FALLBACK", True) and not rows:
         ud_fallback_rows = build_pitcher_rows_from_underdog_lines([date_str])
         if ud_fallback_rows:
             return ud_fallback_rows
@@ -8170,107 +8302,6 @@ def build_kproj_table(board):
 
 
 
-
-# =========================
-# TOMORROW UNDERDOG PITCHER FALLBACK
-# Solves issue where MLB schedule has no probablePitcher yet but Underdog already has pitcher K lines.
-# Pitchers still come from pitcher-K markets only; Rotowire remains batter-lineup fallback only.
-# =========================
-ALLOW_UNDERDOG_TOMORROW_PITCHER_FALLBACK = True
-
-def _line_date_matches_target(line_row, target_date_strs):
-    """Best-effort line date filter. If a prop has no date metadata, keep it for fallback matching."""
-    targets = set(str(x) for x in (target_date_strs or []))
-    if not targets:
-        return True
-    date_keys = ["date", "game_date", "scheduled_at", "scheduledAt", "start_time", "startTime", "commence_time", "game_time", "Game Time"]
-    raw_vals = []
-    for k in date_keys:
-        v = line_row.get(k) if isinstance(line_row, dict) else None
-        if v not in [None, ""]:
-            raw_vals.append(str(v))
-    if not raw_vals:
-        return True
-    return any(any(t in rv for t in targets) for rv in raw_vals)
-
-def _team_from_ud_matchup_text(row):
-    txt = " ".join(str(row.get(k) or "") for k in ["Matchup", "matchup", "game", "Game", "event", "Event"])
-    # Try common "AWAY @ HOME" parsing if present.
-    if "@" in txt:
-        parts = [p.strip() for p in txt.split("@")]
-        if len(parts) >= 2:
-            return parts[0][:3].upper(), parts[1][:3].upper(), txt
-    return None, None, txt
-
-def search_mlb_player_id_by_name(player_name):
-    return mlb_player_search_id_by_name(player_name)
-
-def build_pitcher_rows_from_underdog_lines(target_date_strs=None, max_rows=80):
-    if not ALLOW_UNDERDOG_TOMORROW_PITCHER_FALLBACK:
-        return []
-    try:
-        ud_rows = get_underdog_lines()
-    except Exception:
-        ud_rows = []
-    out = []
-    seen = set()
-    for r in ud_rows or []:
-        if not isinstance(r, dict):
-            continue
-        if not _line_date_matches_target(r, target_date_strs):
-            continue
-        stat_txt = " ".join(str(r.get(k) or "") for k in ["Stat", "stat", "Market", "market", "Title", "title", "Description", "description"])
-        player_name = (
-            r.get("Player") or r.get("player") or r.get("Player Name") or r.get("player_name") or
-            r.get("athlete") or r.get("name")
-        )
-        line_val = safe_float(r.get("Line") or r.get("line") or r.get("Value") or r.get("value"))
-        if not player_name or line_val is None:
-            continue
-        if not is_pitcher_k_text(stat_txt):
-            continue
-        if is_bad_k_market_text(stat_txt) or is_bad_sport_text(stat_txt):
-            continue
-        nm = normalize_name(player_name)
-        if nm in seen:
-            continue
-        seen.add(nm)
-        pid = search_mlb_player_id_by_name(player_name)
-        hand = "R"
-        try:
-            if pid:
-                pdata = safe_get_json(f"{MLB_BASE}/people/{pid}", timeout=10) or {}
-                people = pdata.get("people") or []
-                if people:
-                    hand = people[0].get("pitchHand", {}).get("code", "R") or "R"
-        except Exception:
-            pass
-        away_abbr, home_abbr, matchup_txt = _team_from_ud_matchup_text(r)
-        out.append({
-            "date": (target_date_strs or [""])[0],
-            "game_pk": None,
-            "game_time": r.get("game_time") or r.get("scheduled_at") or r.get("start_time") or "",
-            "status": "Underdog Line Posted",
-            "venue": "",
-            "pitcher_id": pid,
-            "pitcher": player_name,
-            "hand": hand,
-            "team": away_abbr or "",
-            "team_id": None,
-            "opponent": home_abbr or "",
-            "opp_team_id": None,
-            "home_team": home_abbr or "",
-            "away_team": away_abbr or "",
-            "opp_side": "",
-            "matchup": matchup_txt or "Underdog listed",
-            "pitcher_confirmed": False,
-            "underdog_fallback_pitcher": True,
-            "fallback_ud_line": line_val,
-            "fallback_ud_source": r.get("Source") or "Underdog",
-        })
-        if len(out) >= max_rows:
-            break
-    return out
 
 
 def render_kproj_tab(board):
