@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -21,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + WORKLOAD LEASH 2.0 + ROTOWIRE PRELINEUP + TRUE PROJECTION PLUS + FIXED REFRESH FLOW" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -1852,230 +1853,10 @@ def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
     cache[lineup_cache_key(game_pk, opp_side, pitcher_hand)] = {"saved_at": now_iso(), "rows": rows[:9]}
     save_json(LINEUP_CACHE_FILE, cache)
 
-# =========================
-# ROTOWIRE PROJECTED LINEUP FALLBACK
-# Pre-lineup source only:
-# 1) MLB confirmed lineup remains highest priority
-# 2) Rotowire projected lineup is used only before confirmed lineups are posted
-# 3) Team fallback remains last resort
-# =========================
-ROTOWIRE_PROJECTED_LINEUPS_ENABLED = False
-ROTOWIRE_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
-
-MLB_TEAM_ALIASES = {
-    "ARI": ["ARI", "ARZ", "DIAMONDBACKS", "ARIZONA"],
-    "ATL": ["ATL", "BRAVES", "ATLANTA"],
-    "BAL": ["BAL", "ORIOLES", "BALTIMORE"],
-    "BOS": ["BOS", "RED SOX", "BOSTON"],
-    "CHC": ["CHC", "CUBS", "CHICAGO CUBS"],
-    "CWS": ["CWS", "CHW", "WHITE SOX", "CHICAGO WHITE SOX"],
-    "CIN": ["CIN", "REDS", "CINCINNATI"],
-    "CLE": ["CLE", "GUARDIANS", "CLEVELAND"],
-    "COL": ["COL", "ROCKIES", "COLORADO"],
-    "DET": ["DET", "TIGERS", "DETROIT"],
-    "HOU": ["HOU", "ASTROS", "HOUSTON"],
-    "KC": ["KC", "KCR", "ROYALS", "KANSAS CITY"],
-    "LAA": ["LAA", "ANGELS", "LOS ANGELES ANGELS"],
-    "LAD": ["LAD", "DODGERS", "LOS ANGELES DODGERS"],
-    "MIA": ["MIA", "MARLINS", "MIAMI"],
-    "MIL": ["MIL", "BREWERS", "MILWAUKEE"],
-    "MIN": ["MIN", "TWINS", "MINNESOTA"],
-    "NYM": ["NYM", "METS", "NEW YORK METS"],
-    "NYY": ["NYY", "YANKEES", "NEW YORK YANKEES"],
-    "ATH": ["ATH", "OAK", "ATHLETICS", "OAKLAND", "A'S"],
-    "PHI": ["PHI", "PHILLIES", "PHILADELPHIA"],
-    "PIT": ["PIT", "PIRATES", "PITTSBURGH"],
-    "SD": ["SD", "SDP", "PADRES", "SAN DIEGO"],
-    "SEA": ["SEA", "MARINERS", "SEATTLE"],
-    "SF": ["SF", "SFG", "GIANTS", "SAN FRANCISCO"],
-    "STL": ["STL", "CARDINALS", "ST. LOUIS", "SAINT LOUIS"],
-    "TB": ["TB", "TBR", "RAYS", "TAMPA BAY"],
-    "TEX": ["TEX", "RANGERS", "TEXAS"],
-    "TOR": ["TOR", "BLUE JAYS", "TORONTO"],
-    "WSH": ["WSH", "WSN", "NATIONALS", "WASHINGTON"],
-}
-
-def _rw_clean_text(s):
-    try:
-        s = html.unescape(str(s or ""))
-        s = re.sub(r"<[^>]+>", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-    except Exception:
-        return str(s or "").strip()
-
-def _rw_team_key(x):
-    raw = normalize_name(x).upper()
-    raw2 = str(x or "").upper()
-    for abbr, aliases in MLB_TEAM_ALIASES.items():
-        for a in aliases:
-            if normalize_name(a).upper() == raw or f" {a.upper()} " in f" {raw2} ":
-                return abbr
-    return raw2[:3] if raw2 else ""
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_game_team_context_for_lineup(game_pk, opp_side):
-    try:
-        live = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=12)
-        box_team = (live or {}).get("gameData", {}).get("teams", {}).get(opp_side, {})
-        if not box_team:
-            box_team = (live or {}).get("liveData", {}).get("boxscore", {}).get("teams", {}).get(opp_side, {}).get("team", {})
-        abbr = box_team.get("abbreviation") or box_team.get("teamCode") or box_team.get("fileCode")
-        name = box_team.get("name") or box_team.get("clubName") or box_team.get("teamName")
-        return {"abbr": abbr, "name": name, "key": _rw_team_key(abbr or name)}
-    except Exception:
-        return {"abbr": None, "name": None, "key": None}
-
-@st.cache_data(ttl=900, show_spinner=False)
-def mlb_player_search_id_by_name(player_name):
-    nm = str(player_name or "").strip()
-    if not nm:
-        return None
-    # Stats API people search endpoint is not always documented the same way,
-    # so try a couple safe variants.
-    for params in [{"names": nm, "sportId": 1}, {"personIds": "", "names": nm}]:
-        try:
-            data = safe_get_json(f"{MLB_BASE}/people/search", params=params, timeout=10)
-            people = (data or {}).get("people") or []
-            if people:
-                best = max(people, key=lambda p: name_score(nm, p.get("fullName")))
-                if name_score(nm, best.get("fullName")) >= 0.72:
-                    return best.get("id")
-        except Exception:
-            pass
-    return None
-
-@st.cache_data(ttl=900, show_spinner=False)
-def rotowire_daily_lineups_raw_html():
-    if not ROTOWIRE_PROJECTED_LINEUPS_ENABLED:
-        return ""
-    try:
-        r = requests.get(
-            ROTOWIRE_LINEUPS_URL,
-            timeout=14,
-            headers={
-                "User-Agent": "Mozilla/5.0 MLBKPropEngine/RotowirePreLineup",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-        if r.status_code != 200:
-            log_source_request("Rotowire daily lineups", f"HTTP {r.status_code}", r.text[:200])
-            return ""
-        return r.text or ""
-    except Exception as e:
-        log_source_request("Rotowire daily lineups", "ERROR", str(e))
-        return ""
-
-def _rotowire_extract_team_blocks(html_text):
-    """Best-effort parser for Rotowire daily lineups HTML.
-
-    The page structure can change, so this is intentionally defensive:
-    - Finds chunks around team abbreviations/names
-    - Extracts probable/projected player names from lineup-player style blocks
-    - Fails closed to existing fallback when parsing is not good enough
-    """
-    h = html_text or ""
-    if not h:
-        return {}
-    # Normalize escaped content enough for regex scanning.
-    h2 = h.replace("\\u002F", "/").replace("\\/", "/")
-    out = {}
-    # Split by common game/lineup containers when available; otherwise scan wide windows.
-    chunks = re.split(r'(?i)(?:lineup is-|lineup__box|lineup-card|lineup__main|is-mlb)', h2)
-    if len(chunks) < 5:
-        chunks = [h2[i:i+18000] for i in range(0, len(h2), 9000)]
-
-    for abbr, aliases in MLB_TEAM_ALIASES.items():
-        best_names = []
-        aliases_norm = [a.upper() for a in aliases]
-        for ch in chunks:
-            cup = ch.upper()
-            if not any(a in cup for a in aliases_norm):
-                continue
-            # Pull names from common Rotowire player anchors/spans.
-            names = []
-            patterns = [
-                r'lineup__player[^>]*>\\s*<a[^>]*>([^<]{3,45})</a>',
-                r'lineup__player[^>]*>\\s*([^<]{3,45})<',
-                r'data-name="([^"]{3,45})"',
-                r'"name":"([^"]{3,45})"',
-                r'"playerName":"([^"]{3,45})"',
-            ]
-            for pat in patterns:
-                for m in re.findall(pat, ch, flags=re.I):
-                    name = _rw_clean_text(m)
-                    if (
-                        len(name.split()) >= 2
-                        and not any(x in name.lower() for x in ["lineup", "weather", "pitcher", "confirmed", "projected", "batting"])
-                        and name not in names
-                    ):
-                        names.append(name)
-            # Keep first 9 hitters if this chunk looks like a lineup.
-            if len(names) >= 5 and len(names) > len(best_names):
-                best_names = names[:9]
-        if best_names:
-            out[abbr] = best_names[:9]
-    return out
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_rotowire_projected_lineup_names(team_key):
-    html_text = rotowire_daily_lineups_raw_html()
-    blocks = _rotowire_extract_team_blocks(html_text)
-    key = _rw_team_key(team_key)
-    return blocks.get(key, [])
-
-def build_rotowire_projected_lineup_rows(team_key, pitcher_hand=None):
-    names = get_rotowire_projected_lineup_names(team_key)
-    rows = []
-    for idx, name in enumerate(names[:9], start=1):
-        player_id = mlb_player_search_id_by_name(name)
-        season_k, season_so, season_pa = get_batter_season_k_rate(player_id) if player_id else (None, None, None)
-        split_k, split_so, split_pa, split_source = get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand) if (player_id and pitcher_hand) else (None, None, None, "No split")
-        rolling = get_batter_rolling_k_rates(player_id, days_list=(14, 30)) if player_id else {}
-        rolling14 = rolling.get(14)
-        rolling30 = rolling.get(30)
-        used_k, used_source = blend_batter_k_inputs(
-            season_k,
-            split_k=split_k,
-            season_pa=season_pa,
-            split_pa=split_pa,
-            rolling14=rolling14,
-            rolling30=rolling30,
-        )
-        if used_k is None:
-            used_k = split_k if split_k is not None else season_k
-            used_source = split_source if split_k is not None else "Season batter K%"
-        rows.append({
-            "Order": idx,
-            "Batter": name,
-            "Player ID": player_id,
-            "Season K%": None if season_k is None else round(season_k * 100, 1),
-            "Split K%": None if split_k is None else round(split_k * 100, 1),
-            "Rolling 14d K%": None if rolling14 is None else round(rolling14 * 100, 1),
-            "Rolling 30d K%": None if rolling30 is None else round(rolling30 * 100, 1),
-            "Split PA/AB": split_pa,
-            "Used K%": None if used_k is None else round(used_k * 100, 1),
-            "K Source": f"Rotowire projected + {used_source}",
-            "SO": season_so,
-            "PA/AB": season_pa,
-            "Raw_K_Rate": used_k,
-            "Lineup Source": "ROTOWIRE_PROJECTED",
-        })
-    valid = [r["Raw_K_Rate"] for r in rows if r.get("Raw_K_Rate") is not None]
-    if len(valid) >= 5:
-        return rows[:9]
-    return []
-
-
 @st.cache_data(ttl=300, show_spinner=False)
 def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
     box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
     if not box:
-        team_ctx = get_game_team_context_for_lineup(game_pk, opp_side)
-        rw_rows = build_rotowire_projected_lineup_rows(team_ctx.get("key") or team_ctx.get("abbr") or team_ctx.get("name"), pitcher_hand)
-        valid_rw = [r.get("Raw_K_Rate") for r in rw_rows[:9] if r.get("Raw_K_Rate") is not None]
-        if len(valid_rw) >= 5:
-            return float(np.mean(valid_rw)), rw_rows[:9], "Rotowire projected lineup K%", False
         cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
         valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
         if len(valid_cached) >= 5:
@@ -2129,11 +1910,6 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
         split_count = sum(1 for r in rows[:9] if r.get("Split K%") is not None)
         msg = f"Posted lineup K%; splits for {split_count}/9 hitters"
         return lineup_k, rows[:9], msg, len(rows[:9]) >= 8
-    team_ctx = get_game_team_context_for_lineup(game_pk, opp_side)
-    rw_rows = build_rotowire_projected_lineup_rows(team_ctx.get("key") or team_ctx.get("abbr") or team_ctx.get("name"), pitcher_hand)
-    valid_rw = [r.get("Raw_K_Rate") for r in rw_rows[:9] if r.get("Raw_K_Rate") is not None]
-    if len(valid_rw) >= 5:
-        return float(np.mean(valid_rw)), rw_rows[:9], "Rotowire projected lineup K%", False
     cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
     valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
     if len(valid_cached) >= 5:
@@ -2178,8 +1954,6 @@ def confirmed_lineup_status(source_label, lineup_rows):
         return "CONFIRMED"
     if source_label == "CACHED LINEUP":
         return "CACHED"
-    if "ROTOWIRE" in str(source_label).upper() or any((r.get("Lineup Source") == "ROTOWIRE_PROJECTED") for r in (lineup_rows or []) if isinstance(r, dict)):
-        return "ROTOWIRE_PROJECTED"
     return "FALLBACK"
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -5900,19 +5674,6 @@ def render_pick_card(p):
     </div>
     """, unsafe_allow_html=True)
 
-
-# =========================
-# ZERO ROW DIAGNOSTIC
-# Does not change projections; explains when MLB probables are unavailable.
-# =========================
-def tomorrow_zero_rows_explanation(day_mode, all_rows):
-    try:
-        if str(day_mode).lower().startswith("tomorrow") and not all_rows:
-            return "0 pitchers means MLB probablePitcher data did not hydrate for this selected date. Underdog lines may be live before MLB probables. Try Today + Tomorrow or refresh later."
-    except Exception:
-        pass
-    return ""
-
 # =========================
 # APP
 # =========================
@@ -6872,9 +6633,6 @@ def kproj_upside_projection(p):
         if ceiling_risk >= KPROJ_CEILING_RISK_WARN_UNDER or historical_k9 >= 9.0 or recent_max >= 7:
             proj = max(proj, talent_base * KPROJ_TOTAL_SUPPRESSION_CAP, recent_form_proj * 0.88)
 
-    recent_rows_wl2 = p.get("recent_rows") or p.get("Recent Rows") or []
-    proj, expected_bf, wl2_prof = apply_workload_leash_2_to_projection(p, proj, expected_bf, recent_rows_wl2)
-    proj, expected_bf, team_hook_prof = apply_team_manager_hook_profile(p, proj, expected_bf)
     return round(float(clamp(proj, 0.0, 15.0)), 2)
 
 # =========================
@@ -7705,400 +7463,6 @@ def apply_ace_ceiling_protection_to_row(row):
     return row
 
 
-
-
-
-# =========================
-# WORKLOAD / LEASH 2.0 + EXPANDED CEILING RECOGNITION
-# Real-data layer. No blanket projection boost.
-# Focus: workload/leash first, Kyle Harrison type ceiling second, under-risk classification third.
-# =========================
-WORKLOAD_LEASH_2_ENABLED = True
-WL2_MAX_K_NUDGE = 0.42
-WL2_MAX_BF_BOOST = 1.20
-WL2_MAX_BF_CUT = -1.60
-WL2_STRONG_BF = 23.0
-WL2_STABLE_BF = 21.0
-WL2_HIGH_PITCHES = 92.0
-WL2_EFFICIENT_PPB = 3.75
-WL2_HIGH_K_PCT = 0.265
-WL2_ELITE_PUTAWAY = 30.0
-WL2_LINEUP_K_PRESSURE = 23.0
-WL2_CEILING_OVER_LINE = 2.0
-
-def _wl2_mean(vals):
-    xs = []
-    for v in vals or []:
-        x = safe_float(v, None)
-        if x is not None:
-            xs.append(x)
-    return float(np.mean(xs)) if xs else None
-
-def _wl2_recent_vals(recent_rows, key, n=5):
-    vals = []
-    for r in (recent_rows or [])[:n]:
-        if isinstance(r, dict):
-            vals.append(r.get(key))
-    return vals
-
-def workload_leash_2_profile(row=None, recent_rows=None):
-    row = row or {}
-    recent_rows = recent_rows or row.get('recent_rows') or row.get('Recent Rows') or []
-    exp_bf = safe_float(row.get('Exp BF') or row.get('expected_bf'), None)
-    ip_floor = safe_float(row.get('IP Floor') or row.get('ip_floor'), None)
-    pitcher_k = safe_float(row.get('Pitcher K%') or row.get('pitcher_k') or row.get('pitcher_k_pct'), None)
-    if pitcher_k is not None and pitcher_k > 1:
-        pitcher_k /= 100.0
-    putaway = safe_float(row.get('Putaway/Whiff') or row.get('putaway_whiff') or row.get('putaway_rate') or row.get('Putaway'), None)
-    lineup_k = safe_float(row.get('Opp K%') or row.get('Lineup K Pressure') or row.get('opp_k_pct') or row.get('lineup_k_pressure'), None)
-    if lineup_k is not None and lineup_k <= 1:
-        lineup_k *= 100.0
-    avg_bf_l3 = _wl2_mean(_wl2_recent_vals(recent_rows, 'BF', 3))
-    avg_bf_l5 = _wl2_mean(_wl2_recent_vals(recent_rows, 'BF', 5))
-    avg_ip_l3 = _wl2_mean(_wl2_recent_vals(recent_rows, 'IP_float', 3))
-    avg_ip_l5 = _wl2_mean(_wl2_recent_vals(recent_rows, 'IP_float', 5))
-    avg_pitches_l3 = _wl2_mean(_wl2_recent_vals(recent_rows, 'Pitches', 3))
-    avg_pitches_l5 = _wl2_mean(_wl2_recent_vals(recent_rows, 'Pitches', 5))
-    avg_ks_l5 = _wl2_mean(_wl2_recent_vals(recent_rows, 'Ks', 5))
-    avg_bb_l3 = _wl2_mean(_wl2_recent_vals(recent_rows, 'BB', 3))
-    ppb_l3 = avg_pitches_l3 / avg_bf_l3 if avg_pitches_l3 and avg_bf_l3 and avg_bf_l3 > 0 else None
-    score = 50.0; bf_adj = 0.0; k_nudge = 0.0; flags = []
-    bf_anchor = avg_bf_l3 * .60 + avg_bf_l5 * .40 if avg_bf_l3 and avg_bf_l5 else (avg_bf_l3 or avg_bf_l5)
-    if bf_anchor is not None:
-        if bf_anchor >= 24: score += 18; bf_adj += .75; flags.append('STRONG_RECENT_BF')
-        elif bf_anchor >= 22: score += 10; bf_adj += .35; flags.append('STABLE_RECENT_BF')
-        elif bf_anchor <= 17: score -= 18; bf_adj -= .90; flags.append('LOW_RECENT_BF')
-        elif bf_anchor <= 19: score -= 8; bf_adj -= .40; flags.append('LIGHT_RECENT_BF')
-    ip_anchor = avg_ip_l3 * .60 + avg_ip_l5 * .40 if avg_ip_l3 and avg_ip_l5 else (avg_ip_l3 or avg_ip_l5)
-    if ip_anchor is not None:
-        if ip_anchor >= 6.0: score += 12; bf_adj += .35; flags.append('DEEP_IP_TREND')
-        elif ip_anchor <= 4.3: score -= 16; bf_adj -= .75; flags.append('SHORT_IP_TREND')
-    if avg_pitches_l5 is not None:
-        if avg_pitches_l5 >= WL2_HIGH_PITCHES: score += 9; bf_adj += .25; flags.append('PITCH_COUNT_LEASH')
-        elif avg_pitches_l5 <= 72: score -= 12; bf_adj -= .50; flags.append('LOW_PITCH_COUNT_LEASH')
-    if ppb_l3 is not None:
-        if ppb_l3 <= WL2_EFFICIENT_PPB and (avg_pitches_l3 or 0) >= 82: score += 7; bf_adj += .20; flags.append('EFFICIENT_VOLUME')
-        elif ppb_l3 >= 4.35: score -= 10; bf_adj -= .40; flags.append('PITCH_STRESS')
-    if avg_bb_l3 is not None and avg_bb_l3 >= 3: score -= 8; bf_adj -= .35; flags.append('WALK_STRESS')
-    if exp_bf is not None:
-        if exp_bf >= WL2_STRONG_BF: score += 10; flags.append('ENGINE_STRONG_BF')
-        elif exp_bf >= WL2_STABLE_BF: score += 5; flags.append('ENGINE_STABLE_BF')
-        elif exp_bf <= 16.5: score -= 20; flags.append('ENGINE_LOW_BF')
-    if ip_floor is not None:
-        if ip_floor >= 5.5: score += 8; flags.append('HIGH_IP_FLOOR')
-        elif ip_floor < 4.0: score -= 12; flags.append('LOW_IP_FLOOR')
-    ceiling_score = 0.0
-    if pitcher_k is not None:
-        if pitcher_k >= .30: ceiling_score += 28; flags.append('ELITE_K_PROFILE')
-        elif pitcher_k >= WL2_HIGH_K_PCT: ceiling_score += 18; flags.append('HIGH_K_PROFILE')
-    if putaway is not None:
-        if putaway >= 35: ceiling_score += 22; flags.append('ELITE_PUTAWAY')
-        elif putaway >= WL2_ELITE_PUTAWAY: ceiling_score += 14; flags.append('PLUS_PUTAWAY')
-    if lineup_k is not None:
-        if lineup_k >= 25: ceiling_score += 16; flags.append('HIGH_K_LINEUP')
-        elif lineup_k >= WL2_LINEUP_K_PRESSURE: ceiling_score += 9; flags.append('PLUS_K_LINEUP')
-    if avg_ks_l5 is not None:
-        if avg_ks_l5 >= 6.5: ceiling_score += 14; flags.append('RECENT_K_CEILING')
-        elif avg_ks_l5 <= 3.0: ceiling_score -= 8; flags.append('LOW_RECENT_KS')
-    workload_ok = score >= 58; ceiling_ok = ceiling_score >= 38
-    if workload_ok and ceiling_ok:
-        k_nudge += .26
-        if score >= 72 and ceiling_score >= 54: k_nudge += .12
-        flags.append('WL2_CEILING_UPSIDE')
-    elif ceiling_ok and score < 48:
-        k_nudge -= .12; flags.append('CEILING_BUT_LEASH_BLOCKED')
-    bf_adj = float(clamp(bf_adj, WL2_MAX_BF_CUT, WL2_MAX_BF_BOOST))
-    k_nudge = float(clamp(k_nudge, -.22, WL2_MAX_K_NUDGE))
-    score = int(clamp(round(score), 0, 100)); ceiling_score = int(clamp(round(ceiling_score), 0, 100))
-    leash_label = 'STRONG_LEASH_2' if score >= 72 else 'STABLE_LEASH_2' if score >= 58 else 'FRAGILE_LEASH_2' if score >= 42 else 'DANGER_LEASH_2'
-    ceiling_label = 'ELITE_CEILING_2' if ceiling_score >= 54 else 'PLUS_CEILING_2' if ceiling_score >= 38 else 'NORMAL_CEILING_2' if ceiling_score >= 22 else 'LOW_CEILING_2'
-    return {'active': True, 'leash_score_2': score, 'ceiling_score_2': ceiling_score, 'leash_label_2': leash_label, 'ceiling_label_2': ceiling_label, 'bf_adj_2': round(bf_adj,2), 'k_nudge_2': round(k_nudge,2), 'flags_2': flags[:10], 'note': f'{leash_label} / {ceiling_label} | BF adj {bf_adj:+.2f} | K nudge {k_nudge:+.2f}'}
-
-def apply_workload_leash_2_to_projection(row=None, projection=None, expected_bf=None, recent_rows=None):
-    row = row or {}
-    if not WORKLOAD_LEASH_2_ENABLED:
-        return projection, expected_bf, {'active': False, 'note': 'WL2 off'}
-    prof = workload_leash_2_profile(row, recent_rows)
-    proj = safe_float(projection, None); bf = safe_float(expected_bf, None)
-    if proj is not None:
-        proj = round(float(clamp(proj + prof.get('k_nudge_2', 0), 0, 18)), 3)
-    if bf is not None:
-        bf = round(float(clamp(bf + prof.get('bf_adj_2', 0), 10, 34)), 3)
-    row['WL2 Leash Score'] = prof.get('leash_score_2'); row['WL2 Ceiling Score'] = prof.get('ceiling_score_2')
-    row['WL2 Label'] = prof.get('leash_label_2'); row['WL2 Ceiling'] = prof.get('ceiling_label_2')
-    row['WL2 BF Adj'] = prof.get('bf_adj_2'); row['WL2 K Nudge'] = prof.get('k_nudge_2')
-    row['WL2 Flags'] = ' | '.join(prof.get('flags_2', [])); row['WL2 Note'] = prof.get('note')
-    return proj, bf, prof
-
-def workload_leash_2_under_risk(row=None, base_decision=None, base_tier=None):
-    row = row or {}
-    proj = safe_float(row.get('K PROJ') or row.get('Raw K PROJ') or row.get('projection') or row.get('k_proj'), None)
-    line = safe_float(row.get('line') or row.get('UD/Line') or row.get('Line') or row.get('underdog_line'), None)
-    if proj is None or line is None or not (proj < line):
-        return base_decision, base_tier, 0, 'NO_UNDER_RISK', 'Not an under or no line'
-    gap = line - proj
-    leash_score = safe_float(row.get('WL2 Leash Score'), row.get('Leash Score') or 50) or 50
-    ceiling_score = safe_float(row.get('WL2 Ceiling Score'), 0) or 0
-    exp_bf = safe_float(row.get('Exp BF') or row.get('expected_bf'), None)
-    ceiling = safe_float(row.get('Ceiling') or row.get('ceiling'), None)
-    if gap <= .35:
-        return '🚫 PASS — UNDER TOO CLOSE', 'PASS', 4, 'UNDER_TOO_CLOSE', f'Under gap only {gap:.2f}'
-    if gap <= .75 and (ceiling_score >= 38 or leash_score >= 70 or (exp_bf is not None and exp_bf >= 23)):
-        return '🚫 PASS — UNDER VOLUME/CEILING RISK', 'PASS', 5, 'UNDER_VOLUME_CEILING_RISK', f'Gap {gap:.2f}; leash {leash_score}; ceiling {ceiling_score}'
-    if gap <= 1.00 and ceiling is not None and ceiling >= line + WL2_CEILING_OVER_LINE and leash_score >= 65:
-        return '🚫 PASS — UNDER CEILING PATH', 'PASS', 4, 'UNDER_CEILING_PATH', f'Gap {gap:.2f}; ceiling {ceiling:.1f}; leash {leash_score}'
-    return base_decision, base_tier, 0, 'UNDER_OK', f'Under gap {gap:.2f} passed WL2'
-
-def apply_workload_leash_2_classification(row):
-    if not isinstance(row, dict): return row
-    base_decision = row.get('Ace Ceiling Decision') or row.get('Projection First Decision') or row.get('Decision') or row.get('decision')
-    base_tier = row.get('Ace Ceiling Tier') or row.get('Projection First Tier') or row.get('Tier') or row.get('tier')
-    new_decision, new_tier, boost, label, note = workload_leash_2_under_risk(row, base_decision, base_tier)
-    row['WL2 Under Risk Label'] = label; row['WL2 Under Risk Note'] = note; row['WL2 Under Risk Boost'] = boost
-    row['WL2 Decision'] = new_decision; row['WL2 Tier'] = new_tier
-    return row
-
-
-
-
-
-# =========================
-# TRUE PROJECTION PLUS: TEAM / MANAGER HOOK PROFILE
-# Real-data learning layer:
-# - Does NOT overwrite the previous Workload/Leash/Rotowire engine
-# - Uses saved graded history when available
-# - Uses current pitcher/team leash signals only as fallback
-# - Applies tiny capped BF/K adjustments only when evidence is strong
-# =========================
-TEAM_MANAGER_HOOK_PROFILE_ENABLED = True
-TEAM_HOOK_MIN_SAMPLES = 8
-TEAM_HOOK_MAX_BF_ADJ = 0.85
-TEAM_HOOK_MAX_K_NUDGE = 0.22
-
-def _tmhp_team_key(row=None):
-    row = row or {}
-    raw = (
-        row.get("team")
-        or row.get("Team")
-        or row.get("Pitcher Team")
-        or row.get("pitcher_team")
-        or row.get("ML Context Pick")
-        or ""
-    )
-    try:
-        return _rw_team_key(raw)
-    except Exception:
-        return str(raw or "").upper()[:3]
-
-def build_team_manager_hook_profiles_from_results():
-    """Build team/manager hook tendency from saved graded/result history.
-
-    This is intentionally conservative because historical rows may not always
-    contain BF or pitch-count fields. If not enough samples exist, it returns
-    neutral profiles and the engine behaves like the previous file.
-    """
-    results = load_json(RESULT_LOG, [])
-    teams = {}
-    for r in results or []:
-        if not isinstance(r, dict):
-            continue
-        team = _tmhp_team_key(r)
-        if not team:
-            continue
-
-        # Try multiple possible columns because saved rows differ by version.
-        exp_bf = safe_float(r.get("Exp BF") or r.get("expected_bf") or r.get("projected_bf") or r.get("bf_projection"), None)
-        actual_bf = safe_float(r.get("Actual BF") or r.get("actual_bf") or r.get("batters_faced") or r.get("BF"), None)
-        exp_ip = safe_float(r.get("IP Floor") or r.get("ip_floor") or r.get("expected_ip"), None)
-        actual_ip = safe_float(r.get("Actual IP") or r.get("actual_ip") or r.get("innings_pitched"), None)
-        pitches = safe_float(r.get("Pitches") or r.get("actual_pitches") or r.get("pitch_count"), None)
-
-        # Need at least one volume signal.
-        if actual_bf is None and actual_ip is None and pitches is None:
-            continue
-
-        d = teams.setdefault(team, {"n": 0, "bf_err": [], "ip_err": [], "pitches": [], "short_hooks": 0, "deep_hooks": 0})
-        d["n"] += 1
-
-        if actual_bf is not None and exp_bf is not None:
-            d["bf_err"].append(actual_bf - exp_bf)
-            if actual_bf <= 18:
-                d["short_hooks"] += 1
-            if actual_bf >= 24:
-                d["deep_hooks"] += 1
-
-        if actual_ip is not None and exp_ip is not None:
-            d["ip_err"].append(actual_ip - exp_ip)
-            if actual_ip <= 4.5:
-                d["short_hooks"] += 1
-            if actual_ip >= 6.0:
-                d["deep_hooks"] += 1
-
-        if pitches is not None:
-            d["pitches"].append(pitches)
-            if pitches <= 78:
-                d["short_hooks"] += 1
-            if pitches >= 95:
-                d["deep_hooks"] += 1
-
-    profiles = {}
-    for team, d in teams.items():
-        n = int(d.get("n") or 0)
-        if n < TEAM_HOOK_MIN_SAMPLES:
-            continue
-
-        avg_bf_err = _wl2_mean(d.get("bf_err")) or 0.0
-        avg_ip_err = _wl2_mean(d.get("ip_err")) or 0.0
-        avg_pitches = _wl2_mean(d.get("pitches"))
-        short_rate = d.get("short_hooks", 0) / max(1, n)
-        deep_rate = d.get("deep_hooks", 0) / max(1, n)
-
-        score = 50.0
-        score += clamp(avg_bf_err * 4.0, -14, 14)
-        score += clamp(avg_ip_err * 7.0, -10, 10)
-        if avg_pitches is not None:
-            score += clamp((avg_pitches - 86) * 0.85, -10, 12)
-        score += clamp((deep_rate - short_rate) * 22, -16, 16)
-        score = int(clamp(round(score), 0, 100))
-
-        if score >= 66:
-            label = "TEAM_LONG_LEASH"
-        elif score <= 38:
-            label = "TEAM_QUICK_HOOK"
-        else:
-            label = "TEAM_NEUTRAL_HOOK"
-
-        profiles[team] = {
-            "team": team,
-            "samples": n,
-            "score": score,
-            "label": label,
-            "avg_bf_error": round(avg_bf_err, 2),
-            "avg_ip_error": round(avg_ip_err, 2),
-            "avg_pitches": None if avg_pitches is None else round(avg_pitches, 1),
-            "short_hook_rate": round(short_rate, 3),
-            "deep_hook_rate": round(deep_rate, 3),
-        }
-    return profiles
-
-def team_manager_hook_profile_for_row(row=None):
-    row = row or {}
-    team = _tmhp_team_key(row)
-    profiles = build_team_manager_hook_profiles_from_results()
-    prof = profiles.get(team)
-
-    if prof:
-        return prof
-
-    # Fallback is neutral and uses current row signals only for display.
-    # It does not force a team hook adjustment without real saved samples.
-    return {
-        "team": team,
-        "samples": 0,
-        "score": 50,
-        "label": "TEAM_HOOK_NEUTRAL_NO_SAMPLE",
-        "avg_bf_error": 0,
-        "avg_ip_error": 0,
-        "avg_pitches": None,
-        "short_hook_rate": None,
-        "deep_hook_rate": None,
-    }
-
-def apply_team_manager_hook_profile(row=None, projection=None, expected_bf=None):
-    row = row or {}
-    if not TEAM_MANAGER_HOOK_PROFILE_ENABLED:
-        return projection, expected_bf, {"active": False, "note": "Team manager hook profile off"}
-
-    prof = team_manager_hook_profile_for_row(row)
-    score = safe_float(prof.get("score"), 50) or 50
-    samples = int(prof.get("samples") or 0)
-    label = prof.get("label") or "TEAM_HOOK_NEUTRAL"
-
-    bf_adj = 0.0
-    k_nudge = 0.0
-
-    # Only adjust when enough historical samples exist.
-    if samples >= TEAM_HOOK_MIN_SAMPLES:
-        if score >= 66:
-            bf_adj = clamp((score - 64) / 20.0, 0.10, TEAM_HOOK_MAX_BF_ADJ)
-            k_nudge = clamp(bf_adj * 0.16, 0.02, TEAM_HOOK_MAX_K_NUDGE)
-        elif score <= 38:
-            bf_adj = -clamp((40 - score) / 20.0, 0.10, TEAM_HOOK_MAX_BF_ADJ)
-            k_nudge = -clamp(abs(bf_adj) * 0.14, 0.02, TEAM_HOOK_MAX_K_NUDGE)
-
-    proj = safe_float(projection, None)
-    bf = safe_float(expected_bf, None)
-    if proj is not None:
-        proj = round(float(clamp(proj + k_nudge, 0, 18)), 3)
-    if bf is not None:
-        bf = round(float(clamp(bf + bf_adj, 10, 34)), 3)
-
-    row["Team Hook Label"] = label
-    row["Team Hook Score"] = score
-    row["Team Hook Samples"] = samples
-    row["Team Hook BF Adj"] = round(float(bf_adj), 2)
-    row["Team Hook K Nudge"] = round(float(k_nudge), 2)
-    row["Team Hook Note"] = f"{label} | samples {samples} | BF adj {bf_adj:+.2f} | K {k_nudge:+.2f}"
-    return proj, bf, prof
-
-def final_true_projection_quality_gate(row=None):
-    """Adds a non-destructive quality label to help avoid false confidence.
-
-    It does not change projections. It shows whether the current projection has:
-    - confirmed/Rotowire lineup support
-    - workload/leash support
-    - team hook samples
-    - ceiling score support
-    """
-    row = row or {}
-    lineup = str(row.get("Lineup") or row.get("lineup") or row.get("Lineup Source") or "").upper()
-    wl2 = safe_float(row.get("WL2 Leash Score"), None)
-    ceiling = safe_float(row.get("WL2 Ceiling Score"), None)
-    hook_samples = safe_float(row.get("Team Hook Samples"), 0) or 0
-
-    score = 50
-    notes = []
-
-    if "CONFIRMED" in lineup:
-        score += 18; notes.append("confirmed lineup")
-    elif "ROTOWIRE" in lineup:
-        score += 10; notes.append("rotowire projected")
-    else:
-        score -= 8; notes.append("fallback lineup")
-
-    if wl2 is not None:
-        if wl2 >= 70:
-            score += 12; notes.append("strong workload")
-        elif wl2 < 42:
-            score -= 12; notes.append("fragile workload")
-
-    if ceiling is not None:
-        if ceiling >= 54:
-            score += 8; notes.append("elite ceiling")
-        elif ceiling < 22:
-            score -= 4; notes.append("low ceiling")
-
-    if hook_samples >= TEAM_HOOK_MIN_SAMPLES:
-        score += 8; notes.append("team hook learned")
-    else:
-        notes.append("team hook warming")
-
-    score = int(clamp(score, 0, 100))
-    if score >= 78:
-        label = "TRUE_PROJ_STRONG"
-    elif score >= 62:
-        label = "TRUE_PROJ_STABLE"
-    elif score >= 45:
-        label = "TRUE_PROJ_MONITOR"
-    else:
-        label = "TRUE_PROJ_FRAGILE"
-
-    row["True Projection Label"] = label
-    row["True Projection Score"] = score
-    row["True Projection Note"] = " | ".join(notes[:6])
-    return row
-
-
 def build_kproj_table(board):
     rows = []
     for p in board or []:
@@ -8111,8 +7475,6 @@ def build_kproj_table(board):
         p["Decision"] = d.get("decision")
         apply_projection_first_confidence_to_row(p)
         apply_ace_ceiling_protection_to_row(p)
-        apply_workload_leash_2_classification(p)
-        final_true_projection_quality_gate(p)
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
@@ -8125,7 +7487,7 @@ def build_kproj_table(board):
             "Under Sim %": None if dist.get("under_prob") is None else round(dist.get("under_prob") * 100, 1),
             "UD/Line": d.get("line"),
             "Line Source": d.get("line_source"),
-            "Decision": p.get("WL2 Decision") or p.get("Ace Ceiling Decision") or p.get("Projection First Decision") or d.get("decision"),
+            "Decision": p.get("Ace Ceiling Decision") or p.get("Projection First Decision") or d.get("decision"),
             "Base Decision": d.get("decision"),
             "Model Lean": d.get("lean_side"),
             "Lean Gap": d.get("lean_gap"),
@@ -8137,27 +7499,11 @@ def build_kproj_table(board):
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
             "Lineup": p.get("lineup_status"),
             "Hit Rate %": None if d.get("hit_rate") is None else round(d.get("hit_rate") * 100, 1),
-            "Tier": p.get("WL2 Tier") or p.get("Ace Ceiling Tier") or p.get("Projection First Tier") or d.get("tier"),
+            "Tier": p.get("Ace Ceiling Tier") or p.get("Projection First Tier") or d.get("tier"),
             "Confidence Mode": p.get("Projection First Label"),
             "Confidence Note": p.get("Projection First Note"),
             "Ace Ceiling Label": p.get("Ace Ceiling Label"),
             "Ace Ceiling Note": p.get("Ace Ceiling Note"),
-            "WL2 Leash Score": p.get("WL2 Leash Score"),
-            "WL2 Ceiling Score": p.get("WL2 Ceiling Score"),
-            "WL2 Label": p.get("WL2 Label"),
-            "WL2 Ceiling": p.get("WL2 Ceiling"),
-            "WL2 K Nudge": p.get("WL2 K Nudge"),
-            "WL2 BF Adj": p.get("WL2 BF Adj"),
-            "WL2 Under Risk": p.get("WL2 Under Risk Label"),
-            "WL2 Note": p.get("WL2 Note"),
-            "Team Hook Label": p.get("Team Hook Label"),
-            "Team Hook Score": p.get("Team Hook Score"),
-            "Team Hook Samples": p.get("Team Hook Samples"),
-            "Team Hook BF Adj": p.get("Team Hook BF Adj"),
-            "Team Hook K Nudge": p.get("Team Hook K Nudge"),
-            "True Projection Label": p.get("True Projection Label"),
-            "True Projection Score": p.get("True Projection Score"),
-            "True Projection Note": p.get("True Projection Note"),
             "Base Tier": d.get("tier"),
             "Role Score": d.get("role_score"),
             "Starter Score": d.get("starter_score"),
@@ -10408,4 +9754,3 @@ with tab5:
 
 with tab6:
     render_settings_visible_tab(board, dates)
-
