@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -7433,6 +7433,77 @@ def kproj_bar_html(vals):
         parts.append(f"<span class='mini-k-bar-wrap'><span class='mini-k-bar' style='height:{h}px;background:{color};'></span><span class='mini-k-label'>{v}</span></span>")
     return "<div class='mini-k-bars'>" + "".join(parts) + "</div>"
 
+
+
+
+# =========================
+# MOBILE CLICKABLE ENVIRONMENT CARD UI
+# UI only. Does not change projections.
+# =========================
+def _env_ui_clean_label(x):
+    s = str(x or "UNKNOWN").replace("_", " ").strip()
+    return " ".join(s.split()).title()
+
+def _env_ui_badge_class(label):
+    t = str(label or "").upper()
+    if any(x in t for x in ["PLUS", "UP", "FRIENDLY", "STRONG"]):
+        return "good-badge"
+    if any(x in t for x in ["MINUS", "DOWN", "SUPPRESS", "WEAK", "RISK"]):
+        return "red-badge"
+    return "yellow-badge"
+
+def render_environment_mobile_panel(p):
+    """Clickable card section for pitch trend / weather / umpire notes."""
+    p = p or {}
+    pitch_label = p.get("Pitch Trend Label") or "PITCH_TREND_NEUTRAL"
+    weather_label = p.get("Weather Upgrade Label") or "WEATHER_NEUTRAL"
+    ump_label = p.get("Umpire Micro Label") or "UMPIRE_NEUTRAL_OR_UNKNOWN"
+
+    pitch_badge = _env_ui_badge_class(pitch_label)
+    weather_badge = _env_ui_badge_class(weather_label)
+    ump_badge = _env_ui_badge_class(ump_label)
+
+    pitch_note = p.get("Pitch Trend Note") or "Pitch count trend not strong enough to move projection."
+    weather_note = p.get("Weather Upgrade Note") or "Weather is not creating a meaningful K adjustment."
+    ump_note = p.get("Umpire Micro Note") or "Umpire impact is neutral or unavailable."
+
+    pitch_k = safe_float(p.get("Pitch Trend K Nudge"), 0) or 0
+    weather_k = safe_float(p.get("Weather Upgrade K Nudge"), 0) or 0
+    weather_bf = safe_float(p.get("Weather Upgrade BF Adj"), 0) or 0
+    ump_k = safe_float(p.get("Umpire Micro K Nudge"), 0) or 0
+
+    with st.expander("📌 Matchup Factors: Pitch Trend • Weather • Umpire", expanded=False):
+        st.markdown(f"""
+        <div class="kpi-strip">
+            <div class="kpi-box">
+                <div class="kpi-label">📈 Pitch Trend</div>
+                <div class="kpi-value"><span class="badge {pitch_badge}">{_env_ui_clean_label(pitch_label)}</span></div>
+                <div class="kpi-sub">K Adj {pitch_k:+.2f}</div>
+            </div>
+            <div class="kpi-box">
+                <div class="kpi-label">🌦 Weather</div>
+                <div class="kpi-value"><span class="badge {weather_badge}">{_env_ui_clean_label(weather_label)}</span></div>
+                <div class="kpi-sub">K {weather_k:+.2f} | BF {weather_bf:+.2f}</div>
+            </div>
+            <div class="kpi-box">
+                <div class="kpi-label">👨‍⚖️ Umpire</div>
+                <div class="kpi-value"><span class="badge {ump_badge}">{_env_ui_clean_label(ump_label)}</span></div>
+                <div class="kpi-sub">K Adj {ump_k:+.2f}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div class="small-muted">
+            <b>Pitch Trend:</b> {pitch_note}<br>
+            <b>Weather:</b> {weather_note}<br>
+            <b>Umpire:</b> {ump_note}
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.caption("Small capped tiebreakers only. Main projection still comes from pitcher skill, expected BF, matchup, lineup, WL2, and line value.")
+
+
 def render_kproj_pitcher_card(p):
     d = kproj_decision(p)
     dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
@@ -7498,6 +7569,8 @@ def render_kproj_pitcher_card(p):
 # Display-only helper. Matches K Upside tab exactly.
 # Does NOT change projection math, sims, probabilities, or decisions.
 # =========================
+
+    render_environment_mobile_panel(p)
 def display_kproj_truth(p):
     """Exact displayed K PROJ used by K Upside tab."""
     try:
