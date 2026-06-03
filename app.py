@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -6838,6 +6838,10 @@ def kproj_upside_projection(p):
     proj, expected_bf, wl2_prof = apply_workload_leash_2_to_projection(p, proj, expected_bf, recent_rows_wl2)
     if "apply_team_manager_hook_profile" in globals():
         proj, expected_bf, team_hook_prof = apply_team_manager_hook_profile(p, proj, expected_bf)
+    recent_rows_micro = p.get("recent_rows") or p.get("Recent Rows") or []
+    proj, expected_bf, pitch_trend_prof = apply_pitch_count_trend_overlay(p, proj, expected_bf, recent_rows_micro)
+    proj, umpire_micro_prof = apply_umpire_micro_overlay(p, proj)
+    proj, expected_bf, weather_upgrade_prof = apply_weather_engine_upgrade_overlay(p, proj, expected_bf)
     return round(float(clamp(proj, 0.0, 15.0)), 2)
 
 # =========================
@@ -8063,6 +8067,151 @@ def final_true_projection_quality_gate(row=None):
 
 
 
+
+
+
+# =========================
+# ENVIRONMENT + PITCH COUNT + UMPIRE MICRO OVERLAYS
+# Safe capped overlays only. No refresh/player/Underdog changes.
+# =========================
+PITCH_COUNT_TREND_MODEL_ENABLED = True
+UMPIRE_MICRO_MODEL_ENABLED = True
+WEATHER_ENGINE_UPGRADE_ENABLED = True
+PCT_MAX_BF_ADJ = 0.85
+PCT_MAX_K_NUDGE = 0.18
+UMPIRE_MAX_K_NUDGE = 0.18
+WEATHER_MAX_K_NUDGE = 0.16
+WEATHER_MAX_BF_ADJ = 0.45
+
+def _micro_mean(vals):
+    vals = [safe_float(v) for v in (vals or []) if safe_float(v) is not None]
+    return float(np.mean(vals)) if vals else None
+
+def _micro_slope(vals):
+    vals = [safe_float(v) for v in (vals or []) if safe_float(v) is not None]
+    if len(vals) < 3:
+        return 0.0
+    y = np.array(list(reversed(vals)), dtype=float)
+    x = np.arange(len(y), dtype=float)
+    try:
+        return float(np.polyfit(x, y, 1)[0])
+    except Exception:
+        return 0.0
+
+def pitch_count_trend_profile(recent_rows=None):
+    rows = recent_rows or []
+    pitches = [safe_float(r.get("Pitches")) for r in rows[:6] if isinstance(r, dict) and safe_float(r.get("Pitches")) is not None]
+    bf_vals = [safe_float(r.get("BF")) for r in rows[:6] if isinstance(r, dict) and safe_float(r.get("BF")) is not None]
+    ip_vals = [safe_float(r.get("IP_float")) for r in rows[:6] if isinstance(r, dict) and safe_float(r.get("IP_float")) is not None]
+    avg_p_l3 = _micro_mean(pitches[:3])
+    slope_p = _micro_slope(pitches[:5])
+    avg_bf_l3 = _micro_mean(bf_vals[:3])
+    avg_ip_l3 = _micro_mean(ip_vals[:3])
+    score = 50.0
+    flags = []
+    if avg_p_l3 is not None:
+        if avg_p_l3 >= 96: score += 14; flags.append("HIGH_PITCH_BASE")
+        elif avg_p_l3 >= 90: score += 8; flags.append("SOLID_PITCH_BASE")
+        elif avg_p_l3 <= 75: score -= 16; flags.append("LOW_PITCH_BASE")
+        elif avg_p_l3 <= 82: score -= 8; flags.append("MILD_LOW_PITCH_BASE")
+    if slope_p >= 4.0: score += 12; flags.append("PITCH_COUNT_RISING")
+    elif slope_p >= 2.0: score += 6; flags.append("PITCH_COUNT_SLIGHT_RISE")
+    elif slope_p <= -4.0: score -= 12; flags.append("PITCH_COUNT_FALLING")
+    elif slope_p <= -2.0: score -= 6; flags.append("PITCH_COUNT_SLIGHT_DROP")
+    if avg_bf_l3 is not None:
+        if avg_bf_l3 >= 24: score += 8; flags.append("BF_VOLUME_STRONG")
+        elif avg_bf_l3 <= 18: score -= 10; flags.append("BF_VOLUME_LOW")
+    if avg_ip_l3 is not None:
+        if avg_ip_l3 >= 6.0: score += 7; flags.append("IP_TREND_DEEP")
+        elif avg_ip_l3 <= 4.5: score -= 9; flags.append("IP_TREND_SHORT")
+    score = int(clamp(round(score), 0, 100))
+    label = "PITCH_TREND_UP" if score >= 68 else "PITCH_TREND_DOWN" if score <= 38 else "PITCH_TREND_NEUTRAL"
+    bf_adj = k_nudge = 0.0
+    if PITCH_COUNT_TREND_MODEL_ENABLED and len(pitches) >= 3:
+        if score >= 68:
+            bf_adj = clamp((score - 66) / 22.0, 0.10, PCT_MAX_BF_ADJ)
+            k_nudge = clamp(bf_adj * 0.16, 0.02, PCT_MAX_K_NUDGE)
+        elif score <= 38:
+            bf_adj = -clamp((40 - score) / 22.0, 0.10, PCT_MAX_BF_ADJ)
+            k_nudge = -clamp(abs(bf_adj) * 0.15, 0.02, PCT_MAX_K_NUDGE)
+    return {"label": label, "score": score, "flags": flags, "avg_pitches_l3": None if avg_p_l3 is None else round(avg_p_l3,1), "pitch_slope": round(slope_p,2), "bf_adj": round(float(bf_adj),2), "k_nudge": round(float(k_nudge),2)}
+
+def apply_pitch_count_trend_overlay(row=None, projection=None, expected_bf=None, recent_rows=None):
+    row = row or {}
+    prof = pitch_count_trend_profile(recent_rows or row.get("recent_rows") or [])
+    proj = safe_float(projection, None)
+    bf = safe_float(expected_bf, None)
+    k_nudge = safe_float(prof.get("k_nudge"), 0) or 0
+    bf_adj = safe_float(prof.get("bf_adj"), 0) or 0
+    if proj is not None: proj = round(float(clamp(proj + k_nudge, 0, 18)), 3)
+    if bf is not None: bf = round(float(clamp(bf + bf_adj, 10, 34)), 3)
+    row["Pitch Trend Label"] = prof.get("label")
+    row["Pitch Trend Score"] = prof.get("score")
+    row["Pitch Trend K Nudge"] = k_nudge
+    row["Pitch Trend BF Adj"] = bf_adj
+    row["Pitch Trend Note"] = f"{prof.get('label')} | pL3 {prof.get('avg_pitches_l3')} | slope {prof.get('pitch_slope')} | K {k_nudge:+.2f}"
+    return proj, bf, prof
+
+def apply_umpire_micro_overlay(row=None, projection=None):
+    row = row or {}
+    ump_factor = safe_float(row.get("ump_factor"), None)
+    umpire_name = row.get("umpire") or row.get("Umpire") or ""
+    k_nudge = 0.0
+    label = "UMPIRE_NEUTRAL_OR_UNKNOWN"
+    score = 50
+    if UMPIRE_MICRO_MODEL_ENABLED and ump_factor is not None:
+        k_nudge = round(float(clamp((ump_factor - 1.0) * 7.0, -UMPIRE_MAX_K_NUDGE, UMPIRE_MAX_K_NUDGE)), 2)
+        score = int(clamp(50 + (ump_factor - 1.0) * 900, 0, 100))
+        label = "UMPIRE_K_FRIENDLY" if k_nudge >= 0.06 else "UMPIRE_K_SUPPRESS" if k_nudge <= -0.06 else "UMPIRE_NEUTRAL"
+    row["Umpire Micro Label"] = label
+    row["Umpire Micro Score"] = score
+    row["Umpire Micro K Nudge"] = k_nudge
+    row["Umpire Micro Note"] = f"{label} | {umpire_name or 'unknown'} | K {k_nudge:+.2f}"
+    proj = safe_float(projection, None)
+    if proj is not None: proj = round(float(clamp(proj + k_nudge, 0, 18)), 3)
+    return proj, {"label": label, "score": score, "k_nudge": k_nudge}
+
+def apply_weather_engine_upgrade_overlay(row=None, projection=None, expected_bf=None):
+    row = row or {}
+    base_factor = safe_float(row.get("weather_factor"), None)
+    da_factor = safe_float(row.get("density_altitude_factor") or row.get("da_factor"), None)
+    temp = safe_float(row.get("temperature") or row.get("temp_f") or row.get("Temp"), None)
+    humidity = safe_float(row.get("humidity") or row.get("Humidity"), None)
+    wind = safe_float(row.get("wind_speed") or row.get("Wind Speed"), None)
+    roof = str(row.get("roof") or row.get("Roof") or "").upper()
+    k_nudge = 0.0
+    bf_adj = 0.0
+    flags = []
+    if WEATHER_ENGINE_UPGRADE_ENABLED and not ("DOME" in roof or "CLOSED" in roof):
+        factor = 1.0
+        if base_factor is not None: factor *= clamp(base_factor, 0.965, 1.035)
+        if da_factor is not None: factor *= clamp(da_factor, 0.965, 1.025)
+        if temp is not None:
+            if temp >= 92: bf_adj -= 0.15; flags.append("HOT_FATIGUE")
+            elif 58 <= temp <= 78: bf_adj += 0.08; flags.append("COMFORT_TEMP")
+            elif temp <= 45: k_nudge -= 0.04; flags.append("COLD_GRIP")
+        if humidity is not None and temp is not None and humidity >= 70 and temp >= 84:
+            bf_adj -= 0.12; flags.append("HUMID_FATIGUE")
+        if wind is not None and wind >= 15:
+            k_nudge -= 0.02; flags.append("WINDY")
+        k_nudge += clamp((factor - 1.0) * 5.0, -WEATHER_MAX_K_NUDGE, WEATHER_MAX_K_NUDGE)
+    elif WEATHER_ENGINE_UPGRADE_ENABLED:
+        flags.append("ROOF_CONTROLLED")
+    k_nudge = round(float(clamp(k_nudge, -WEATHER_MAX_K_NUDGE, WEATHER_MAX_K_NUDGE)), 2)
+    bf_adj = round(float(clamp(bf_adj, -WEATHER_MAX_BF_ADJ, WEATHER_MAX_BF_ADJ)), 2)
+    label = "WEATHER_K_SLIGHT_PLUS" if k_nudge >= 0.06 or bf_adj >= 0.15 else "WEATHER_K_SLIGHT_MINUS" if k_nudge <= -0.06 or bf_adj <= -0.15 else "WEATHER_NEUTRAL"
+    row["Weather Upgrade Label"] = label
+    row["Weather Upgrade Score"] = int(clamp(50 + (k_nudge * 110) + (bf_adj * 18), 0, 100))
+    row["Weather Upgrade K Nudge"] = k_nudge
+    row["Weather Upgrade BF Adj"] = bf_adj
+    row["Weather Upgrade Note"] = f"{label} | K {k_nudge:+.2f} | BF {bf_adj:+.2f} | {'/'.join(flags[:4])}"
+    proj = safe_float(projection, None)
+    bf = safe_float(expected_bf, None)
+    if proj is not None: proj = round(float(clamp(proj + k_nudge, 0, 18)), 3)
+    if bf is not None: bf = round(float(clamp(bf + bf_adj, 10, 34)), 3)
+    return proj, bf, {"label": label, "k_nudge": k_nudge, "bf_adj": bf_adj}
+
+
 def build_kproj_table(board):
     rows = []
     for p in board or []:
@@ -8117,6 +8266,14 @@ def build_kproj_table(board):
             "Team Hook Score": p.get("Team Hook Score"),
             "True Projection Label": p.get("True Projection Label"),
             "True Projection Score": p.get("True Projection Score"),
+            "Pitch Trend Label": p.get("Pitch Trend Label"),
+            "Pitch Trend Score": p.get("Pitch Trend Score"),
+            "Pitch Trend K Nudge": p.get("Pitch Trend K Nudge"),
+            "Umpire Micro Label": p.get("Umpire Micro Label"),
+            "Umpire Micro K Nudge": p.get("Umpire Micro K Nudge"),
+            "Weather Upgrade Label": p.get("Weather Upgrade Label"),
+            "Weather Upgrade K Nudge": p.get("Weather Upgrade K Nudge"),
+            "Weather Upgrade BF Adj": p.get("Weather Upgrade BF Adj"),
             "Base Tier": d.get("tier"),
             "Role Score": d.get("role_score"),
             "Starter Score": d.get("starter_score"),
