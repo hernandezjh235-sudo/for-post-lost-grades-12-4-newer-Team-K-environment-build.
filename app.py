@@ -1859,7 +1859,7 @@ def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
 # 2) Rotowire projected lineup is used only before confirmed lineups are posted
 # 3) Team fallback remains last resort
 # =========================
-ROTOWIRE_PROJECTED_LINEUPS_ENABLED = True
+ROTOWIRE_PROJECTED_LINEUPS_ENABLED = False
 ROTOWIRE_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 
 MLB_TEAM_ALIASES = {
