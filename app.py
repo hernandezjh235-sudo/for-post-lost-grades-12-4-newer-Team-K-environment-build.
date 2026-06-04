@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY + CALIBRATION AUDIT ONLY + K ONLY SAVE LINE FIX + OLD SAVE LOGS RESTORED" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY + CALIBRATION AUDIT ONLY" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -6171,54 +6171,6 @@ def render_calibration_audit_tab():
         st.write("Look for buckets with at least 25+ samples before making real tuning decisions.")
 
 
-
-
-
-# =========================
-# SAVE / LOAD REAL LINE NORMALIZATION FIX
-# K-only. Keeps real saved line/source fields available after reload.
-# =========================
-def normalize_saved_real_line_fields(row):
-    row = dict(row or {})
-    line = first_value(row, ["UD/Line", "line", "Line", "active_line", "Active Line", "Prop Line"])
-    line = safe_float(line)
-    if line is not None:
-        row["UD/Line"] = line
-        row["line"] = line
-        row["Line"] = line
-
-    source = first_value(row, ["Line Source", "line_source", "Source", "active_source", "Active Source"])
-    if source:
-        row["Line Source"] = source
-        row["line_source"] = source
-    elif line is not None:
-        row["Line Source"] = row.get("Line Source") or "Saved Real Line"
-        row["line_source"] = row.get("line_source") or row["Line Source"]
-
-    proj = first_value(row, ["K PROJ", "projection", "Projection", "proj"])
-    proj = safe_float(proj)
-    if proj is not None:
-        row["K PROJ"] = proj
-        row["projection"] = proj
-        row["Projection"] = proj
-
-    pitcher = first_value(row, ["Pitcher", "pitcher", "Player", "player"])
-    if pitcher:
-        row["Pitcher"] = pitcher
-        row["pitcher"] = pitcher
-
-    return row
-
-def normalize_saved_snapshot_rows(rows):
-    return [normalize_saved_real_line_fields(r) for r in (rows or []) if isinstance(r, dict)]
-
-def load_saved_pick_log_normalized():
-    return normalize_saved_snapshot_rows(load_json(PICK_LOG, []))
-
-def save_pick_log_normalized(rows):
-    save_json(PICK_LOG, normalize_saved_snapshot_rows(rows or []))
-
-
 # =========================
 # APP
 # =========================
@@ -6313,7 +6265,7 @@ if save_btn:
         st.session_state.last_saved_count = added
         st.success(f"Saved official before-game snapshot. Added {added} new rows.")
 
-saved = load_saved_pick_log_normalized()
+saved = load_json(PICK_LOG, [])
 
 # IMPORTANT:
 # - If you have refreshed this session, the screen shows refreshed live board.
@@ -8773,7 +8725,6 @@ def apply_volume_safety_classification(row=None):
 def build_kproj_table(board):
     rows = []
     for p in board or []:
-        p = normalize_saved_real_line_fields(p)
         d = kproj_decision(p)
         dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
         p["K PROJ"] = d.get("projection")
@@ -11035,7 +10986,7 @@ def inject_mobile_k_card_fix():
     """, unsafe_allow_html=True)
 
 
-tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6, tab_calibration_audit= st.tabs([
+tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6, tab_pitching_outs, tab_calibration_audit= st.tabs([
     'K PROJ / UPSIDE',
     'FINAL BOARD',
     'MONEYLINE EDGE',
@@ -11049,6 +11000,7 @@ tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_das
     'CALIBRATION',
     'SOURCE LOG',
     'SETTINGS',
+    "Pitching Outs",
     "🧠 Calibration Audit"])
 
 with tab_kproj:
@@ -11094,7 +11046,8 @@ with tab6:
 # =========================
 try:
     _multi_prop_rows = st.session_state.get("projections", [])
-
+    with tab_pitching_outs:
+        render_multi_prop_tab(_multi_prop_rows, "Pitching Outs")
 except NameError:
     pass
 
