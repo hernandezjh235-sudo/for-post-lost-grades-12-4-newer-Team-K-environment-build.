@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY + CALIBRATION AUDIT ONLY + K ONLY SAVE LINE FIX" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -5650,7 +5650,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     }
 
 def save_many_once(new_picks):
-    picks = load_json(PICK_LOG, [])
+    picks = load_saved_pick_log_normalized()
     ids = set([p.get("pick_id") for p in picks])
     added = 0
     for p in new_picks:
@@ -5690,7 +5690,7 @@ def get_actual_pitcher_ks(game_pk, pitcher_id):
     return None
 
 def grade_finished_games():
-    picks = load_json(PICK_LOG, [])
+    picks = load_saved_pick_log_normalized()
     results = load_json(RESULT_LOG, [])
     result_ids = set([r.get("pick_id") for r in results])
     graded = 0
@@ -6011,6 +6011,214 @@ def render_multi_prop_tab(rows, prop_type):
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+
+
+
+# =========================
+# CALIBRATION AUDIT ONLY
+# Safe version:
+# - Dashboard only
+# - Does NOT alter projections
+# - Does NOT touch refresh
+# - Does NOT touch player loading
+# =========================
+CALIBRATION_AUDIT_ONLY_ENABLED = True
+
+def _audit_actual_projection(row):
+    actual = safe_float(row.get("actual") or row.get("Actual") or row.get("Actual Ks") or row.get("actual_ks"))
+    proj = safe_float(row.get("projection") or row.get("K PROJ") or row.get("Projection") or row.get("proj"))
+    return actual, proj
+
+def _audit_side(row):
+    raw = str(row.get("pick_side") or row.get("Pick") or row.get("Decision") or row.get("Model Lean") or "").upper()
+    if "OVER" in raw or " O" in raw or raw.startswith("O"):
+        return "OVER"
+    if "UNDER" in raw or " U" in raw or raw.startswith("U"):
+        return "UNDER"
+    proj = safe_float(row.get("projection") or row.get("K PROJ") or row.get("Projection"))
+    line = safe_float(row.get("line") or row.get("UD/Line") or row.get("Line"))
+    if proj is not None and line is not None:
+        return "OVER" if proj > line else "UNDER"
+    return "UNKNOWN"
+
+def _audit_line(row):
+    return safe_float(row.get("line") or row.get("UD/Line") or row.get("Line"))
+
+def _audit_tier(row):
+    return str(row.get("Tier") or row.get("tier") or row.get("Base Tier") or "UNKNOWN").upper()
+
+def _audit_edge(row):
+    edge = safe_float(row.get("Edge") or row.get("Edge Gap") or row.get("Lean Gap") or row.get("abs_edge"))
+    if edge is not None:
+        return abs(edge)
+    proj = safe_float(row.get("projection") or row.get("K PROJ") or row.get("Projection"))
+    line = _audit_line(row)
+    if proj is not None and line is not None:
+        return abs(proj - line)
+    return None
+
+def _audit_win(row):
+    raw = str(row.get("graded_result") or row.get("Result") or row.get("result") or "").upper()
+    if raw == "WIN" or row.get("win") is True:
+        return 1
+    if raw == "LOSS" or row.get("win") is False:
+        return 0
+    actual, proj = _audit_actual_projection(row)
+    line = _audit_line(row)
+    side = _audit_side(row)
+    if actual is None or line is None:
+        return None
+    if side == "OVER":
+        return 1 if actual > line else 0
+    if side == "UNDER":
+        return 1 if actual < line else 0
+    return None
+
+def _audit_bucket_line(line):
+    line = safe_float(line)
+    if line is None:
+        return "NO LINE"
+    if line <= 3.5:
+        return "Line <= 3.5"
+    if line <= 4.5:
+        return "Line 4.5"
+    if line <= 5.5:
+        return "Line 5.5"
+    if line <= 6.5:
+        return "Line 6.5"
+    return "Line 7+"
+
+def _audit_bucket_edge(edge):
+    edge = safe_float(edge)
+    if edge is None:
+        return "No Edge"
+    if edge < 0.5:
+        return "Edge < 0.5"
+    if edge < 1.0:
+        return "Edge 0.5-1.0"
+    if edge < 1.5:
+        return "Edge 1.0-1.5"
+    if edge < 2.0:
+        return "Edge 1.5-2.0"
+    return "Edge 2.0+"
+
+def build_calibration_audit_rows(results=None):
+    results = results if results is not None else load_json(RESULT_LOG, [])
+    groups = {}
+
+    def add_group(name, row, err, win):
+        g = groups.setdefault(name, {"Bucket": name, "Samples": 0, "Wins": 0, "Err Sum": 0.0, "Abs Err Sum": 0.0})
+        g["Samples"] += 1
+        g["Wins"] += int(win)
+        g["Err Sum"] += float(err)
+        g["Abs Err Sum"] += abs(float(err))
+
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        actual, proj = _audit_actual_projection(r)
+        win = _audit_win(r)
+        if actual is None or proj is None or win is None:
+            continue
+        err = actual - proj
+        side = _audit_side(r)
+        tier = _audit_tier(r)
+        line_bucket = _audit_bucket_line(_audit_line(r))
+        edge_bucket = _audit_bucket_edge(_audit_edge(r))
+
+        add_group("ALL", r, err, win)
+        add_group(f"Side: {side}", r, err, win)
+        add_group(f"Tier: {tier}", r, err, win)
+        add_group(line_bucket, r, err, win)
+        add_group(edge_bucket, r, err, win)
+        add_group(f"{side} | {line_bucket}", r, err, win)
+        add_group(f"{side} | {edge_bucket}", r, err, win)
+
+    rows = []
+    for g in groups.values():
+        n = max(1, g["Samples"])
+        rows.append({
+            "Bucket": g["Bucket"],
+            "Samples": g["Samples"],
+            "Wins": g["Wins"],
+            "Win Rate %": round((g["Wins"] / n) * 100, 1),
+            "Bias Ks": round(g["Err Sum"] / n, 2),
+            "MAE Ks": round(g["Abs Err Sum"] / n, 2),
+        })
+    return pd.DataFrame(rows)
+
+def render_calibration_audit_tab():
+    st.markdown("### 🧠 Calibration Audit Only")
+    st.caption("Safe audit dashboard only. It does not change projections, player loading, lines, or decisions.")
+    df = build_calibration_audit_rows(load_json(RESULT_LOG, []))
+    if df.empty:
+        st.info("No graded results found yet. Save/grade results first.")
+        return
+    all_row = df[df["Bucket"] == "ALL"]
+    if not all_row.empty:
+        r = all_row.iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Samples", int(r["Samples"]))
+        c2.metric("Win Rate", f"{r['Win Rate %']}%")
+        c3.metric("Bias Ks", r["Bias Ks"])
+        c4.metric("MAE Ks", r["MAE Ks"])
+
+    st.dataframe(df.sort_values(["Samples", "Bucket"], ascending=[False, True]), use_container_width=True, hide_index=True)
+
+    with st.expander("How to use this", expanded=False):
+        st.write("Bias Ks > 0 means actual Ks are coming in higher than projection.")
+        st.write("Bias Ks < 0 means projections are too high in that bucket.")
+        st.write("Look for buckets with at least 25+ samples before making real tuning decisions.")
+
+
+
+
+
+# =========================
+# SAVE / LOAD REAL LINE NORMALIZATION FIX
+# K-only. Keeps real saved line/source fields available after reload.
+# =========================
+def normalize_saved_real_line_fields(row):
+    row = dict(row or {})
+    line = first_value(row, ["UD/Line", "line", "Line", "active_line", "Active Line", "Prop Line"])
+    line = safe_float(line)
+    if line is not None:
+        row["UD/Line"] = line
+        row["line"] = line
+        row["Line"] = line
+
+    source = first_value(row, ["Line Source", "line_source", "Source", "active_source", "Active Source"])
+    if source:
+        row["Line Source"] = source
+        row["line_source"] = source
+    elif line is not None:
+        row["Line Source"] = row.get("Line Source") or "Saved Real Line"
+        row["line_source"] = row.get("line_source") or row["Line Source"]
+
+    proj = first_value(row, ["K PROJ", "projection", "Projection", "proj"])
+    proj = safe_float(proj)
+    if proj is not None:
+        row["K PROJ"] = proj
+        row["projection"] = proj
+        row["Projection"] = proj
+
+    pitcher = first_value(row, ["Pitcher", "pitcher", "Player", "player"])
+    if pitcher:
+        row["Pitcher"] = pitcher
+        row["pitcher"] = pitcher
+
+    return row
+
+def normalize_saved_snapshot_rows(rows):
+    return [normalize_saved_real_line_fields(r) for r in (rows or []) if isinstance(r, dict)]
+
+def load_saved_pick_log_normalized():
+    return normalize_saved_snapshot_rows(load_json(PICK_LOG, []))
+
+def save_pick_log_normalized(rows):
+    save_json(PICK_LOG, normalize_saved_snapshot_rows(rows or []))
+
+
 # =========================
 # APP
 # =========================
@@ -6105,7 +6313,7 @@ if save_btn:
         st.session_state.last_saved_count = added
         st.success(f"Saved official before-game snapshot. Added {added} new rows.")
 
-saved = load_json(PICK_LOG, [])
+saved = load_saved_pick_log_normalized()
 
 # IMPORTANT:
 # - If you have refreshed this session, the screen shows refreshed live board.
@@ -8565,6 +8773,7 @@ def apply_volume_safety_classification(row=None):
 def build_kproj_table(board):
     rows = []
     for p in board or []:
+        p = normalize_saved_real_line_fields(p)
         d = kproj_decision(p)
         dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
         p["K PROJ"] = d.get("projection")
@@ -9221,7 +9430,7 @@ def _grade_pick_result(side, line, actual):
 
 def build_results_grading_dashboard_frames():
     """Read existing result/pick logs if present. Safe if logs do not exist."""
-    picks = load_json(PICK_LOG, []) if "PICK_LOG" in globals() else []
+    picks = load_saved_pick_log_normalized() if "PICK_LOG" in globals() else []
     results = load_json(RESULT_LOG, []) if "RESULT_LOG" in globals() else []
 
     rows = []
@@ -9542,7 +9751,7 @@ def auto_fetch_boxscore_pitcher_ks(game_pk):
 
 def auto_grade_saved_picks_for_date(date_str):
     """Grades PICK_LOG saved picks for one date using final MLB boxscores."""
-    picks = load_json(PICK_LOG, []) if "PICK_LOG" in globals() else []
+    picks = load_saved_pick_log_normalized() if "PICK_LOG" in globals() else []
     schedule = auto_fetch_mlb_schedule_results(date_str)
     all_pitcher_ks = {}
     for g in schedule:
@@ -10584,7 +10793,7 @@ def render_official_save_grade_visible_tab(board, dates=None):
             except Exception as e:
                 st.error(f"Grade failed: {e}")
 
-    picks = load_json(PICK_LOG, []) if "PICK_LOG" in globals() else []
+    picks = load_saved_pick_log_normalized() if "PICK_LOG" in globals() else []
     results = load_json(RESULT_LOG, []) if "RESULT_LOG" in globals() else []
     st.markdown("#### Saved Picks")
     if picks:
@@ -10826,7 +11035,7 @@ def inject_mobile_k_card_fix():
     """, unsafe_allow_html=True)
 
 
-tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6, tab_pitching_outs= st.tabs([
+tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_dash, tab_auto_results, tab_safe_vol, tab_pitch_ump, tab2, tab3, tab4, tab5, tab6, tab_calibration_audit= st.tabs([
     'K PROJ / UPSIDE',
     'FINAL BOARD',
     'MONEYLINE EDGE',
@@ -10840,7 +11049,7 @@ tab_kproj, tab_final_board, tab_moneyline_edge, tab_lineup_lock, tab_results_das
     'CALIBRATION',
     'SOURCE LOG',
     'SETTINGS',
-    "Pitching Outs"])
+    "🧠 Calibration Audit"])
 
 with tab_kproj:
     render_kproj_tab(board)
@@ -10885,7 +11094,15 @@ with tab6:
 # =========================
 try:
     _multi_prop_rows = st.session_state.get("projections", [])
-    with tab_pitching_outs:
-        render_multi_prop_tab(_multi_prop_rows, "Pitching Outs")
+
+except NameError:
+    pass
+
+# =========================
+# CALIBRATION AUDIT TAB RENDERER
+# =========================
+try:
+    with tab_calibration_audit:
+        render_calibration_audit_tab()
 except NameError:
     pass
