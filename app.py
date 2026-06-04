@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY + CALIBRATION AUDIT ONLY + K ONLY SAVE LINE FIX + SNAPSHOT LOCK FIX + SAVE COUNT UPDATE FIX" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY + CALIBRATION AUDIT ONLY + K ONLY SAVE LINE FIX + SNAPSHOT LOCK FIX + SAVE COUNT UPDATE FIX + FORCE LIVE SAVE" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -5765,6 +5765,23 @@ def build_signal_tracking():
 # =========================
 # RENDERING
 # =========================
+
+
+
+def handle_save_official_snapshot_button():
+    rows = current_live_board_rows_for_save()
+    result = save_official_snapshot_rows_with_counts(rows)
+    if not rows:
+        st.warning("Save found 0 live board rows. Refresh Live Board first, then save.")
+    else:
+        st.success(
+            f"Saved official before-game snapshot. Live rows found {len(rows)} | "
+            f"Added {result['added']} new | Updated {result['updated']} existing | "
+            f"Real-line rows {result['real_line_rows']} | Total saved {result['total_saved']}."
+        )
+    return result
+
+
 def render_kpis(picks, bankroll):
     valid = [p for p in picks if p.get("ev") is not None]
     best = sorted(valid, key=lambda x: x.get("ev", -999), reverse=True)[0] if valid else None
@@ -6349,134 +6366,43 @@ def save_official_snapshot_rows_with_counts(rows):
     return {"added": added, "updated": updated, "real_line_rows": real_line_rows, "total_saved": len(final_rows)}
 
 def current_live_board_rows_for_save():
-    # Prefer the actual current board/projection rows, not the already-saved pick log.
-    for key in ["projections", "kproj_rows", "board", "current_board", "last_board", "official_rows"]:
-        try:
+    # Prefer actual current live board rows, not saved pick log.
+    priority_keys = [
+        "projections", "kproj_rows", "kproj_table", "board", "current_board",
+        "last_board", "official_rows", "final_board", "all_rows", "rows"
+    ]
+    candidates = []
+    try:
+        for key in priority_keys:
             val = st.session_state.get(key, None)
-            if isinstance(val, list) and len(val) > 0:
-                return val
             if isinstance(val, pd.DataFrame) and not val.empty:
-                return val.to_dict("records")
-        except Exception:
-            pass
+                recs = val.to_dict("records")
+                candidates.append((key, recs))
+            elif isinstance(val, list) and len(val) > 0 and all(isinstance(x, dict) for x in val[:3]):
+                candidates.append((key, val))
+    except Exception:
+        pass
+
+    def score_rows(rows):
+        if not rows:
+            return -1
+        n = len(rows)
+        line_count = 0
+        pitcher_count = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            if first_value(r, ["Pitcher", "pitcher", "Player", "player"]):
+                pitcher_count += 1
+            if safe_float(first_value(r, ["UD/Line", "line", "Line", "active_line", "Prop Line"])) is not None:
+                line_count += 1
+        return (line_count * 1000) + (pitcher_count * 10) + n
+
+    if candidates:
+        best_key, best_rows = max(candidates, key=lambda kv: score_rows(kv[1]))
+        return best_rows
+
     return []
-
-
-# =========================
-# APP
-# =========================
-st.markdown("""
-<div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.17 SAFETY GATES + PASS DIRECTION</div>
-  <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
-</div>
-""", unsafe_allow_html=True)
-
-with st.sidebar:
-    st.header("Controls")
-    day_mode = st.radio("Game Feed", ["Today + Tomorrow", "Today", "Tomorrow"], index=0)
-    bankroll = st.number_input("Bankroll", min_value=1.0, value=1000.0, step=50.0)
-    default_odds = st.number_input("Default Odds if sportsbook price missing", value=-110.0, step=5.0)
-    hide_no_line = st.checkbox("Hide No Real Line picks", value=False)
-    only_strong = st.checkbox("Show only strong signals", value=True)
-    st.divider()
-    st.header("Model Upgrades")
-    use_statcast = st.checkbox("Use Statcast pitcher CSW/whiff", value=True)
-    use_pitch_type = st.checkbox("Use pitch-type whiff mix", value=True)
-    use_calibration = st.checkbox("Use historical calibration", value=True)
-    use_bayesian_markov = st.checkbox("Use Bayesian Markov Monte Carlo", value=True)
-    use_weather = st.checkbox("Use live weather adjustment", value=True)
-    use_umpire = st.checkbox("Use capped umpire tendency", value=True)
-    use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
-    use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
-    use_optic = st.checkbox("Optional: OpticOdds API", value=False)
-    if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
-        st.cache_data.clear()
-        st.session_state.loaded_picks = []
-        st.session_state.last_refresh_time = None
-        st.success("Cache cleared. Now click REFRESH LIVE BOARD again.")
-    st.caption("Refresh does not save official picks. Save only when the board looks right. Optional paid APIs stay OFF unless you have keys.")
-
-dates = target_dates(day_mode)
-
-if "loaded_picks" not in st.session_state:
-    st.session_state.loaded_picks = []
-if "last_refresh_time" not in st.session_state:
-    st.session_state.last_refresh_time = None
-if "last_saved_count" not in st.session_state:
-    st.session_state.last_saved_count = 0
-
-col_refresh, col_save = st.columns(2)
-
-with col_refresh:
-    refresh_btn = st.button("🔄 REFRESH LIVE BOARD — Do Not Save Yet", use_container_width=True)
-
-with col_save:
-    save_btn = st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", use_container_width=True)
-
-if refresh_btn:
-    all_rows = []
-    for d in dates:
-        all_rows.extend(extract_probable_pitchers(d))
-
-    projections = []
-    progress = st.progress(0)
-
-    for i, row in enumerate(all_rows):
-        try:
-            projections.append(
-                make_projection(
-                    row,
-                    bankroll=bankroll,
-                    default_odds=default_odds,
-                    use_statcast=use_statcast,
-                    use_pitch_type=use_pitch_type,
-                    use_calibration=use_calibration,
-                    use_bayesian_markov=use_bayesian_markov,
-                    use_weather=use_weather,
-                    use_umpire=use_umpire,
-                    use_xgboost_assist=use_xgboost_assist,
-                    use_sgo=use_sgo,
-                    use_optic=use_optic
-                )
-            )
-        except Exception as e:
-            log_source_request("make_projection", "ERROR", f"{row.get('pitcher')}: {e}")
-        progress.progress((i + 1) / max(1, len(all_rows)))
-
-    st.session_state.loaded_picks = projections
-    st.session_state.last_refresh_time = now_iso()
-    st.success(f"Refreshed {len(projections)} pitchers. Nothing officially saved yet.")
-
-if save_btn:
-    if not st.session_state.get("loaded_picks"):
-        st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")
-    else:
-        added = save_many_once(st.session_state.loaded_picks)
-        st.session_state.last_saved_count = added
-        st.success(f"Saved official before-game snapshot. Added {added} new rows. If 0, existing rows may have been updated.")
-
-saved = load_saved_pick_log_normalized()
-
-# IMPORTANT:
-# - If you have refreshed this session, the screen shows refreshed live board.
-# - If not, it shows saved official snapshots for the selected dates.
-if st.session_state.get("loaded_picks"):
-    board = st.session_state.loaded_picks
-    board_status = "LIVE REFRESHED BOARD — NOT OFFICIAL UNLESS SAVED"
-else:
-    board = [p for p in saved if p.get("date") in dates]
-    board_status = "SAVED OFFICIAL SNAPSHOTS"
-
-if hide_no_line:
-    board = [p for p in board if p.get("line") is not None]
-if only_strong:
-    board = [p for p in board if p.get("signal_type") == "good"]
-
-st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('last_refresh_time') or 'Not refreshed this session'} | Last save added: {st.session_state.get('last_saved_count', 0)}")
-
-render_kpis(board, bankroll)
-
 def display_clean_real_prop_rows(rows, **kwargs):
     cleaned = clean_real_prop_debug_rows(rows)
     if cleaned:
