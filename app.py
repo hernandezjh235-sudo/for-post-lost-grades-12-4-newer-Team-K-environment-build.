@@ -5651,20 +5651,29 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
 
 def save_many_once(new_picks):
     picks = load_json(PICK_LOG, [])
-    ids = set([p.get("pick_id") for p in picks])
+    by_id = {p.get("pick_id"): i for i, p in enumerate(picks) if p.get("pick_id")}
     added = 0
+    updated = 0
+
     for p in new_picks:
-        if p.get("pick_id") not in ids:
-            official = dict(p)
-            official["official_snapshot_saved_at"] = now_iso()
-            official["snapshot_type"] = "OFFICIAL_BEFORE_GAME"
-            official["official_quality_gate"] = "PASS" if official.get("data_score", 0) >= MIN_OFFICIAL_SAVE_SCORE else "LOW_DATA_REVIEW"
+        pid = p.get("pick_id")
+        official = dict(p)
+        official["official_snapshot_saved_at"] = now_iso()
+        official["snapshot_type"] = "OFFICIAL_BEFORE_GAME"
+        official["official_quality_gate"] = "PASS" if official.get("data_score", 0) >= MIN_OFFICIAL_SAVE_SCORE else "LOW_DATA_REVIEW"
+
+        if pid and pid in by_id:
+            picks[by_id[pid]].update(official)
+            updated += 1
+        else:
             picks.append(official)
             log_long_backtest_row(official)
-            ids.add(p.get("pick_id"))
+            if pid:
+                by_id[pid] = len(picks) - 1
             added += 1
+
     save_json(PICK_LOG, picks[-10000:])
-    return added
+    return added + updated
 
 # =========================
 # GRADING
