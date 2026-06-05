@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta, date
 
-APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY + CALIBRATION AUDIT ONLY" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
+APP_VERSION = "NO_TOP_PLAYS_BUILD |  + TRUE MOBILE UI + TABS FIXED + KPROJ CLARITY + KPROJ SYNCED + TRUE KPROJ SYNC + REBUILT TRUE KPROJ SYNC + ALL TABS KPROJ SYNCED + VISIBLE LOWER TABS + MOBILE CARD FIX + SMART EDGE UPGRADES + CONFIDENCE CLEAN + ACE CEILING PROTECTION + OLD REFRESH + NEW PROJECTIONS + MLB PROJECTED LINEUPS + ENV PITCHCOUNT UMPIRE + ENV UI CARDS + MULTI PROP TABS + VOLUME SAFETY + K + PITCHING OUTS ONLY + CALIBRATION AUDIT ONLY + EV CARDS" +  "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + LIGHT TRUE LEASH BF + MONEYLINE EDGE + LIGHT BULLPEN TAX + ELITE SAFETY DASH + SAFE/VOLATILE + AUTO RESULTS + PITCHTYPE/UMP/UI + FINAL BOARD + BALANCED FINAL BOARD + ML LOGO UI + ML PRO BOARD UI + ML CONTEXT"
 
 try:
     import pytz
@@ -5802,6 +5802,7 @@ def render_kpis(picks, bankroll):
         """, unsafe_allow_html=True)
 
 def render_pick_card(p):
+    render_card_ev_strip(p)
     prob = p.get("fair_probability")
     prob_pct = int(round(prob * 100)) if prob is not None else 0
     progress_width = max(3, min(100, prob_pct))
@@ -5892,6 +5893,7 @@ def render_pick_card(p):
 # UI/projection extension only. Does NOT change strikeout math.
 # =========================
 MULTI_PROP_TABS_ENABLED = True
+
 
 def _mp_avg(rows, key, n=5, default=None):
     vals=[]
@@ -7811,7 +7813,61 @@ def render_environment_mobile_panel(p):
         st.caption("Small capped tiebreakers only. Main projection still comes from pitcher skill, expected BF, matchup, lineup, WL2, and line value.")
 
 
+
+
+
+# =========================
+# PLAYER CARD EV DISPLAY HELPERS
+# UI only. Does not change projections.
+# =========================
+def card_ev_display_values(p):
+    p = p or {}
+    ev = first_value(p, ["EV", "ev", "Expected Value", "expected_value"])
+    fair_prob = first_value(p, ["Fair Probability", "fair_probability", "Fair Prob", "Prob", "Confidence %", "Confidence"])
+    kelly = first_value(p, ["Kelly", "kelly", "Kelly %", "Kelly Fraction"])
+
+    evf = safe_float(ev)
+    pf = safe_float(fair_prob)
+    kf = safe_float(kelly)
+
+    if pf is not None and pf <= 1:
+        pf = pf * 100.0
+    if kf is not None and kf <= 1:
+        kf = kf * 100.0
+    if evf is not None and abs(evf) <= 1:
+        evf = evf * 100.0
+
+    ev_txt = "—" if evf is None else f"{evf:+.1f}%"
+    prob_txt = "—" if pf is None else f"{pf:.1f}%"
+    kelly_txt = "—" if kf is None else f"{kf:.2f}%"
+    return ev_txt, prob_txt, kelly_txt, evf
+
+def render_card_ev_strip(p):
+    ev_txt, prob_txt, kelly_txt, evf = card_ev_display_values(p)
+    badge = "good-badge" if (evf is not None and evf > 0) else "red-badge" if (evf is not None and evf < 0) else "yellow-badge"
+    st.markdown(f"""
+    <div class="kpi-strip">
+        <div class="kpi-box">
+            <div class="kpi-label">EV</div>
+            <div class="kpi-value"><span class="badge {badge}">{ev_txt}</span></div>
+            <div class="kpi-sub">Expected value</div>
+        </div>
+        <div class="kpi-box">
+            <div class="kpi-label">Fair Prob</div>
+            <div class="kpi-value">{prob_txt}</div>
+            <div class="kpi-sub">Model hit probability</div>
+        </div>
+        <div class="kpi-box">
+            <div class="kpi-label">Kelly</div>
+            <div class="kpi-value">{kelly_txt}</div>
+            <div class="kpi-sub">Capped stake guide</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def render_kproj_pitcher_card(p):
+    render_card_ev_strip(p)
     d = kproj_decision(p)
     dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
     putaway, put_label = kproj_putaway_value(p)
@@ -8773,6 +8829,9 @@ def build_kproj_table(board):
             "Tier": p.get("Volume Safety Tier") or p.get("WL2 Tier") or p.get("Ace Ceiling Tier") or p.get("Projection First Tier") or d.get("tier"),
             "Confidence Mode": p.get("Projection First Label"),
             "Confidence Note": p.get("Projection First Note"),
+            "EV": d.get("ev") or p.get("EV"),
+            "Fair Probability": d.get("fair_probability") or p.get("Fair Probability"),
+            "Kelly": d.get("kelly") or p.get("Kelly"),
             "Ace Ceiling Label": p.get("Ace Ceiling Label"),
             "Ace Ceiling Note": p.get("Ace Ceiling Note"),
             "WL2 Leash Score": p.get("WL2 Leash Score"),
@@ -10630,6 +10689,7 @@ def build_final_board_rows(board):
 
 
 def render_final_pick_card(r):
+    render_card_ev_strip(r)
     score = safe_float(r.get("Final Score"), 0) or 0
     proj = safe_float(r.get("Projection"), None)
     ref = safe_float(r.get("Refined"), proj)
@@ -10669,6 +10729,7 @@ def render_final_pick_card(r):
       <div><b>Warnings:</b> {html.escape(str(r.get("Warnings","—")))}</div>
     </div>
     """, unsafe_allow_html=True)
+
 
 def render_final_board_tab(board, dates=None):
     st.markdown("### 🧠 FINAL BOARD — Final Decision Center")
