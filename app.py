@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + SABERMETRIC K"
 
 try:
     import pytz
@@ -1097,7 +1097,7 @@ def get_pitcher_profile(pid):
         f"{MLB_BASE}/people/{pid}/stats",
         params={"stats": "season", "group": "pitching"}
     )
-    default = {"Pitcher K%": LEAGUE_AVG_K, "BF": 0, "SO": 0, "AVG IP": None, "K/9": None, "source": "Fallback league avg"}
+    default = {"Pitcher K%": LEAGUE_AVG_K, "BF": 0, "SO": 0, "BB": None, "HR": None, "IP": None, "AVG IP": None, "K/9": None, "BB%": None, "K-BB%": None, "FIP": None, "xFIP": None, "SIERA": None, "source": "Fallback league avg"}
     try:
         split = get_first_stat_split(data)
         if not split:
@@ -1105,15 +1105,28 @@ def get_pitcher_profile(pid):
         stat = split.get("stat", {})
         ip = baseball_ip_to_float(stat.get("inningsPitched"))
         so = safe_float(stat.get("strikeOuts"), 0) or 0
+        bb = safe_float(stat.get("baseOnBalls"), 0) or 0
+        hr = safe_float(stat.get("homeRuns"), 0) or 0
         bf = safe_float(stat.get("battersFaced"), 0) or 0
         gs = safe_float(stat.get("gamesStarted"), None)
         gp = safe_float(stat.get("gamesPlayed"), 0) or 0
         starts = gs if gs and gs > 0 else gp
         k_pct = so / bf if bf > 0 else LEAGUE_AVG_K
+        bb_pct = bb / bf if bf > 0 else None
+        kbb_pct = (k_pct - bb_pct) if bb_pct is not None else None
         k9 = so / ip * 9 if ip and ip > 0 else None
         avg_ip = ip / starts if starts and starts > 0 and ip else None
         shrunk = ((k_pct * bf) + (LEAGUE_AVG_K * 150)) / max(bf + 150, 1)
-        return {"Pitcher K%": float(clamp(shrunk, 0.08, 0.45)), "BF": bf, "SO": so, "AVG IP": avg_ip, "K/9": k9, "source": "Season K/BF with shrink"}
+        dips = build_dips_metrics_from_counts(so=so, bb=bb, hr=hr, ip=ip, bf=bf)
+        return {
+            "Pitcher K%": float(clamp(shrunk, 0.08, 0.45)),
+            "BF": bf, "SO": so, "BB": bb, "HR": hr, "IP": ip,
+            "AVG IP": avg_ip, "K/9": k9,
+            "BB%": None if bb_pct is None else float(bb_pct),
+            "K-BB%": None if kbb_pct is None else float(kbb_pct),
+            "FIP": dips.get("fip"), "xFIP": dips.get("xfip"), "SIERA": dips.get("siera"),
+            "source": "Season K/BF + DIPS with shrink"
+        }
     except Exception:
         return default
 
@@ -3632,7 +3645,7 @@ def apply_repeat_matchup_factor(k_rate, repeat_profile):
 # =========================
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_statcast_pitch_profile(pitcher_id, days=365):
-    empty = {"available": False, "message": "No pitcher id", "rows": 0, "csw": None, "whiff": None, "pitch_mix": [], "pitch_type_profile": [], "putaway": None}
+    empty = {"available": False, "message": "No pitcher id", "rows": 0, "csw": None, "whiff": None, "chase": None, "zone_contact": None, "pitch_mix": [], "pitch_type_profile": [], "putaway": None}
     if not pitcher_id:
         return empty
     end = datetime.now()
@@ -3665,6 +3678,26 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
         swings = int(swing_mask.sum())
         csw = (called + whiffs_n) / pitch_count if pitch_count else None
         whiff = whiffs_n / swings if swings else None
+
+        # Sabermetric K inputs from real Statcast pitch-level data.
+        # Chase% = swings at pitches outside the zone. Zone Contact% = contact on swings inside the zone.
+        chase = None
+        zone_contact = None
+        try:
+            if "zone" in df.columns:
+                zone_num = pd.to_numeric(df["zone"], errors="coerce")
+                out_zone = zone_num.isin([11, 12, 13, 14])
+                in_zone = zone_num.isin([1, 2, 3, 4, 5, 6, 7, 8, 9])
+                out_zone_pitches = int(out_zone.sum())
+                chase_swings = int((out_zone & swing_mask).sum())
+                chase = chase_swings / out_zone_pitches if out_zone_pitches else None
+                zone_swings = int((in_zone & swing_mask).sum())
+                zone_whiffs = int((in_zone & whiff_mask).sum())
+                zone_contact = (zone_swings - zone_whiffs) / zone_swings if zone_swings else None
+        except Exception:
+            chase = None
+            zone_contact = None
+
         pitch_mix = []
         pitch_type_profile = []
         if "pitch_type" in df.columns:
@@ -3693,7 +3726,7 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
                     "Pitches": int(row["Pitches"]),
                     "Swings": int(row["Swings"]),
                 })
-        return {"available": True, "message": "Real Statcast pitch-level data loaded", "rows": pitch_count, "csw": None if csw is None else float(csw), "whiff": None if whiff is None else float(whiff), "pitch_mix": pitch_mix, "pitch_type_profile": pitch_type_profile}
+        return {"available": True, "message": "Real Statcast pitch-level data loaded", "rows": pitch_count, "csw": None if csw is None else float(csw), "whiff": None if whiff is None else float(whiff), "chase": None if chase is None else float(chase), "zone_contact": None if zone_contact is None else float(zone_contact), "pitch_mix": pitch_mix, "pitch_type_profile": pitch_type_profile}
     except Exception as e:
         empty["message"] = f"Statcast unavailable: {e}"
         return empty
@@ -3706,6 +3739,280 @@ def apply_statcast_csw_adjustment(pitcher_k, statcast_profile, enabled=True):
         return pitcher_k, "No Statcast CSW available"
     factor = clamp(1 + ((float(csw) - 0.275) * 0.45), 0.93, 1.07)
     return clamp(pitcher_k * factor, 0.08, 0.50), f"Real Statcast CSW adjustment x{factor:.3f}"
+
+
+
+def build_sabermetric_k_profile(pitcher_k, statcast_profile=None, lineup_rows=None, enabled=True):
+    """Sabermetric K Layer 1.0 for strikeout props.
+
+    Uses the K-predictive metrics only:
+      - CSW% (called strikes + whiffs per pitch)
+      - SwStr/Whiff% (whiffs per swing from pitch-level Statcast)
+      - Chase% (swings outside the zone)
+      - Zone Contact% (lower is better for strikeouts)
+      - Projected/confirmed lineup K pressure as a small context guard
+
+    The factor is capped so sabermetrics improve the projection without overpowering
+    the existing BF, lineup, pitch count, market, and official-play filters.
+    """
+    base_k = safe_float(pitcher_k)
+    if not enabled or base_k is None:
+        return {"available": False, "score": 50, "label": "SABER_OFF", "k_factor": 1.0, "note": "Sabermetric K layer off"}
+
+    sp = statcast_profile or {}
+    if not sp.get("available"):
+        return {"available": False, "score": 50, "label": "SABER_UNKNOWN", "k_factor": 1.0, "note": sp.get("message", "Sabermetric K unavailable")}
+
+    csw = safe_float(sp.get("csw"))
+    whiff = safe_float(sp.get("whiff"))
+    chase = safe_float(sp.get("chase"))
+    zone_contact = safe_float(sp.get("zone_contact"))
+
+    components = []
+    notes = []
+    # League reference anchors. These are conservative and intentionally broad.
+    if csw is not None:
+        v = clamp(50 + ((csw - 0.285) / 0.055) * 25, 20, 100)
+        components.append((v, 0.36)); notes.append(f"CSW {csw*100:.1f}%")
+    if whiff is not None:
+        v = clamp(50 + ((whiff - 0.255) / 0.075) * 25, 20, 100)
+        components.append((v, 0.30)); notes.append(f"Whiff {whiff*100:.1f}%")
+    if chase is not None:
+        v = clamp(50 + ((chase - 0.305) / 0.075) * 22, 20, 100)
+        components.append((v, 0.18)); notes.append(f"Chase {chase*100:.1f}%")
+    if zone_contact is not None:
+        v = clamp(50 + ((0.835 - zone_contact) / 0.075) * 22, 20, 100)
+        components.append((v, 0.16)); notes.append(f"Zone contact {zone_contact*100:.1f}%")
+
+    if not components:
+        return {"available": False, "score": 50, "label": "SABER_THIN", "k_factor": 1.0, "note": "Sabermetric K layer thin: no CSW/whiff/chase/contact metrics"}
+
+    total_w = sum(w for _, w in components) or 1.0
+    score = sum(v * w for v, w in components) / total_w
+
+    # Small context guard from the actual batter table; not a replacement for lineup_k/log5.
+    rates = []
+    for r in lineup_rows or []:
+        rk = safe_float(r.get("Raw_K_Rate"))
+        if rk is None:
+            rk = safe_float(r.get("Used K%"))
+            if rk is not None and rk > 1:
+                rk = rk / 100.0
+        if rk is not None:
+            rates.append(rk)
+    if len(rates) >= 6:
+        avg_lu = float(np.mean(rates))
+        if avg_lu >= 0.255:
+            score += 4; notes.append(f"lineup K pressure {avg_lu*100:.1f}%")
+        elif avg_lu <= 0.195:
+            score -= 4; notes.append(f"contact lineup {avg_lu*100:.1f}%")
+
+    score = int(round(clamp(score, 20, 100)))
+    if score >= 88:
+        label = "ELITE_SABER_K"
+    elif score >= 76:
+        label = "PLUS_SABER_K"
+    elif score >= 62:
+        label = "SOLID_SABER_K"
+    elif score >= 45:
+        label = "NEUTRAL_SABER_K"
+    else:
+        label = "LOW_SABER_K"
+
+    # Capped K-rate factor. We already have a CSW adjustment elsewhere, so the factor is modest.
+    factor = 1.0 + ((score - 50) / 50.0) * 0.045
+    factor = float(clamp(factor, 0.955, 1.055))
+    return {
+        "available": True,
+        "score": score,
+        "label": label,
+        "k_factor": round(factor, 3),
+        "csw": None if csw is None else round(csw * 100, 1),
+        "whiff": None if whiff is None else round(whiff * 100, 1),
+        "chase": None if chase is None else round(chase * 100, 1),
+        "zone_contact": None if zone_contact is None else round(zone_contact * 100, 1),
+        "note": f"Sabermetric K {label}: score {score}/100; factor x{factor:.3f}; " + "; ".join(notes)
+    }
+
+def apply_sabermetric_k_adjustment(pitcher_k, sabermetric_profile, enabled=True):
+    if not enabled or not isinstance(sabermetric_profile, dict) or not sabermetric_profile.get("available"):
+        return pitcher_k, (sabermetric_profile or {}).get("note", "No sabermetric K adjustment")
+    factor = safe_float(sabermetric_profile.get("k_factor"), 1.0) or 1.0
+    return float(clamp((safe_float(pitcher_k, LEAGUE_AVG_K) or LEAGUE_AVG_K) * factor, 0.08, 0.50)), sabermetric_profile.get("note", f"Sabermetric K factor x{factor:.3f}")
+
+
+# =========================
+# DIPS / MARKET-INEFFICIENCY LAYER FOR K PROPS
+# =========================
+def build_dips_metrics_from_counts(so=None, bb=None, hr=None, ip=None, bf=None):
+    """Return DIPS-style pitcher metrics from MLB season counts.
+
+    Strikeout props should not let ERA/WHIP drive the pick. This layer focuses on
+    K-BB% first, then uses FIP/xFIP/SIERA only as light sustainability signals.
+
+    Notes:
+    - FIP uses a common constant approximation because MLB Stats API does not
+      provide the season-specific FIP constant directly.
+    - xFIP is approximated by normalizing HR to a league-average HR/9 baseline;
+      it is intentionally light-weight.
+    - SIERA here is a compact K-BB/PA approximation. Without full batted-ball
+      detail, it should be used as a direction/risk flag, not a primary projection.
+    """
+    so = safe_float(so, 0) or 0
+    bb = safe_float(bb, 0) or 0
+    hr = safe_float(hr, 0) or 0
+    ip = safe_float(ip)
+    bf = safe_float(bf)
+    if not ip or ip <= 0 or not bf or bf <= 0:
+        return {"available": False, "k_pct": None, "bb_pct": None, "kbb_pct": None, "fip": None, "xfip": None, "siera": None}
+
+    k_pct = so / bf
+    bb_pct = bb / bf
+    kbb_pct = k_pct - bb_pct
+
+    # Approx constants. The goal is a stable direction signal, not official leader-board values.
+    fip_constant = 3.15
+    league_hr9 = 1.12
+    x_hr = league_hr9 * ip / 9.0
+    fip = ((13 * hr) + (3 * bb) - (2 * so)) / ip + fip_constant
+    xfip = ((13 * x_hr) + (3 * bb) - (2 * so)) / ip + fip_constant
+
+    # Compact SIERA-style approximation using the strongest available DIPS inputs.
+    # Lower is better. Keep bounded to avoid bad stat feeds creating extreme values.
+    siera = 5.20 - (16.0 * k_pct) + (11.0 * bb_pct) - (2.2 * kbb_pct)
+
+    return {
+        "available": True,
+        "k_pct": float(k_pct),
+        "bb_pct": float(bb_pct),
+        "kbb_pct": float(kbb_pct),
+        "fip": round(float(clamp(fip, 1.2, 8.5)), 2),
+        "xfip": round(float(clamp(xfip, 1.2, 8.5)), 2),
+        "siera": round(float(clamp(siera, 1.5, 7.5)), 2),
+    }
+
+
+def build_dips_k_profile(profile=None, recent_rows=None, enabled=True):
+    """DIPS K Dominance Engine.
+
+    Uses K-BB% as the main signal and FIP/xFIP/SIERA as small supporting context.
+    It is purposely capped so it helps side selection without overfitting.
+    """
+    if not enabled:
+        return {"available": False, "score": 50, "label": "DIPS_OFF", "k_factor": 1.0, "reliability_nudge": 0, "note": "DIPS layer off"}
+    profile = profile or {}
+
+    kbb = safe_float(profile.get("K-BB%"))
+    fip = safe_float(profile.get("FIP"))
+    xfip = safe_float(profile.get("xFIP"))
+    siera = safe_float(profile.get("SIERA"))
+    bb_pct = safe_float(profile.get("BB%"))
+    bf = safe_float(profile.get("BF"), 0) or 0
+
+    # Recent K-BB% support, light weight only.
+    recent_kbb = None
+    try:
+        vals = []
+        for r in (recent_rows or [])[:5]:
+            so = safe_float(r.get("Ks"))
+            bb = safe_float(r.get("BB"))
+            bf_r = safe_float(r.get("BF"))
+            if so is not None and bb is not None and bf_r and bf_r > 0:
+                vals.append((so - bb) / bf_r)
+        if vals:
+            recent_kbb = sum(vals) / len(vals)
+    except Exception:
+        recent_kbb = None
+
+    components = []
+    notes = []
+    if kbb is not None:
+        # 6% weak, 14% solid, 20% strong, 25% elite.
+        components.append((clamp((kbb - 0.06) / 0.20, 0, 1) * 100, 0.52))
+        notes.append(f"K-BB {kbb*100:.1f}%")
+    if recent_kbb is not None:
+        components.append((clamp((recent_kbb - 0.05) / 0.21, 0, 1) * 100, 0.14))
+        notes.append(f"L5 K-BB {recent_kbb*100:.1f}%")
+    if siera is not None:
+        # Lower SIERA supports skill sustainability.
+        components.append((clamp((5.10 - siera) / 2.20, 0, 1) * 100, 0.12))
+        notes.append(f"SIERA {siera:.2f}")
+    if fip is not None:
+        components.append((clamp((5.25 - fip) / 2.40, 0, 1) * 100, 0.10))
+        notes.append(f"FIP {fip:.2f}")
+    if xfip is not None:
+        components.append((clamp((5.15 - xfip) / 2.25, 0, 1) * 100, 0.08))
+        notes.append(f"xFIP {xfip:.2f}")
+    if bb_pct is not None:
+        # Walks do not kill K ability directly, but they do create pitch-count stress.
+        bb_score = clamp((0.13 - bb_pct) / 0.09, 0, 1) * 100
+        components.append((bb_score, 0.04))
+        notes.append(f"BB {bb_pct*100:.1f}%")
+
+    if not components:
+        return {"available": False, "score": 50, "label": "DIPS_UNKNOWN", "k_factor": 1.0, "reliability_nudge": 0, "note": "No DIPS inputs available"}
+
+    total_w = sum(w for _, w in components) or 1.0
+    score = int(round(sum(v * w for v, w in components) / total_w))
+
+    # Small-sample shrink.
+    if bf < 120:
+        score = int(round((score * 0.65) + (50 * 0.35)))
+        notes.append(f"thin BF {int(bf)}")
+    elif bf < 220:
+        score = int(round((score * 0.82) + (50 * 0.18)))
+        notes.append(f"medium BF {int(bf)}")
+
+    if score >= 88:
+        label = "DIPS_ELITE"
+    elif score >= 76:
+        label = "DIPS_STRONG"
+    elif score >= 62:
+        label = "DIPS_SOLID"
+    elif score >= 45:
+        label = "DIPS_NEUTRAL"
+    else:
+        label = "DIPS_RISK"
+
+    # Projection modifier: purposely smaller than CSW/SwStr layer.
+    factor = 1.0 + clamp((score - 50) / 1000.0, -0.045, 0.055)
+    # If walks are extreme, avoid boosting OVER too much because pitch count may shorten outing.
+    if bb_pct is not None and bb_pct >= 0.115 and factor > 1.0:
+        factor = min(factor, 1.018)
+        notes.append("walk-stress cap")
+
+    reliability_nudge = 0
+    if score >= 82:
+        reliability_nudge = 4
+    elif score >= 70:
+        reliability_nudge = 2
+    elif score <= 38:
+        reliability_nudge = -5
+    elif score <= 48:
+        reliability_nudge = -2
+
+    return {
+        "available": True,
+        "score": score,
+        "label": label,
+        "k_factor": round(float(factor), 3),
+        "reliability_nudge": reliability_nudge,
+        "kbb_pct": None if kbb is None else round(kbb * 100, 1),
+        "bb_pct": None if bb_pct is None else round(bb_pct * 100, 1),
+        "recent_kbb_pct": None if recent_kbb is None else round(recent_kbb * 100, 1),
+        "fip": fip,
+        "xfip": xfip,
+        "siera": siera,
+        "note": f"DIPS {label}: score {score}/100; factor x{factor:.3f}; " + "; ".join(notes),
+    }
+
+
+def apply_dips_k_adjustment(pitcher_k, dips_profile, enabled=True):
+    if not enabled or not isinstance(dips_profile, dict) or not dips_profile.get("available"):
+        return pitcher_k, (dips_profile or {}).get("note", "No DIPS adjustment")
+    factor = safe_float(dips_profile.get("k_factor"), 1.0) or 1.0
+    base = safe_float(pitcher_k, LEAGUE_AVG_K) or LEAGUE_AVG_K
+    return float(clamp(base * factor, 0.08, 0.50)), dips_profile.get("note", f"DIPS K factor x{factor:.3f}")
 
 def apply_pitch_type_matchup_adjustment(pitcher_k, pitcher_statcast, enabled=True):
     if not enabled or not pitcher_statcast or not pitcher_statcast.get("available"):
@@ -5657,6 +5964,8 @@ def build_projection_reliability_score(p):
     pc_score = safe_float(p.get('pitch_count_score'), 72) or 72
     trap_score = safe_float(p.get('trap_line_score'), 0) or 0
     matchup_score = safe_float(p.get('matchup_history_score'), 50) or 50
+    dips_nudge = safe_float(p.get('dips_reliability_nudge'), 0) or 0
+    dips_score = safe_float(p.get('dips_k_score'), 50) or 50
     score = 0.42 * data_score + 0.18 * pc_score
     score += 10 if p.get('lineup_locked') else 3
     score += 9 if p.get('pitcher_confirmed') else 2
@@ -5673,6 +5982,7 @@ def build_projection_reliability_score(p):
         score -= 4
     if matchup_score >= 70 or matchup_score <= 30:
         score += 3  # strong matchup data supports reliability, either direction
+    score += clamp(dips_nudge, -6, 5)
 
     score = int(round(clamp(score, 0, 100)))
     if score >= 92:
@@ -5685,7 +5995,7 @@ def build_projection_reliability_score(p):
         label = 'RISKY_RELIABILITY'
     else:
         label = 'FADE_RELIABILITY'
-    note = f'Reliability {label}: {score}/100 | data {data_score:.0f}, pitch count {pc_score:.0f}, trap {trap_score:.0f}, matchup {matchup_score:.0f}'
+    note = f'Reliability {label}: {score}/100 | data {data_score:.0f}, pitch count {pc_score:.0f}, trap {trap_score:.0f}, matchup {matchup_score:.0f}, DIPS {dips_score:.0f}'
     return {'score': score, 'label': label, 'note': note}
 
 
@@ -6040,6 +6350,29 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
 
     batter_pitch_profile_rows = matchup_profile.get("batter_rows", []) if isinstance(matchup_profile, dict) else []
 
+    # Sabermetric K Layer: CSW + whiff + chase + zone contact, lightly capped.
+    try:
+        sabermetric_k_profile = build_sabermetric_k_profile(
+            pitcher_k,
+            statcast_profile=statcast_profile,
+            lineup_rows=lineup_rows,
+            enabled=use_statcast,
+        )
+        pitcher_k, sabermetric_k_note = apply_sabermetric_k_adjustment(pitcher_k, sabermetric_k_profile, enabled=use_statcast)
+    except Exception as _sab_e:
+        sabermetric_k_profile = {"available": False, "score": 50, "label": "SABER_ERROR", "k_factor": 1.0, "note": f"Sabermetric K skipped: {_sab_e}"}
+        sabermetric_k_note = sabermetric_k_profile.get("note")
+
+    # DIPS / Moneyball-style sustainability layer: K-BB%, SIERA, FIP/xFIP.
+    # This is intentionally light-weight so it supports K skill without overpowering
+    # CSW/SwStr, BF, lineup, pitch count, or confirmed lines.
+    try:
+        dips_k_profile = build_dips_k_profile(profile, recent_rows=recent_rows, enabled=True)
+        pitcher_k, dips_k_note = apply_dips_k_adjustment(pitcher_k, dips_k_profile, enabled=True)
+    except Exception as _dips_e:
+        dips_k_profile = {"available": False, "score": 50, "label": "DIPS_ERROR", "k_factor": 1.0, "reliability_nudge": 0, "note": f"DIPS skipped: {_dips_e}"}
+        dips_k_note = dips_k_profile.get("note")
+
     # v11.4 run-damage / game-script risk
     try:
         pitcher_damage_profile = pitcher_run_damage_profile(pid, recent_rows=recent_rows, statcast_profile=statcast_profile)
@@ -6215,6 +6548,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "statcast_available": statcast_profile.get("available"),
         "statcast_csw": None if statcast_profile.get("csw") is None else statcast_profile.get("csw") * 100,
         "statcast_whiff": None if statcast_profile.get("whiff") is None else statcast_profile.get("whiff") * 100,
+        "sabermetric_k_score": sabermetric_k_profile.get("score") if "sabermetric_k_profile" in locals() else 50,
+        "sabermetric_k_factor": sabermetric_k_profile.get("k_factor") if "sabermetric_k_profile" in locals() else 1.0,
         "pitch_type_matchup_available": pitch_type_available,
         "pitch_type_factor": pitch_type_factor,
         "consensus_count": 0,
@@ -6451,7 +6786,11 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     if active_line is not None and not price_is_real:
         risk_notes = (risk_notes + "; " if risk_notes else "") + "EV/odds are estimated from sidebar default odds, not a real sportsbook price"
 
-    # Add transparent calibration notes to the card/debug output.
+    # Add transparent sabermetric/calibration notes to the card/debug output.
+    if "sabermetric_k_note" in locals() and sabermetric_k_note:
+        risk_notes = (risk_notes + "; " if risk_notes else "") + str(sabermetric_k_note)
+    if "dips_k_note" in locals() and dips_k_note:
+        risk_notes = (risk_notes + "; " if risk_notes else "") + str(dips_k_note)
     if true_projection_calibration.get("note"):
         risk_notes = (risk_notes + "; " if risk_notes else "") + true_projection_calibration.get("note")
     if true_probability_calibration.get("note"):
@@ -6506,6 +6845,13 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             rr["Run Damage H9"] = pitcher_damage_profile.get("h9") if "pitcher_damage_profile" in locals() else None
             rr["Run Damage BB9"] = pitcher_damage_profile.get("bb9") if "pitcher_damage_profile" in locals() else None
             rr["Run Damage HR9"] = pitcher_damage_profile.get("hr9") if "pitcher_damage_profile" in locals() else None
+            rr["DIPS Score"] = dips_k_profile.get("score") if "dips_k_profile" in locals() else 50
+            rr["DIPS Label"] = dips_k_profile.get("label") if "dips_k_profile" in locals() else "DIPS_UNKNOWN"
+            rr["K-BB%"] = dips_k_profile.get("kbb_pct") if "dips_k_profile" in locals() else None
+            rr["SIERA"] = dips_k_profile.get("siera") if "dips_k_profile" in locals() else None
+            rr["FIP"] = dips_k_profile.get("fip") if "dips_k_profile" in locals() else None
+            rr["xFIP"] = dips_k_profile.get("xfip") if "dips_k_profile" in locals() else None
+            rr["DIPS Note"] = dips_k_note if "dips_k_note" in locals() else "DIPS unavailable"
             rr["Recent H/R/ER/BB/HR"] = (f"H {pitcher_damage_profile.get('recent_hits_avg')} | R {pitcher_damage_profile.get('recent_runs_avg')} | ER {pitcher_damage_profile.get('recent_er_avg')} | BB {pitcher_damage_profile.get('recent_bb_avg')} | HR {pitcher_damage_profile.get('recent_hr_avg')}") if "pitcher_damage_profile" in locals() else ""
             rr["Opponent Damage Risk"] = opponent_damage_profile.get("risk_level", "UNKNOWN") if "opponent_damage_profile" in locals() else "UNKNOWN"
             rr["Pitch-Type Batter Detail Rows"] = len(batter_pitch_profile_rows) if "batter_pitch_profile_rows" in locals() else 0
@@ -6697,6 +7043,23 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "statcast_rows": statcast_profile.get("rows"),
         "statcast_csw": None if statcast_profile.get("csw") is None else round(statcast_profile.get("csw") * 100, 1),
         "statcast_whiff": None if statcast_profile.get("whiff") is None else round(statcast_profile.get("whiff") * 100, 1),
+        "statcast_chase": None if statcast_profile.get("chase") is None else round(statcast_profile.get("chase") * 100, 1),
+        "statcast_zone_contact": None if statcast_profile.get("zone_contact") is None else round(statcast_profile.get("zone_contact") * 100, 1),
+        "sabermetric_k_score": sabermetric_k_profile.get("score") if "sabermetric_k_profile" in locals() else 50,
+        "sabermetric_k_label": sabermetric_k_profile.get("label") if "sabermetric_k_profile" in locals() else "SABER_UNKNOWN",
+        "sabermetric_k_factor": sabermetric_k_profile.get("k_factor") if "sabermetric_k_profile" in locals() else 1.0,
+        "sabermetric_k_note": sabermetric_k_note if "sabermetric_k_note" in locals() else "Sabermetric K unavailable",
+        "dips_k_score": dips_k_profile.get("score") if "dips_k_profile" in locals() else 50,
+        "dips_k_label": dips_k_profile.get("label") if "dips_k_profile" in locals() else "DIPS_UNKNOWN",
+        "dips_k_factor": dips_k_profile.get("k_factor") if "dips_k_profile" in locals() else 1.0,
+        "dips_reliability_nudge": dips_k_profile.get("reliability_nudge") if "dips_k_profile" in locals() else 0,
+        "kbb_pct": dips_k_profile.get("kbb_pct") if "dips_k_profile" in locals() else None,
+        "bb_pct": dips_k_profile.get("bb_pct") if "dips_k_profile" in locals() else None,
+        "recent_kbb_pct": dips_k_profile.get("recent_kbb_pct") if "dips_k_profile" in locals() else None,
+        "siera": dips_k_profile.get("siera") if "dips_k_profile" in locals() else None,
+        "fip": dips_k_profile.get("fip") if "dips_k_profile" in locals() else None,
+        "xfip": dips_k_profile.get("xfip") if "dips_k_profile" in locals() else None,
+        "dips_k_note": dips_k_note if "dips_k_note" in locals() else "DIPS unavailable",
         "statcast_note": statcast_note,
         "pitch_type_matchup_available": pitch_type_available,
         "pitch_type_factor": round(safe_float(pitch_type_factor, 1.0), 3),
