@@ -221,6 +221,9 @@ def get_secret(key, default=""):
 # The Odds API key is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
 ODDS_API_KEY = "9dc242dd0bdc503a59ab3052a173cc9c"
+# Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
+# It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
+MANUAL_MARKET_ODDS_TEXT = ""
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
@@ -5391,14 +5394,16 @@ def get_oddsapi_all_pitcher_k_lines(player_name, game_home=None, game_away=None)
         f"{ODDS_BASE}/sports/baseball_mlb/odds",
         params={
             "apiKey": ODDS_API_KEY,
-            "regions": "us",
-            "markets": ",".join(SPORTSBOOK_PITCHER_K_MARKETS),
+            "regions": "us,us2",
+            # Official Odds API MLB player prop keys: pitcher_strikeouts and pitcher_strikeouts_alternate.
+            # Keep the extra aliases in the parser, but request only real API markets here.
+            "markets": "pitcher_strikeouts,pitcher_strikeouts_alternate",
             "oddsFormat": "american",
         },
         timeout=20,
     )
     if not isinstance(data, list):
-        return source_result("Sportsbook", "FAILED", rows=[], message="Odds API all-slate pitcher-K call failed or plan has no player props")
+        return source_result("Sportsbook", "FAILED", rows=[], message="Odds API call failed, quota blocked, or plan does not include MLB player props")
     rows = []
     for ev in data:
         rows.extend(_parse_oddsapi_pitcher_k_event(ev, player_name, game_home, game_away))
@@ -5451,6 +5456,45 @@ def get_sportsbook_k_data(game_home, game_away, player_name):
     # Fallback: all-slate pitcher-K prop search, filtered back to this game/player.
     # This catches team naming issues like ATH/OAK/Sacramento Athletics.
     return get_oddsapi_all_pitcher_k_lines(player_name, game_home, game_away)
+
+def get_manual_market_k_data(player_name, active_line=None):
+    """Manual sportsbook odds fallback for Market/Sharp cards only.
+
+    Format accepted in the sidebar, one row per pitcher:
+      Pitcher Name, Line, OverOdds, UnderOdds
+      Cristopher Sanchez, 6.5, -145, +115
+
+    This never participates in active line selection or K projection. It only adds
+    priced rows that build_market_odds_intelligence() can read for the card.
+    """
+    txt = str(globals().get("MANUAL_MARKET_ODDS_TEXT", "") or "").strip()
+    if not txt:
+        return source_result("ManualMarket", "OFF", rows=[], message="Manual market odds empty")
+    rows = []
+    for raw in txt.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Accept comma, pipe, tab, or semicolon separators.
+        parts = [p.strip() for p in re.split(r"[,|;\t]+", line) if p.strip()]
+        if len(parts) < 4:
+            continue
+        nm = parts[0]
+        k_line = is_valid_k_line(safe_float(parts[1]), allow_integer=True)
+        over_px = safe_float(parts[2].replace("+", "")) if isinstance(parts[2], str) else safe_float(parts[2])
+        under_px = safe_float(parts[3].replace("+", "")) if isinstance(parts[3], str) else safe_float(parts[3])
+        if k_line is None or name_score(player_name, nm) < 0.80:
+            continue
+        # If an active UD/PP line exists, only use manual prices at that line so it cannot shift decisions.
+        if active_line is not None and safe_float(k_line) != safe_float(active_line):
+            continue
+        if over_px is not None:
+            rows.append({"Source": "ManualMarket", "Provider": "Manual", "Player": player_name, "Matched Name": nm, "Match Score": round(name_score(player_name, nm), 3), "Market": "pitcher_strikeouts", "Line": k_line, "Side": "OVER", "Price": int(over_px)})
+        if under_px is not None:
+            rows.append({"Source": "ManualMarket", "Provider": "Manual", "Player": player_name, "Matched Name": nm, "Match Score": round(name_score(player_name, nm), 3), "Market": "pitcher_strikeouts", "Line": k_line, "Side": "UNDER", "Price": int(under_px)})
+    if not rows:
+        return source_result("ManualMarket", "NO MATCH", rows=[], message="No manual market row matched this pitcher/line")
+    return source_result("ManualMarket", "FOUND", rows=rows, line=safe_float(rows[0].get("Line")), message=f"Manual market odds matched: {len(rows)} rows")
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_prizepicks_k_data(player_name):
@@ -6909,7 +6953,12 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     sgo_data = get_sportsgameodds_k_data(pitcher_name) if use_sgo else source_result("SportsGameOdds", "OFF", message="Optional source turned off")
     optic_data = get_opticodds_k_data(pitcher_name) if use_optic else source_result("OpticOdds", "OFF", message="Optional source turned off")
 
-    active_line, active_source, consensus = choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data)
+    # Keep The Odds API isolated to Market/Sharp only. It should NOT set or shift the active K line.
+    # Active line still comes from Underdog/PrizePicks/optional sources.
+    market_only_blank = source_result("Sportsbook", "MARKET_ONLY", line=None, rows=[], message="Odds API kept out of active-line selection")
+    active_line, active_source, consensus = choose_active_line(market_only_blank, pp_data, ud_data, sgo_data, optic_data)
+
+    manual_market_data = get_manual_market_k_data(pitcher_name, active_line)
 
     # v11.8 TRUE CALIBRATION ENGINE:
     # Uses only graded official snapshots. It shifts projection slightly by proven bias buckets,
@@ -6982,7 +7031,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         price_is_real = False
         price_source = "NO REAL PRICE"
         priced_rows = []
-        for src in [sportsbook_data, sgo_data, optic_data]:
+        for src in [sportsbook_data, manual_market_data, sgo_data, optic_data]:
             priced_rows.extend(src.get("rows", []))
         market_intel = build_market_odds_intelligence(priced_rows, active_line, pick_side, fair_prob)
         line_history = build_line_history_audit(recent_rows, active_line, projection=mean)
@@ -8033,6 +8082,16 @@ with st.sidebar:
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
     use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
     use_optic = st.checkbox("Optional: OpticOdds API", value=False)
+    st.divider()
+    st.header("Market Odds Fallback")
+    st.caption("Optional. Only fills Market/Sharp cards. Does not change K projection, BF/IP, pitch count, lineups, or Underdog line.")
+    MANUAL_MARKET_ODDS_TEXT = st.text_area(
+        "Manual sportsbook odds",
+        value="",
+        height=90,
+        placeholder="Pitcher Name, Line, OverOdds, UnderOdds\nCristopher Sanchez, 6.5, -145, +115",
+        help="Use when Odds API does not return pitcher props. One pitcher per line.",
+    )
     if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
         st.cache_data.clear()
         st.session_state.loaded_picks = []
