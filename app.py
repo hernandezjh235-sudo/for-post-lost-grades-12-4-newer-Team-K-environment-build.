@@ -1834,7 +1834,7 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 # - Used only when MLB confirmed lineup is not available yet
 # - Falls back safely to the internal MLB projected lineup engine
 # =========================
-ROTOWIRE_EXPECTED_LINEUPS_ENABLED = False  # disabled: FanGraphs/RosterResource is now the projected-lineup source
+ROTOWIRE_EXPECTED_LINEUPS_ENABLED = False  # disabled: using original MLB confirmed + MLB pre-lineup engine
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
 
@@ -2244,7 +2244,7 @@ def _try_rotowire_expected_lineup(game_pk, opp_side, pitcher_hand=None):
 # - This layer only affects batter lineup / matchup K% logic. It does NOT touch Underdog lines,
 #   PrizePicks, sportsbook odds, or any market line pulls.
 # =========================
-FANGRAPHS_ROSTER_LINEUPS_ENABLED = True
+FANGRAPHS_ROSTER_LINEUPS_ENABLED = False
 FANGRAPHS_LINEUP_MIN_VALID_HITTERS = 5
 FANGRAPHS_BASE_URL = "https://www.fangraphs.com/roster-resource"
 
@@ -2520,22 +2520,31 @@ def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
     save_json(LINEUP_CACHE_FILE, cache)
 
 def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
-    """Resolve opponent lineup K-rate using ONLY:
+    """Resolve opponent lineup K-rate using the stable original lineup stack:
 
-    1) MLB confirmed/posted lineup once battingOrder exists in the official boxscore
-    2) FanGraphs/RosterResource projected lineup before official lineups post
+    1) MLB official/confirmed lineup once battingOrder exists in the MLB boxscore
+    2) Internal MLB pre-lineup/projected recent-lineup engine before official lineups post
+    3) Cached locked lineup only as a backup
 
-    Important: this intentionally does NOT fall back to the internal MLB projected lineup for
-    the batter-by-batter matchup card. If FanGraphs is unavailable, the app should display
-    a clear unavailable message instead of silently showing MLB projected hitters.
-    Underdog/PrizePicks/sportsbook line pulling is untouched.
+    This intentionally does NOT use Rotowire or FanGraphs. Underdog/PrizePicks/sportsbook
+    prop-line pulling is untouched and remains separate from batter lineup resolution.
     """
     box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
+
+    # If official boxscore lineups are not available yet, use the app's original MLB pre-lineup engine.
     if not box:
-        fg_k, fg_rows, fg_msg, fg_locked = _try_fangraphs_roster_lineup(game_pk, opp_side, pitcher_hand)
-        if fg_rows and fg_k is not None:
-            return fg_k, fg_rows, fg_msg, fg_locked
-        return None, [], "FanGraphs/RosterResource lineup unavailable; MLB confirmed lineup not posted yet", False
+        team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
+        proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
+        valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
+        if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
+            return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
+
+        cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
+        valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
+        if len(valid_cached) >= 5:
+            return float(np.mean(valid_cached)), cached_rows[:9], "Using cached locked lineup", True
+        return None, [], "Boxscore not available; MLB projected lineup unavailable", False
+
     players = box.get("teams", {}).get(opp_side, {}).get("players", {})
     rows = []
     for _, pdata in players.items():
@@ -2575,23 +2584,30 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
             "SO": season_so,
             "PA/AB": season_pa,
             "Raw_K_Rate": used_k,
-            "Lineup Source": "MLB_CONFIRMED_LINEUP"
+            "Lineup Source": "MLB_CONFIRMED_LINEUP",
         })
+
     rows = sorted(rows, key=lambda x: x["Order"])
-    valid = [r["Raw_K_Rate"] for r in rows[:9] if r["Raw_K_Rate"] is not None]
+    valid = [r["Raw_K_Rate"] for r in rows[:9] if r.get("Raw_K_Rate") is not None]
     if len(valid) >= 5:
         set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows[:9])
         lineup_k = float(np.mean(valid))
         split_count = sum(1 for r in rows[:9] if r.get("Split K%") is not None)
         msg = f"Posted lineup K%; splits for {split_count}/9 hitters"
         return lineup_k, rows[:9], msg, len(rows[:9]) >= 8
-    # If MLB boxscore exists but the posted lineup is still thin/incomplete, use FanGraphs/RosterResource.
-    # Do not fall back to internal MLB projected hitters, by design.
-    fg_k, fg_rows, fg_msg, fg_locked = _try_fangraphs_roster_lineup(game_pk, opp_side, pitcher_hand)
-    if fg_rows and fg_k is not None:
-        return fg_k, fg_rows, fg_msg, fg_locked
-    return None, rows, "MLB confirmed lineup thin/not posted and FanGraphs/RosterResource unavailable", False
 
+    # If boxscore exists but official lineup is still thin/not posted, use original MLB pre-lineup engine.
+    team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
+    proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
+    valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
+    if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
+        return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
+
+    cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
+    valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
+    if len(valid_cached) >= 5:
+        return float(np.mean(valid_cached)), cached_rows[:9], "Current lineup thin; using cached locked lineup", True
+    return None, rows, "Lineup not posted or not enough hitter K data", False
 
 def team_k_vs_hand(team_id, hand):
     data = safe_get_json(f"{MLB_BASE}/teams/{team_id}/stats", params={"stats": "season", "group": "hitting"})
@@ -8559,7 +8575,7 @@ def render_kproj_pitcher_card(p):
             st.caption("Lineup source: " + (", ".join([f"{k} ({v})" for k, v in src_counts.items()]) or "—"))
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.caption("No confirmed batter-by-batter lineup yet. This tab will improve when lineups lock.")
+        st.caption("No batter-by-batter lineup available yet. The app uses MLB confirmed lineups when posted and MLB projected pre-lineups before lock.")
 
 
 def _display_pct_value(v):
