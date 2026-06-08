@@ -1641,7 +1641,7 @@ def blend_batter_k_inputs(season_k, split_k=None, season_pa=None, split_pa=None,
     return clamp(blended, 0.04, 0.55), f"Blended real K inputs: {sources}"
 
 
-# - Does NOT use Rotowire
+# - Internal MLB projected fallback only
 # - Uses MLB recent lineups / boxscores to estimate expected 1-9 hitters
 # =========================
 MLB_PROJECTED_LINEUPS_ENABLED = True
@@ -1834,7 +1834,7 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 # - Used only when MLB confirmed lineup is not available yet
 # - Falls back safely to the internal MLB projected lineup engine
 # =========================
-ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True
+ROTOWIRE_EXPECTED_LINEUPS_ENABLED = False  # disabled: FanGraphs/RosterResource is now the projected-lineup source
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
 
@@ -2234,6 +2234,276 @@ def _try_rotowire_expected_lineup(game_pk, opp_side, pitcher_hand=None):
     return None, [], "Rotowire expected lineup unavailable", False
 
 
+
+# =========================
+# FANGRAPHS ROSTERRESOURCE PROJECTED LINEUP LAYER (LINEUP ONLY)
+# =========================
+# Purpose:
+# - Use FanGraphs/RosterResource projected batters BEFORE MLB confirmed lineups post.
+# - Once MLB official/boxscore lineup is available, confirmed MLB lineup stays the top source.
+# - This layer only affects batter lineup / matchup K% logic. It does NOT touch Underdog lines,
+#   PrizePicks, sportsbook odds, or any market line pulls.
+# =========================
+FANGRAPHS_ROSTER_LINEUPS_ENABLED = True
+FANGRAPHS_LINEUP_MIN_VALID_HITTERS = 5
+FANGRAPHS_BASE_URL = "https://www.fangraphs.com/roster-resource"
+
+FANGRAPHS_TEAM_SLUGS = {
+    "ARI": "diamondbacks", "AZ": "diamondbacks",
+    "ATL": "braves",
+    "BAL": "orioles",
+    "BOS": "red-sox",
+    "CHC": "cubs",
+    "CHW": "white-sox", "CWS": "white-sox",
+    "CIN": "reds",
+    "CLE": "guardians",
+    "COL": "rockies",
+    "DET": "tigers",
+    "HOU": "astros",
+    "KC": "royals", "KCR": "royals",
+    "LAA": "angels", "ANA": "angels",
+    "LAD": "dodgers",
+    "MIA": "marlins", "FLA": "marlins",
+    "MIL": "brewers",
+    "MIN": "twins",
+    "NYM": "mets",
+    "NYY": "yankees",
+    "ATH": "athletics", "OAK": "athletics",
+    "PHI": "phillies",
+    "PIT": "pirates",
+    "SD": "padres", "SDP": "padres",
+    "SF": "giants", "SFG": "giants",
+    "SEA": "mariners",
+    "STL": "cardinals",
+    "TB": "rays", "TBR": "rays",
+    "TEX": "rangers",
+    "TOR": "blue-jays",
+    "WSH": "nationals", "WAS": "nationals",
+}
+
+FANGRAPHS_TEAM_ALIASES = {
+    "AZ": "ARI", "ARZ": "ARI",
+    "CWS": "CHW",
+    "KC": "KC", "KCR": "KC",
+    "OAK": "ATH",
+    "SDP": "SD",
+    "SFG": "SF",
+    "TBR": "TB",
+    "WAS": "WSH",
+}
+
+def _fg_norm_team_abbr(abbr):
+    a = str(abbr or "").upper().strip()
+    return FANGRAPHS_TEAM_ALIASES.get(a, a)
+
+def _fg_team_slug(team_abbr):
+    return FANGRAPHS_TEAM_SLUGS.get(_fg_norm_team_abbr(team_abbr))
+
+def _fg_clean_name(name):
+    name = html.unescape(str(name or ""))
+    name = name.replace("\xa0", " ")
+    name = " ".join(name.split())
+    # Remove common RosterResource / fantasy status suffixes without touching the real name.
+    for token in [" IL", " DTD", " OUT", " Q", " SUSP", " NA"]:
+        if name.upper().endswith(token):
+            name = name[: -len(token)].strip()
+    return name
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fangraphs_fetch_team_page_html(team_abbr):
+    """Fetch FanGraphs/RosterResource pages for one team.
+
+    We try the lineup tracker first, then the depth chart page. FanGraphs markup can change,
+    so downstream parsing is defensive and falls back to the internal MLB projected lineup if
+    fewer than FANGRAPHS_LINEUP_MIN_VALID_HITTERS are found.
+    """
+    if not FANGRAPHS_ROSTER_LINEUPS_ENABLED:
+        return ""
+    slug = _fg_team_slug(team_abbr)
+    if not slug:
+        return ""
+    urls = [
+        f"{FANGRAPHS_BASE_URL}/lineup-tracker/{slug}",
+        f"{FANGRAPHS_BASE_URL}/depth-charts/{slug}",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=18, headers=headers)
+            if r.status_code < 400 and (r.text or "").strip():
+                return r.text or ""
+        except Exception:
+            continue
+    return ""
+
+def _fg_expected_split_from_pitcher_hand(pitcher_hand):
+    # Opposing lineup is selected by pitcher handedness.
+    return "vsL" if str(pitcher_hand or "").upper() == "L" else "vsR"
+
+def _fangraphs_extract_names_from_tables(raw_html, pitcher_hand=None):
+    """Best-effort extraction from HTML tables.
+
+    RosterResource pages expose multiple tables/sections. We prefer tables/nearby labels that
+    mention the relevant projected platoon: vsR if the pitcher is right-handed, vsL if left-handed.
+    """
+    if not raw_html:
+        return []
+    wanted = _fg_expected_split_from_pitcher_hand(pitcher_hand)
+    rows = []
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw_html, "html.parser")
+        for bad in soup(["script", "style", "noscript"]):
+            bad.decompose()
+        candidates = []
+        # Grab actual tables plus div blocks that look like projected lineup/platoon groups.
+        candidates.extend(soup.find_all("table"))
+        for sel in ["div", "section", "article"]:
+            for block in soup.find_all(sel):
+                cls = " ".join(block.get("class") or [])
+                txt_head = block.get_text(" ", strip=True)[:180]
+                if any(k in (cls + " " + txt_head).lower() for k in ["platoon", "lineup", "depth", "projected"]):
+                    candidates.append(block)
+
+        def block_score(block):
+            tx = block.get_text(" ", strip=True).lower()
+            score = 0
+            if wanted.lower() in tx or (wanted == "vsR" and "vs rhp" in tx) or (wanted == "vsL" and "vs lhp" in tx):
+                score += 8
+            if "projected" in tx:
+                score += 3
+            if "platoon" in tx:
+                score += 3
+            if "lineup" in tx:
+                score += 2
+            if "batter" in tx or "hitters" in tx:
+                score += 1
+            return score
+
+        candidates = sorted(candidates, key=block_score, reverse=True)
+        import re
+        pos_set = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
+        stop_words = {
+            "RosterResource", "Depth Charts", "Lineup Tracker", "Projected Standings",
+            "Starting Pitchers", "Bullpen", "Bench", "Injury Report", "Payroll", "Schedule Grid",
+            "Probables Grid", "Latest Roster Moves", "Team Page Key", "Related Links"
+        }
+        seen = set()
+        for block in candidates[:20]:
+            # Prefer anchor text because FanGraphs player links are usually clean names.
+            anchors = [a.get_text(" ", strip=True) for a in block.find_all("a")]
+            texts = anchors if anchors else block.get_text("\n", strip=True).split("\n")
+            for raw in texts:
+                t = _fg_clean_name(raw)
+                if not t or t in stop_words:
+                    continue
+                if len(t.split()) < 2 or len(t) > 34:
+                    continue
+                # Avoid headers/stats/percentages/role rows.
+                if re.search(r"\d", t):
+                    continue
+                if t.upper() in pos_set:
+                    continue
+                if any(x in t.lower() for x in ["fangraphs", "roster", "depth chart", "projected", "leaderboard", "probable"]):
+                    continue
+                # Basic human-name check: letters, spaces, apostrophes, hyphens, periods.
+                if not re.match(r"^[A-Za-zÀ-ÖØ-öø-ÿ.'\- ]+$", t):
+                    continue
+                key = normalize_name(t)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "Order": len(rows) + 1,
+                    "Batter": t,
+                    "Lineup Source": f"FANGRAPHS_ROSTERRESOURCE_{wanted.upper()}",
+                })
+                if len(rows) >= 9:
+                    return rows[:9]
+            if len(rows) >= 9:
+                return rows[:9]
+    except Exception:
+        return []
+    return rows[:9]
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_fangraphs_rosterresource_lineup(team_abbr, pitcher_hand=None):
+    """Return FanGraphs/RosterResource projected lineup rows for one team.
+
+    If FanGraphs is blocked, markup changes, or the parser finds too few hitters, this returns []
+    and the engine falls back to MLB projected/recent lineup logic.
+    """
+    team_abbr = _fg_norm_team_abbr(team_abbr)
+    raw = _fangraphs_fetch_team_page_html(team_abbr)
+    if not raw:
+        return []
+    rows = _fangraphs_extract_names_from_tables(raw, pitcher_hand=pitcher_hand)
+    if len(rows) >= FANGRAPHS_LINEUP_MIN_VALID_HITTERS:
+        return rows[:9]
+    return []
+
+def build_fangraphs_roster_lineup_rows(team_abbr, pitcher_hand=None):
+    """Convert FanGraphs/RosterResource projected lineup names into app row schema."""
+    team_abbr = _fg_norm_team_abbr(team_abbr)
+    if not FANGRAPHS_ROSTER_LINEUPS_ENABLED or not team_abbr:
+        return []
+    base_rows = get_fangraphs_rosterresource_lineup(team_abbr, pitcher_hand=pitcher_hand) or []
+    if len(base_rows) < FANGRAPHS_LINEUP_MIN_VALID_HITTERS:
+        return []
+
+    rows = []
+    for idx, base in enumerate(base_rows[:9], start=1):
+        name = _fg_clean_name(base.get("Batter"))
+        player_id = _mlb_search_player_id_by_name(name)
+        season_k, season_so, season_pa = get_batter_season_k_rate(player_id) if player_id else (None, None, None)
+        split_k, split_so, split_pa, split_source = get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand) if (player_id and pitcher_hand) else (None, None, None, "No split")
+        rolling = get_batter_rolling_k_rates(player_id, days_list=(14, 30)) if player_id else {}
+        rolling14 = rolling.get(14)
+        rolling30 = rolling.get(30)
+        used_k, used_source = blend_batter_k_inputs(
+            season_k,
+            split_k=split_k,
+            season_pa=season_pa,
+            split_pa=split_pa,
+            rolling14=rolling14,
+            rolling30=rolling30,
+        )
+        if used_k is None:
+            used_k = split_k if split_k is not None else season_k
+            used_source = split_source if split_k is not None else "Season batter K%"
+        rows.append({
+            "Order": idx,
+            "Batter": name,
+            "Player ID": player_id,
+            "Season K%": None if season_k is None else round(season_k * 100, 1),
+            "Split K%": None if split_k is None else round(split_k * 100, 1),
+            "Rolling 14d K%": None if rolling14 is None else round(rolling14 * 100, 1),
+            "Rolling 30d K%": None if rolling30 is None else round(rolling30 * 100, 1),
+            "Split PA/AB": split_pa,
+            "Used K%": None if used_k is None else round(used_k * 100, 1),
+            "K Source": f"FanGraphs RosterResource + {used_source}",
+            "SO": season_so,
+            "PA/AB": season_pa,
+            "Raw_K_Rate": used_k,
+            "Lineup Source": base.get("Lineup Source") or "FANGRAPHS_ROSTERRESOURCE_PROJECTED",
+        })
+    valid = [r.get("Raw_K_Rate") for r in rows if r.get("Raw_K_Rate") is not None]
+    if len(valid) >= FANGRAPHS_LINEUP_MIN_VALID_HITTERS:
+        return rows[:9]
+    return []
+
+def _try_fangraphs_roster_lineup(game_pk, opp_side, pitcher_hand=None):
+    team_abbr = _game_team_abbr_from_box_or_live(game_pk, opp_side)
+    fg_rows = build_fangraphs_roster_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
+    valid_fg = [r.get("Raw_K_Rate") for r in fg_rows[:9] if r.get("Raw_K_Rate") is not None]
+    if len(valid_fg) >= FANGRAPHS_LINEUP_MIN_VALID_HITTERS:
+        split = _fg_expected_split_from_pitcher_hand(pitcher_hand)
+        return float(np.mean(valid_fg)), fg_rows[:9], f"FanGraphs RosterResource projected lineup K% ({team_abbr}, {split})", False
+    return None, [], "FanGraphs RosterResource projected lineup unavailable", False
+
 def lineup_cache_key(game_pk, opp_side, pitcher_hand):
     return f"{game_pk}_{opp_side}_{pitcher_hand or 'NA'}"
 
@@ -2250,23 +2520,22 @@ def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
     save_json(LINEUP_CACHE_FILE, cache)
 
 def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
+    """Resolve opponent lineup K-rate using ONLY:
+
+    1) MLB confirmed/posted lineup once battingOrder exists in the official boxscore
+    2) FanGraphs/RosterResource projected lineup before official lineups post
+
+    Important: this intentionally does NOT fall back to the internal MLB projected lineup for
+    the batter-by-batter matchup card. If FanGraphs is unavailable, the app should display
+    a clear unavailable message instead of silently showing MLB projected hitters.
+    Underdog/PrizePicks/sportsbook line pulling is untouched.
+    """
     box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
     if not box:
-        # Pregame hierarchy: Rotowire expected lineup first, then internal MLB projected fallback.
-        # This does not affect Underdog/PrizePicks/sportsbook line pulls.
-        rw_k, rw_rows, rw_msg, rw_locked = _try_rotowire_expected_lineup(game_pk, opp_side, pitcher_hand)
-        if rw_rows and rw_k is not None:
-            return rw_k, rw_rows, rw_msg, rw_locked
-        team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
-        proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
-        valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
-        if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
-            return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
-        cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
-        valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
-        if len(valid_cached) >= 5:
-            return float(np.mean(valid_cached)), cached_rows[:9], "Using cached locked lineup", True
-        return None, [], "Boxscore not available; Rotowire and MLB projected unavailable", False
+        fg_k, fg_rows, fg_msg, fg_locked = _try_fangraphs_roster_lineup(game_pk, opp_side, pitcher_hand)
+        if fg_rows and fg_k is not None:
+            return fg_k, fg_rows, fg_msg, fg_locked
+        return None, [], "FanGraphs/RosterResource lineup unavailable; MLB confirmed lineup not posted yet", False
     players = box.get("teams", {}).get(opp_side, {}).get("players", {})
     rows = []
     for _, pdata in players.items():
@@ -2305,7 +2574,8 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
             "K Source": used_source,
             "SO": season_so,
             "PA/AB": season_pa,
-            "Raw_K_Rate": used_k
+            "Raw_K_Rate": used_k,
+            "Lineup Source": "MLB_CONFIRMED_LINEUP"
         })
     rows = sorted(rows, key=lambda x: x["Order"])
     valid = [r["Raw_K_Rate"] for r in rows[:9] if r["Raw_K_Rate"] is not None]
@@ -2315,20 +2585,12 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
         split_count = sum(1 for r in rows[:9] if r.get("Split K%") is not None)
         msg = f"Posted lineup K%; splits for {split_count}/9 hitters"
         return lineup_k, rows[:9], msg, len(rows[:9]) >= 8
-    # If MLB boxscore exists but the posted lineup is still thin/incomplete, try Rotowire expected before fallback.
-    rw_k, rw_rows, rw_msg, rw_locked = _try_rotowire_expected_lineup(game_pk, opp_side, pitcher_hand)
-    if rw_rows and rw_k is not None:
-        return rw_k, rw_rows, rw_msg, rw_locked
-    team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
-    proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
-    valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
-    if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
-        return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
-    cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
-    valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
-    if len(valid_cached) >= 5:
-        return float(np.mean(valid_cached)), cached_rows[:9], "Current lineup thin; using cached locked lineup", True
-    return None, rows, "Lineup not posted or not enough hitter K data", False
+    # If MLB boxscore exists but the posted lineup is still thin/incomplete, use FanGraphs/RosterResource.
+    # Do not fall back to internal MLB projected hitters, by design.
+    fg_k, fg_rows, fg_msg, fg_locked = _try_fangraphs_roster_lineup(game_pk, opp_side, pitcher_hand)
+    if fg_rows and fg_k is not None:
+        return fg_k, fg_rows, fg_msg, fg_locked
+    return None, rows, "MLB confirmed lineup thin/not posted and FanGraphs/RosterResource unavailable", False
 
 
 def team_k_vs_hand(team_id, hand):
@@ -2358,6 +2620,8 @@ def projection_source_label(lineup_msg, lineup_locked, lineup_rows):
     row_count = len(lineup_rows or [])
     if "cached" in msg:
         return "CACHED LINEUP"
+    if "fangraphs" in msg or any("FANGRAPHS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "FANGRAPHS ROSTER"
     if "rotowire" in msg or any((r.get("Lineup Source") == "ROTOWIRE_EXPECTED_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
         return "ROTOWIRE EXPECTED"
     if lineup_locked and row_count >= 8 and ("posted lineup" in msg or "posted" in msg):
@@ -2371,6 +2635,8 @@ def confirmed_lineup_status(source_label, lineup_rows):
         return "CONFIRMED"
     if source_label == "CACHED LINEUP":
         return "CACHED"
+    if source_label == "FANGRAPHS ROSTER" or any("FANGRAPHS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "FANGRAPHS ROSTER"
     if source_label == "ROTOWIRE EXPECTED" or any((r.get("Lineup Source") == "ROTOWIRE_EXPECTED_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
         return "ROTOWIRE EXPECTED"
     if "PROJECTED RECENT" in str(source_label).upper() or any((r.get("Lineup Source") == "MLB_PROJECTED_RECENT_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
@@ -7815,6 +8081,9 @@ def kproj_role_stability_score(p):
     if "CONFIRMED" in lineup_status or "TRUE" in lineup_status:
         score += 8
         notes.append("true lineup")
+    elif "FANGRAPHS" in lineup_status or "ROSTER" in lineup_status:
+        score += 5
+        notes.append("FanGraphs RosterResource projected lineup")
     elif "ROTOWIRE" in lineup_status:
         score += 5
         notes.append("Rotowire expected lineup")
@@ -8310,6 +8579,8 @@ def _display_pct_value(v):
 def _short_lineup_source(row):
     src = str((row or {}).get("Lineup Source") or (row or {}).get("Source") or "").upper()
     ksrc = str((row or {}).get("K Source") or "")
+    if "FANGRAPHS" in src or "FanGraphs" in ksrc:
+        return "FanGraphs roster"
     if "ROTOWIRE_CONFIRMED" in src:
         return "Rotowire confirmed"
     if "ROTOWIRE" in src or "Rotowire" in ksrc:
@@ -8943,4 +9214,3 @@ with tab6:
             st.error("All logs cleared.")
 
 st.caption("Workflow: Refresh live board -> inspect lines -> save official before-game snapshot -> after games, grade and learn.")
-
