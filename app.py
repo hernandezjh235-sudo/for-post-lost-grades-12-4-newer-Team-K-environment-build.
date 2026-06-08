@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT + SABERMETRIC K"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + SABER DIPS + MECHANICS ATTRIBUTION"
 
 try:
     import pytz
@@ -3645,7 +3645,7 @@ def apply_repeat_matchup_factor(k_rate, repeat_profile):
 # =========================
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_statcast_pitch_profile(pitcher_id, days=365):
-    empty = {"available": False, "message": "No pitcher id", "rows": 0, "csw": None, "whiff": None, "chase": None, "zone_contact": None, "pitch_mix": [], "pitch_type_profile": [], "putaway": None}
+    empty = {"available": False, "message": "No pitcher id", "rows": 0, "csw": None, "whiff": None, "chase": None, "zone_contact": None, "pitch_mix": [], "pitch_type_profile": [], "putaway": None, "fastball_velo_season": None, "fastball_velo_recent": None, "fastball_velo_delta": None, "pitch_usage_trend": None, "pitch_usage_note": None, "first_strike_pct": None}
     if not pitcher_id:
         return empty
     end = datetime.now()
@@ -3698,6 +3698,76 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
             chase = None
             zone_contact = None
 
+        # Mechanics / trend inputs for strikeout projection quality.
+        # Fastball velocity trend: recent 30 days vs full pulled window.
+        fastball_velo_season = None
+        fastball_velo_recent = None
+        fastball_velo_delta = None
+        pitch_usage_trend = None
+        pitch_usage_note = None
+        first_strike_pct = None
+        try:
+            if "pitch_type" in df.columns and "release_speed" in df.columns:
+                fb_types = {"FF", "SI", "FT", "FC"}
+                df_v = df.copy()
+                df_v["pitch_type"] = df_v["pitch_type"].fillna("UNK").astype(str)
+                df_v["release_speed"] = pd.to_numeric(df_v["release_speed"], errors="coerce")
+                fb = df_v[df_v["pitch_type"].isin(fb_types) & df_v["release_speed"].notna()]
+                if not fb.empty:
+                    fastball_velo_season = float(fb["release_speed"].mean())
+                    if "game_date" in fb.columns:
+                        gdt = pd.to_datetime(fb["game_date"], errors="coerce")
+                        recent_cut = pd.Timestamp(end.date()) - pd.Timedelta(days=30)
+                        fb_recent = fb[gdt >= recent_cut]
+                        if len(fb_recent) >= 15:
+                            fastball_velo_recent = float(fb_recent["release_speed"].mean())
+                            fastball_velo_delta = float(fastball_velo_recent - fastball_velo_season)
+        except Exception:
+            fastball_velo_season = fastball_velo_recent = fastball_velo_delta = None
+
+        try:
+            if "pitch_type" in df.columns:
+                df_u = df.copy()
+                df_u["pitch_type"] = df_u["pitch_type"].fillna("UNK").astype(str)
+                if "game_date" in df_u.columns:
+                    gdt = pd.to_datetime(df_u["game_date"], errors="coerce")
+                    recent_cut = pd.Timestamp(end.date()) - pd.Timedelta(days=30)
+                    recent_df = df_u[gdt >= recent_cut]
+                    if len(recent_df) >= 40:
+                        season_usage = df_u["pitch_type"].value_counts(normalize=True)
+                        recent_usage = recent_df["pitch_type"].value_counts(normalize=True)
+                        trends = []
+                        for pt in set(season_usage.index).union(set(recent_usage.index)):
+                            s_u = float(season_usage.get(pt, 0.0))
+                            r_u = float(recent_usage.get(pt, 0.0))
+                            delta = r_u - s_u
+                            if abs(delta) >= 0.045:
+                                trends.append({"Pitch Type": pt, "Season Usage %": round(s_u*100,1), "Recent Usage %": round(r_u*100,1), "Delta %": round(delta*100,1)})
+                        trends = sorted(trends, key=lambda x: abs(x.get("Delta %",0)), reverse=True)[:3]
+                        pitch_usage_trend = trends
+                        if trends:
+                            pitch_usage_note = "; ".join([f"{t['Pitch Type']} {t['Delta %']:+.1f} pts" for t in trends])
+        except Exception:
+            pitch_usage_trend = None
+            pitch_usage_note = None
+
+        try:
+            # First-strike%: first pitch of each PA that is a called/swinging strike/foul/in play.
+            key_cols = [c for c in ["game_pk", "at_bat_number"] if c in df.columns]
+            if len(key_cols) == 2:
+                df_fs = df.copy()
+                if "pitch_number" in df_fs.columns:
+                    df_fs["pitch_number_num"] = pd.to_numeric(df_fs["pitch_number"], errors="coerce")
+                    first_df = df_fs.sort_values(key_cols + ["pitch_number_num"]).groupby(key_cols, as_index=False).first()
+                else:
+                    first_df = df_fs.groupby(key_cols, as_index=False).first()
+                fd = first_df["description"].astype(str).str.lower()
+                strike_like = fd.isin(["called_strike", "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play", "hit_into_play_no_out", "hit_into_play_score"])
+                if len(first_df) >= 20:
+                    first_strike_pct = float(strike_like.mean())
+        except Exception:
+            first_strike_pct = None
+
         pitch_mix = []
         pitch_type_profile = []
         if "pitch_type" in df.columns:
@@ -3726,7 +3796,7 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
                     "Pitches": int(row["Pitches"]),
                     "Swings": int(row["Swings"]),
                 })
-        return {"available": True, "message": "Real Statcast pitch-level data loaded", "rows": pitch_count, "csw": None if csw is None else float(csw), "whiff": None if whiff is None else float(whiff), "chase": None if chase is None else float(chase), "zone_contact": None if zone_contact is None else float(zone_contact), "pitch_mix": pitch_mix, "pitch_type_profile": pitch_type_profile}
+        return {"available": True, "message": "Real Statcast pitch-level data loaded", "rows": pitch_count, "csw": None if csw is None else float(csw), "whiff": None if whiff is None else float(whiff), "chase": None if chase is None else float(chase), "zone_contact": None if zone_contact is None else float(zone_contact), "pitch_mix": pitch_mix, "pitch_type_profile": pitch_type_profile, "fastball_velo_season": None if fastball_velo_season is None else round(float(fastball_velo_season), 2), "fastball_velo_recent": None if fastball_velo_recent is None else round(float(fastball_velo_recent), 2), "fastball_velo_delta": None if fastball_velo_delta is None else round(float(fastball_velo_delta), 2), "pitch_usage_trend": pitch_usage_trend or [], "pitch_usage_note": pitch_usage_note or "No meaningful recent pitch-usage shift", "first_strike_pct": None if first_strike_pct is None else float(first_strike_pct)}
     except Exception as e:
         empty["message"] = f"Statcast unavailable: {e}"
         return empty
@@ -3840,6 +3910,115 @@ def apply_sabermetric_k_adjustment(pitcher_k, sabermetric_profile, enabled=True)
     factor = safe_float(sabermetric_profile.get("k_factor"), 1.0) or 1.0
     return float(clamp((safe_float(pitcher_k, LEAGUE_AVG_K) or LEAGUE_AVG_K) * factor, 0.08, 0.50)), sabermetric_profile.get("note", f"Sabermetric K factor x{factor:.3f}")
 
+
+
+# =========================
+# MECHANICS / PITCH-SHAPE TREND LAYER FOR K PROPS
+# =========================
+def build_mechanics_k_profile(statcast_profile=None, enabled=True):
+    """Velocity trend + pitch usage trend + first-strike%.
+
+    This layer is intentionally capped. It is meant to detect K-upside/injury-risk
+    signals without overpowering CSW/whiff, BF, lineups, pitch count, or market.
+    """
+    sp = statcast_profile or {}
+    if not enabled or not sp.get("available"):
+        return {"available": False, "score": 50, "label": "MECH_UNKNOWN", "k_factor": 1.0, "note": sp.get("message", "Mechanics layer unavailable")}
+
+    components = []
+    notes = []
+    velo_delta = safe_float(sp.get("fastball_velo_delta"))
+    if velo_delta is not None:
+        # +1.5 mph is very strong, -1.5 mph is a real risk flag.
+        vscore = clamp(50 + (velo_delta / 1.5) * 22, 20, 95)
+        components.append((vscore, 0.42))
+        notes.append(f"FB velo trend {velo_delta:+.1f} mph")
+
+    fstrike = safe_float(sp.get("first_strike_pct"))
+    if fstrike is not None:
+        # League-ish anchor around 61-62%.
+        fs_score = clamp(50 + ((fstrike - 0.615) / 0.075) * 22, 20, 95)
+        components.append((fs_score, 0.36))
+        notes.append(f"F-Strike {fstrike*100:.1f}%")
+
+    usage_trend = sp.get("pitch_usage_trend") or []
+    usage_score = 50
+    if usage_trend:
+        # If a pitcher is changing pitch mix, we do not automatically call it good.
+        # We reward only modestly when the changed pitch is also a high-CSW/whiff pitch
+        # in the pitch_type_profile table; otherwise it is an information/confidence tag.
+        pitch_profiles = {str(r.get("Pitch Type")): r for r in (sp.get("pitch_type_profile") or [])}
+        plus_points = 0
+        detail = []
+        for t in usage_trend[:3]:
+            pt = str(t.get("Pitch Type"))
+            delta = safe_float(t.get("Delta %"), 0) or 0
+            prof = pitch_profiles.get(pt, {})
+            wr = safe_float(prof.get("Pitcher Whiff%"))
+            csw = safe_float(prof.get("Pitcher CSW%"))
+            if delta > 0 and ((wr is not None and wr >= 30) or (csw is not None and csw >= 32)):
+                plus_points += min(8, abs(delta) * 0.55)
+            elif delta < 0 and ((wr is not None and wr >= 30) or (csw is not None and csw >= 32)):
+                plus_points -= min(7, abs(delta) * 0.45)
+            detail.append(f"{pt} {delta:+.1f} pts")
+        usage_score = clamp(50 + plus_points, 35, 70)
+        components.append((usage_score, 0.22))
+        notes.append("Usage trend " + ", ".join(detail))
+
+    if not components:
+        return {"available": False, "score": 50, "label": "MECH_THIN", "k_factor": 1.0, "note": "No velocity/usage/F-Strike trend data"}
+
+    total_w = sum(w for _, w in components) or 1.0
+    score = int(round(clamp(sum(v*w for v, w in components) / total_w, 20, 100)))
+    if score >= 82:
+        label = "MECH_UPGRADE"
+    elif score >= 66:
+        label = "MECH_PLUS"
+    elif score >= 46:
+        label = "MECH_NEUTRAL"
+    else:
+        label = "MECH_RISK"
+
+    factor = 1.0 + ((score - 50) / 50.0) * 0.035
+    factor = float(clamp(factor, 0.965, 1.04))
+    return {
+        "available": True,
+        "score": score,
+        "label": label,
+        "k_factor": round(factor, 3),
+        "fastball_velo_season": sp.get("fastball_velo_season"),
+        "fastball_velo_recent": sp.get("fastball_velo_recent"),
+        "fastball_velo_delta": sp.get("fastball_velo_delta"),
+        "pitch_usage_note": sp.get("pitch_usage_note") or "No meaningful usage shift",
+        "pitch_usage_trend": usage_trend,
+        "first_strike_pct": None if fstrike is None else round(fstrike * 100, 1),
+        "note": f"Mechanics {label}: score {score}/100; factor x{factor:.3f}; " + "; ".join(notes)
+    }
+
+def apply_mechanics_k_adjustment(pitcher_k, mechanics_profile, enabled=True):
+    if not enabled or not isinstance(mechanics_profile, dict) or not mechanics_profile.get("available"):
+        return pitcher_k, (mechanics_profile or {}).get("note", "No mechanics K adjustment")
+    factor = safe_float(mechanics_profile.get("k_factor"), 1.0) or 1.0
+    return float(clamp((safe_float(pitcher_k, LEAGUE_AVG_K) or LEAGUE_AVG_K) * factor, 0.08, 0.50)), mechanics_profile.get("note", f"Mechanics K factor x{factor:.3f}")
+
+def build_projection_attribution_engine(base_projection=None, final_projection=None, components=None):
+    """Small transparent attribution table for mobile cards/debugging.
+
+    components should be a list of (label, delta, note). Deltas are approximate K
+    contributions, not a second projection model. They help verify pipeline alignment.
+    """
+    rows = []
+    base = safe_float(base_projection, 0.0) or 0.0
+    final = safe_float(final_projection, base) or base
+    for label, delta, note in (components or []):
+        d = safe_float(delta, 0.0) or 0.0
+        rows.append({"Layer": str(label), "K Impact": round(d, 2), "Note": str(note or "")[:140]})
+    explained = sum(safe_float(r.get("K Impact"), 0) or 0 for r in rows)
+    residual = final - base - explained
+    if abs(residual) >= 0.05:
+        rows.append({"Layer": "Simulation/Calibration", "K Impact": round(residual, 2), "Note": "Monte Carlo, market/probability calibration, rounding, and interaction effects"})
+    summary = f"Base {base:.2f} → Final {final:.2f} ({final-base:+.2f} K)"
+    return {"base_projection": round(base, 2), "final_projection": round(final, 2), "total_delta": round(final-base, 2), "summary": summary, "rows": rows[:8]}
 
 # =========================
 # DIPS / MARKET-INEFFICIENCY LAYER FOR K PROPS
@@ -6323,11 +6502,15 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     lineup_status_label = confirmed_lineup_status(proj_source_label, lineup_rows)
 
     pitcher_k, pitcher_k_source, learn_scale = blend_pitcher_k_rate(profile["Pitcher K%"], recent_rows, pid)
+    pitcher_k_blend_base = safe_float(pitcher_k, LEAGUE_AVG_K) or LEAGUE_AVG_K
     elite_factor, elite_note = elite_pitcher_boost_factor(pitcher_k)
     pitcher_k = clamp(pitcher_k * elite_factor, 0.08, 0.50)
+    pitcher_k_after_elite = safe_float(pitcher_k, pitcher_k_blend_base) or pitcher_k_blend_base
 
     statcast_profile = get_statcast_pitch_profile(pid, days=365)
+    pitcher_k_before_statcast = safe_float(pitcher_k, pitcher_k_after_elite) or pitcher_k_after_elite
     pitcher_k, statcast_note = apply_statcast_csw_adjustment(pitcher_k, statcast_profile, enabled=use_statcast)
+    pitcher_k_after_statcast = safe_float(pitcher_k, pitcher_k_before_statcast) or pitcher_k_before_statcast
 
     # v9.6 upgrade: prefer true batter-vs-pitch-type matchup when lineup is available.
     matchup_profile = build_pitch_type_matchup_profile(
@@ -6349,6 +6532,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             pitch_type_note = matchup_profile.get("message", pitch_type_note)
 
     batter_pitch_profile_rows = matchup_profile.get("batter_rows", []) if isinstance(matchup_profile, dict) else []
+    pitcher_k_after_pitch_type = safe_float(pitcher_k, pitcher_k_after_statcast) or pitcher_k_after_statcast
 
     # Sabermetric K Layer: CSW + whiff + chase + zone contact, lightly capped.
     try:
@@ -6362,6 +6546,16 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     except Exception as _sab_e:
         sabermetric_k_profile = {"available": False, "score": 50, "label": "SABER_ERROR", "k_factor": 1.0, "note": f"Sabermetric K skipped: {_sab_e}"}
         sabermetric_k_note = sabermetric_k_profile.get("note")
+    pitcher_k_after_sabermetric = safe_float(pitcher_k, pitcher_k_after_pitch_type) or pitcher_k_after_pitch_type
+
+    # Mechanics trend layer: fastball velocity trend, pitch usage shift, first-strike%.
+    try:
+        mechanics_k_profile = build_mechanics_k_profile(statcast_profile, enabled=use_statcast)
+        pitcher_k, mechanics_k_note = apply_mechanics_k_adjustment(pitcher_k, mechanics_k_profile, enabled=use_statcast)
+    except Exception as _mech_e:
+        mechanics_k_profile = {"available": False, "score": 50, "label": "MECH_ERROR", "k_factor": 1.0, "note": f"Mechanics skipped: {_mech_e}"}
+        mechanics_k_note = mechanics_k_profile.get("note")
+    pitcher_k_after_mechanics = safe_float(pitcher_k, pitcher_k_after_sabermetric) or pitcher_k_after_sabermetric
 
     # DIPS / Moneyball-style sustainability layer: K-BB%, SIERA, FIP/xFIP.
     # This is intentionally light-weight so it supports K skill without overpowering
@@ -6372,6 +6566,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     except Exception as _dips_e:
         dips_k_profile = {"available": False, "score": 50, "label": "DIPS_ERROR", "k_factor": 1.0, "reliability_nudge": 0, "note": f"DIPS skipped: {_dips_e}"}
         dips_k_note = dips_k_profile.get("note")
+    pitcher_k_after_dips = safe_float(pitcher_k, pitcher_k_after_mechanics) or pitcher_k_after_mechanics
 
     # v11.4 run-damage / game-script risk
     try:
@@ -6452,9 +6647,11 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     except Exception as _mh_e:
         matchup_history_profile = {"available": False, "score": 50, "label": "MATCHUP_UNKNOWN", "k_factor": 1.0, "note": f"Matchup history skipped: {_mh_e}"}
         matchup_history_note = matchup_history_profile.get("note")
+    pitcher_k_after_matchup_history = safe_float(pitcher_k, pitcher_k_after_dips) or pitcher_k_after_dips
 
     calibration_profile = build_model_calibration_profile(load_json(RESULT_LOG, []))
     pitcher_k, calibration_note = apply_calibration_adjustment(pitcher_k, calibration_profile, enabled=use_calibration)
+    pitcher_k_after_calibration = safe_float(pitcher_k, pitcher_k_after_matchup_history) or pitcher_k_after_matchup_history
 
     matchup_k = calculate_log5_k_rate(pitcher_k, lineup_k)
     opp_context_factor, opp_context_note = opponent_k_context_factor(lineup_k)
@@ -6857,6 +7054,24 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             rr["Pitch-Type Batter Detail Rows"] = len(batter_pitch_profile_rows) if "batter_pitch_profile_rows" in locals() else 0
             prop_rows.append(rr)
 
+    # Projection Attribution Engine: transparent mobile/debug explanation of why K PROJ moved.
+    try:
+        attr_base_bf = safe_float(bf, DEFAULT_BF) or DEFAULT_BF
+        attr_base_projection = (safe_float(pitcher_k_blend_base, LEAGUE_AVG_K) or LEAGUE_AVG_K) * attr_base_bf
+        attr_components = [
+            ("Elite/true talent", (safe_float(pitcher_k_after_elite, pitcher_k_blend_base) - safe_float(pitcher_k_blend_base, LEAGUE_AVG_K)) * attr_base_bf, elite_note),
+            ("CSW/Statcast", (safe_float(pitcher_k_after_statcast, pitcher_k_after_elite) - safe_float(pitcher_k_after_elite, pitcher_k_blend_base)) * attr_base_bf, statcast_note),
+            ("Pitch mix/matchup", (safe_float(pitcher_k_after_pitch_type, pitcher_k_after_statcast) - safe_float(pitcher_k_after_statcast, pitcher_k_blend_base)) * attr_base_bf, pitch_type_note),
+            ("Saber K", (safe_float(pitcher_k_after_sabermetric, pitcher_k_after_pitch_type) - safe_float(pitcher_k_after_pitch_type, pitcher_k_blend_base)) * attr_base_bf, sabermetric_k_note if "sabermetric_k_note" in locals() else ""),
+            ("Mechanics trend", (safe_float(pitcher_k_after_mechanics, pitcher_k_after_sabermetric) - safe_float(pitcher_k_after_sabermetric, pitcher_k_blend_base)) * attr_base_bf, mechanics_k_note if "mechanics_k_note" in locals() else ""),
+            ("DIPS/K-BB", (safe_float(pitcher_k_after_dips, pitcher_k_after_mechanics) - safe_float(pitcher_k_after_mechanics, pitcher_k_blend_base)) * attr_base_bf, dips_k_note if "dips_k_note" in locals() else ""),
+            ("Matchup history", (safe_float(pitcher_k_after_matchup_history, pitcher_k_after_dips) - safe_float(pitcher_k_after_dips, pitcher_k_blend_base)) * attr_base_bf, matchup_history_note if "matchup_history_note" in locals() else ""),
+            ("Volume/BF/IP", (safe_float(matchup_k, pitcher_k_after_calibration) or pitcher_k_after_calibration) * (attr_base_bf - DEFAULT_BF), f"BF {attr_base_bf:.1f}; IP {innings_outcome.get('projected_ip', '—') if isinstance(innings_outcome, dict) else '—'}; {leash.get('pitch_count_label', '')}"),
+        ]
+        projection_attribution = build_projection_attribution_engine(attr_base_projection, mean, attr_components)
+    except Exception as _attr_e:
+        projection_attribution = {"base_projection": None, "final_projection": round(mean, 2), "total_delta": None, "summary": f"Attribution unavailable: {_attr_e}", "rows": []}
+
     pick_id = f"{row['date']}_{row['game_pk']}_{pid}_{active_line}_{active_source}"
 
     out = {
@@ -7060,6 +7275,18 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "fip": dips_k_profile.get("fip") if "dips_k_profile" in locals() else None,
         "xfip": dips_k_profile.get("xfip") if "dips_k_profile" in locals() else None,
         "dips_k_note": dips_k_note if "dips_k_note" in locals() else "DIPS unavailable",
+        "mechanics_k_score": mechanics_k_profile.get("score") if "mechanics_k_profile" in locals() else 50,
+        "mechanics_k_label": mechanics_k_profile.get("label") if "mechanics_k_profile" in locals() else "MECH_UNKNOWN",
+        "mechanics_k_factor": mechanics_k_profile.get("k_factor") if "mechanics_k_profile" in locals() else 1.0,
+        "fastball_velo_season": mechanics_k_profile.get("fastball_velo_season") if "mechanics_k_profile" in locals() else None,
+        "fastball_velo_recent": mechanics_k_profile.get("fastball_velo_recent") if "mechanics_k_profile" in locals() else None,
+        "fastball_velo_delta": mechanics_k_profile.get("fastball_velo_delta") if "mechanics_k_profile" in locals() else None,
+        "pitch_usage_note": mechanics_k_profile.get("pitch_usage_note") if "mechanics_k_profile" in locals() else None,
+        "first_strike_pct": mechanics_k_profile.get("first_strike_pct") if "mechanics_k_profile" in locals() else None,
+        "mechanics_k_note": mechanics_k_note if "mechanics_k_note" in locals() else "Mechanics unavailable",
+        "projection_attribution": projection_attribution if "projection_attribution" in locals() else {},
+        "projection_attribution_summary": projection_attribution.get("summary") if isinstance(projection_attribution, dict) else "Attribution unavailable",
+        "projection_attribution_rows": projection_attribution.get("rows") if isinstance(projection_attribution, dict) else [],
         "statcast_note": statcast_note,
         "pitch_type_matchup_available": pitch_type_available,
         "pitch_type_factor": round(safe_float(pitch_type_factor, 1.0), 3),
@@ -8882,6 +9109,20 @@ def render_kproj_pitcher_card(p):
     line_badge = "good-badge" if d["line_source"] == "Underdog" else "yellow-badge"
     lineup_badge = "good-badge" if p.get("lineup_locked") else "yellow-badge"
     recent_html = kproj_bar_html(p.get("last_10_ks"))
+    # Mobile-friendly mechanics and attribution summaries.
+    velo_delta = safe_float(p.get('fastball_velo_delta'))
+    velo_display = "—" if velo_delta is None else f"{velo_delta:+.1f} mph"
+    velo_sub = "" if p.get('fastball_velo_recent') is None else f"Recent {p.get('fastball_velo_recent')} | Season {p.get('fastball_velo_season')}"
+    fstrike_display = "—" if p.get('first_strike_pct') is None else f"{safe_float(p.get('first_strike_pct'),0):.1f}%"
+    usage_note_display = html.escape(str(p.get('pitch_usage_note') or 'No major usage shift'))
+    attr_summary_display = html.escape(str(p.get('projection_attribution_summary') or 'Attribution unavailable'))
+    attr_rows = p.get('projection_attribution_rows') or []
+    attr_items = []
+    for ar in attr_rows[:5]:
+        impact = safe_float(ar.get('K Impact'), 0) or 0
+        sign = '+' if impact >= 0 else ''
+        attr_items.append(f"<div style='display:flex;justify-content:space-between;gap:10px;border-top:1px solid rgba(255,255,255,.07);padding:5px 0;'><span>{html.escape(str(ar.get('Layer','Layer')))}</span><b>{sign}{impact:.2f} K</b></div>")
+    attr_html = "".join(attr_items) if attr_items else "<div class='kpi-sub'>No attribution rows available</div>"
     st.markdown(f"""
     <div class="pick-card" style="border-color:rgba(90,100,255,.45);box-shadow:0 0 26px rgba(90,100,255,.16);">
       <div style="display:grid;grid-template-columns:1.25fr .75fr .75fr .75fr .9fr;gap:18px;align-items:center;">
@@ -8906,6 +9147,14 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Form</div><div class="kpi-value" style="font-size:15px;">{p.get('recent_vs_season_flag', '—')}</div><div class="kpi-sub">L3 {p.get('recent_form_l3', '—')} | L10 {p.get('recent_form_l10', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Velocity Trend</div><div class="kpi-value" style="font-size:18px;">{velo_display}</div><div class="kpi-sub">{velo_sub}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">F-Strike / Usage</div><div class="kpi-value" style="font-size:18px;">{fstrike_display}</div><div class="kpi-sub">{usage_note_display}</div></div>
+      </div>
+      <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
+        <div class="small-muted">Projection Attribution</div>
+        <div class="kpi-value" style="font-size:16px;">{attr_summary_display}</div>
+        <div class="kpi-sub" style="margin-top:4px;">{html.escape(str(p.get('mechanics_k_label','MECH_UNKNOWN')))} | {html.escape(str(p.get('mechanics_k_note',''))[:130])}</div>
+        <div class="kpi-sub" style="margin-top:6px;">{attr_html}</div>
       </div>
       <div class="kpi-sub" style="margin-top:8px;line-height:1.35;">{p.get('market_note','')}<br>{p.get('line_history_note','')}<br>{p.get('sharp_warning_note','')}<br>{p.get('innings_outcome_note','')}</div>
       <div class="hr-soft"></div>
@@ -9009,6 +9258,10 @@ def build_kproj_table(board):
             "Line Grade": p.get("line_history_grade"),
             "L10 Avg": p.get("line_l10_avg"),
             "Recent Form": p.get("recent_vs_season_flag"),
+            "Velo Δ": p.get("fastball_velo_delta"),
+            "F-Strike%": p.get("first_strike_pct"),
+            "Mechanics": p.get("mechanics_k_label"),
+            "Attrib": p.get("projection_attribution_summary"),
             "Matchup Hist Score": p.get("matchup_history_score"),
             "Matchup Hist Label": p.get("matchup_history_label"),
             "Hit Rate %": None if d.get("hit_rate") is None else round(d.get("hit_rate") * 100, 1),
