@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + SABER DIPS + MECHANICS ATTRIBUTION"
+APP_VERSION = "v11.17 K PROJ UPSIDE + MONEYBALL HITS/RBI + ML 2.0"
 
 try:
     import pytz
@@ -72,6 +72,7 @@ UNDERDOG_URLS = [
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
+SHARPAPI_BASE = "https://api.sharpapi.io/api/v1"
 
 SPORTSBOOK_PITCHER_K_MARKETS = [
     "pitcher_strikeouts",
@@ -218,7 +219,13 @@ def get_secret(key, default=""):
     except Exception:
         return os.getenv(key, default)
 
-ODDS_API_KEY = get_secret("ODDS_API_KEY", "")
+# SharpAPI is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
+# Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
+ODDS_API_KEY = ""  # Disabled: old OddsAPI path is not active in get_sportsbook_k_data().
+SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
+# Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
+# It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
+MANUAL_MARKET_ODDS_TEXT = ""
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
@@ -1097,7 +1104,7 @@ def get_pitcher_profile(pid):
         f"{MLB_BASE}/people/{pid}/stats",
         params={"stats": "season", "group": "pitching"}
     )
-    default = {"Pitcher K%": LEAGUE_AVG_K, "BF": 0, "SO": 0, "BB": None, "HR": None, "IP": None, "AVG IP": None, "K/9": None, "BB%": None, "K-BB%": None, "FIP": None, "xFIP": None, "SIERA": None, "source": "Fallback league avg"}
+    default = {"Pitcher K%": LEAGUE_AVG_K, "BF": 0, "SO": 0, "BB": None, "HR": None, "IP": None, "AVG IP": None, "K/9": None, "BB%": None, "K-BB%": None, "BABIP": None, "FIP": None, "xFIP": None, "SIERA": None, "source": "Fallback league avg"}
     try:
         split = get_first_stat_split(data)
         if not split:
@@ -1107,6 +1114,8 @@ def get_pitcher_profile(pid):
         so = safe_float(stat.get("strikeOuts"), 0) or 0
         bb = safe_float(stat.get("baseOnBalls"), 0) or 0
         hr = safe_float(stat.get("homeRuns"), 0) or 0
+        hits_allowed = safe_float(stat.get("hits"), 0) or 0
+        hbp_allowed = safe_float(stat.get("hitByPitch"), 0) or 0
         bf = safe_float(stat.get("battersFaced"), 0) or 0
         gs = safe_float(stat.get("gamesStarted"), None)
         gp = safe_float(stat.get("gamesPlayed"), 0) or 0
@@ -1116,6 +1125,9 @@ def get_pitcher_profile(pid):
         kbb_pct = (k_pct - bb_pct) if bb_pct is not None else None
         k9 = so / ip * 9 if ip and ip > 0 else None
         avg_ip = ip / starts if starts and starts > 0 and ip else None
+        # Pitcher BABIP regression signal: DIPS-style context only. It should not drive K projection.
+        balls_in_play = max(0.0, bf - so - bb - hbp_allowed - hr)
+        pitcher_babip = ((hits_allowed - hr) / balls_in_play) if balls_in_play > 0 else None
         shrunk = ((k_pct * bf) + (LEAGUE_AVG_K * 150)) / max(bf + 150, 1)
         dips = build_dips_metrics_from_counts(so=so, bb=bb, hr=hr, ip=ip, bf=bf)
         return {
@@ -1124,6 +1136,7 @@ def get_pitcher_profile(pid):
             "AVG IP": avg_ip, "K/9": k9,
             "BB%": None if bb_pct is None else float(bb_pct),
             "K-BB%": None if kbb_pct is None else float(kbb_pct),
+            "BABIP": None if pitcher_babip is None else float(clamp(pitcher_babip, 0.180, 0.430)),
             "FIP": dips.get("fip"), "xFIP": dips.get("xfip"), "SIERA": dips.get("siera"),
             "source": "Season K/BF + DIPS with shrink"
         }
@@ -4193,6 +4206,31 @@ def apply_dips_k_adjustment(pitcher_k, dips_profile, enabled=True):
     base = safe_float(pitcher_k, LEAGUE_AVG_K) or LEAGUE_AVG_K
     return float(clamp(base * factor, 0.08, 0.50)), dips_profile.get("note", f"DIPS K factor x{factor:.3f}")
 
+
+def build_babip_regression_profile(profile=None):
+    """DIPS-style BABIP regression context for pitcher volatility.
+
+    This is intentionally NOT a K-projection driver. It is a small reliability /
+    miss-reason context layer because BABIP can signal luck, defense noise, or
+    early-pull/run-damage risk.
+    """
+    prof = profile or {}
+    babip = safe_float(prof.get("BABIP"), None)
+    if babip is None:
+        return {"available": False, "babip": None, "score": 50, "label": "BABIP_UNKNOWN", "reliability_nudge": 0, "note": "BABIP unavailable"}
+    league = 0.300
+    diff = babip - league
+    if diff >= 0.055:
+        label, score, nudge = "UNLUCKY_HIGH_BABIP", 70, 2
+        note = f"BABIP {babip:.3f} above league {league:.3f}; possible positive regression, but watch run-damage volatility."
+    elif diff <= -0.045:
+        label, score, nudge = "LUCKY_LOW_BABIP", 38, -2
+        note = f"BABIP {babip:.3f} below league {league:.3f}; possible negative regression / run-prevention luck."
+    else:
+        label, score, nudge = "BABIP_NEUTRAL", 55, 0
+        note = f"BABIP {babip:.3f} near league {league:.3f}; neutral regression signal."
+    return {"available": True, "babip": round(float(babip), 3), "score": score, "label": label, "reliability_nudge": nudge, "note": note}
+
 def apply_pitch_type_matchup_adjustment(pitcher_k, pitcher_statcast, enabled=True):
     if not enabled or not pitcher_statcast or not pitcher_statcast.get("available"):
         return pitcher_k, "No pitch-type matchup adjustment", False, [], 1.0
@@ -5267,6 +5305,346 @@ def get_odds_events():
     data = safe_get_json(f"{ODDS_BASE}/sports/baseball_mlb/events", params={"apiKey": ODDS_API_KEY}, timeout=16)
     return data if isinstance(data, list) else []
 
+
+# =========================
+# SHARPAPI — MARKET ODDS ONLY
+# =========================
+# This layer is intentionally isolated from the projection engine. It only feeds:
+#   Market card, Sharp card, market agreement score, trap/disagreement warnings.
+# It should NOT directly change K projection, BF, IP, pitch count, or lineup logic.
+def _sharpapi_text_blob(obj):
+    try:
+        if isinstance(obj, dict):
+            vals = []
+            for k, v in obj.items():
+                if isinstance(v, (str, int, float)):
+                    vals.append(f"{k} {v}")
+            return " ".join(vals).lower()
+        return str(obj).lower()
+    except Exception:
+        return ""
+
+def _sharpapi_market_looks_like_pitcher_k(obj):
+    blob = _sharpapi_text_blob(obj)
+    # Keep this intentionally strict so moneyline/run total odds do not leak into K cards.
+    good_terms = [
+        "pitcher strikeout", "pitcher strikeouts", "player strikeout", "player strikeouts",
+        "strikeouts", "strikeout", "earned strikeouts", "total strikeouts", "k prop", " k "
+    ]
+    bad_terms = ["moneyline", "spread", "run line", "total runs", "home runs", "hits allowed", "walks allowed"]
+    if any(x in blob for x in bad_terms):
+        return False
+    return any(x in blob for x in good_terms)
+
+def _sharpapi_find_line(obj):
+    if not isinstance(obj, dict):
+        return None
+    keys = ["line", "point", "points", "handicap", "total", "threshold", "value"]
+    v = first_value(obj, keys)
+    line = safe_float(v)
+    if is_valid_k_line(line, allow_integer=True) is not None:
+        return float(line)
+    # Some APIs put line in strings like "Over 6.5".
+    for val in obj.values():
+        if isinstance(val, str):
+            vals = extract_k_lines_from_text(val)
+            if vals:
+                return float(vals[0])
+    return None
+
+def _sharpapi_find_price(obj, side=None):
+    if not isinstance(obj, dict):
+        return None
+    side_l = str(side or "").lower()
+    if side_l.startswith("over"):
+        keys = ["over_odds", "overOdds", "over_price", "overPrice", "overAmerican", "over_american"]
+        px = safe_float(first_value(obj, keys))
+        if px is not None:
+            return int(px)
+    if side_l.startswith("under"):
+        keys = ["under_odds", "underOdds", "under_price", "underPrice", "underAmerican", "under_american"]
+        px = safe_float(first_value(obj, keys))
+        if px is not None:
+            return int(px)
+    keys = ["price", "odds", "american_odds", "americanOdds", "american", "oddsAmerican"]
+    px = safe_float(first_value(obj, keys))
+    return None if px is None else int(px)
+
+def _sharpapi_find_side(obj):
+    if not isinstance(obj, dict):
+        return ""
+    vals = []
+    for k in ["side", "selection", "outcome", "name", "label", "type", "bet", "position"]:
+        v = obj.get(k)
+        if v is not None:
+            vals.append(str(v))
+    blob = " ".join(vals).lower()
+    if "over" in blob:
+        return "OVER"
+    if "under" in blob:
+        return "UNDER"
+    return ""
+
+def _sharpapi_player_candidate(obj):
+    if not isinstance(obj, dict):
+        return ""
+    keys = [
+        "player", "player_name", "playerName", "participant", "participant_name", "participantName",
+        "description", "selection_name", "selectionName", "name", "athlete", "athleteName"
+    ]
+    val = first_value(obj, keys)
+    return str(val or "")
+
+def _walk_json(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_json(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json(v)
+
+def _parse_sharpapi_pitcher_k_payload(data, player_name, game_home=None, game_away=None):
+    rows = []
+    seen = set()
+    if data is None:
+        return rows
+    for obj in _walk_json(data):
+        if not isinstance(obj, dict):
+            continue
+        blob = _sharpapi_text_blob(obj)
+        if not _sharpapi_market_looks_like_pitcher_k(obj):
+            continue
+        cand = _sharpapi_player_candidate(obj)
+        # If player field is not direct, allow blob-based player matching.
+        score = max(name_score(player_name, cand), name_score(player_name, blob[:200]))
+        if score < 0.78:
+            continue
+        line = _sharpapi_find_line(obj)
+        if line is None:
+            continue
+        provider = first_value(obj, ["sportsbook", "book", "bookmaker", "book_name", "bookName", "provider", "sportsbookName"]) or "SharpAPI"
+        market = first_value(obj, ["market", "market_name", "marketName", "stat", "stat_type", "prop", "category", "bet_type", "betType"]) or "pitcher_strikeouts"
+        # Case A: one object contains both over and under prices.
+        over_px = _sharpapi_find_price(obj, "OVER")
+        under_px = _sharpapi_find_price(obj, "UNDER")
+        if over_px is not None or under_px is not None:
+            for side, px in [("OVER", over_px), ("UNDER", under_px)]:
+                if px is None:
+                    continue
+                key = (str(provider), str(market), round(line, 2), side, int(px), round(score, 3))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "Source": "SharpAPI",
+                    "Provider": str(provider),
+                    "Player": player_name,
+                    "Matched Name": cand or player_name,
+                    "Match Score": round(score, 3),
+                    "Market": market,
+                    "Line": line,
+                    "Side": side,
+                    "Price": int(px),
+                    "Last Update": first_value(obj, ["updated_at", "last_update", "lastUpdate", "timestamp"]),
+                })
+            continue
+        # Case B: one object per outcome.
+        side = _sharpapi_find_side(obj)
+        px = _sharpapi_find_price(obj, side)
+        if side in ["OVER", "UNDER"] and px is not None:
+            key = (str(provider), str(market), round(line, 2), side, int(px), round(score, 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "Source": "SharpAPI",
+                "Provider": str(provider),
+                "Player": player_name,
+                "Matched Name": cand or player_name,
+                "Match Score": round(score, 3),
+                "Market": market,
+                "Line": line,
+                "Side": side,
+                "Price": int(px),
+                "Last Update": first_value(obj, ["updated_at", "last_update", "lastUpdate", "timestamp"]),
+            })
+    return rows
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_sharpapi_mlb_pitcher_k_lines(player_name, game_home=None, game_away=None):
+    """Return SharpAPI pitcher strikeout odds for Market/Sharp cards only.
+
+    This function is intentionally isolated from the projection engine. It may fill
+    the Market and Sharp UI boxes, but it never changes K projection, BF/IP, pitch
+    count, lineups, sabermetrics, DIPS, or Underdog active line selection.
+    """
+    if not SHARPAPI_KEY:
+        return source_result("SharpAPI", "DISABLED", rows=[], message="Add SHARPAPI_KEY to enable Market/Sharp odds")
+    headers = {"X-API-Key": SHARPAPI_KEY}
+    # Based on SharpAPI quick start. Keep league=MLB simple and parse defensively.
+    data = safe_get_json(f"{SHARPAPI_BASE}/odds", params={"league": "MLB"}, headers=headers, timeout=20)
+    if not data:
+        return source_result("SharpAPI", "FAILED", rows=[], message="SharpAPI call failed or returned empty data")
+    rows = _parse_sharpapi_pitcher_k_payload(data, player_name, game_home, game_away)
+    if not rows:
+        # Try a few common query variants without letting this touch projections.
+        for params in [
+            {"league": "MLB", "market": "pitcher_strikeouts"},
+            {"league": "MLB", "market": "player_strikeouts"},
+            {"league": "MLB", "sport": "baseball"},
+        ]:
+            data2 = safe_get_json(f"{SHARPAPI_BASE}/odds", params=params, headers=headers, timeout=20)
+            rows.extend(_parse_sharpapi_pitcher_k_payload(data2, player_name, game_home, game_away))
+            if rows:
+                break
+    if not rows:
+        return source_result("SharpAPI", "NO MATCH", rows=[], message="SharpAPI connected but no pitcher-K odds matched this player")
+    line_vals = [safe_float(r.get("Line")) for r in rows if safe_float(r.get("Line")) is not None]
+    consensus = float(np.median(line_vals)) if line_vals else None
+    return source_result("SharpAPI", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} SharpAPI pitcher-K outcomes")
+
+
+# =========================
+# THE ODDS API — MARKET ODDS ONLY
+# =========================
+# This layer is intentionally isolated from the projection engine. It only feeds:
+#   Market card, Sharp card, market agreement score, trap/disagreement warnings.
+# It should NOT directly change K projection, BF, IP, pitch count, or lineup logic.
+MLB_TEAM_ALIASES = {
+    "ARI": ["arizona diamondbacks", "diamondbacks", "ari", "arizona"],
+    "ATL": ["atlanta braves", "braves", "atl", "atlanta"],
+    "BAL": ["baltimore orioles", "orioles", "bal", "baltimore"],
+    "BOS": ["boston red sox", "red sox", "bos", "boston"],
+    "CHC": ["chicago cubs", "cubs", "chc"],
+    "CWS": ["chicago white sox", "white sox", "cws", "chw"],
+    "CIN": ["cincinnati reds", "reds", "cin", "cincinnati"],
+    "CLE": ["cleveland guardians", "guardians", "cle", "cleveland"],
+    "COL": ["colorado rockies", "rockies", "col", "colorado"],
+    "DET": ["detroit tigers", "tigers", "det", "detroit"],
+    "HOU": ["houston astros", "astros", "hou", "houston"],
+    "KC": ["kansas city royals", "royals", "kc", "kcr", "kansas city"],
+    "LAA": ["los angeles angels", "angels", "laa", "anaheim"],
+    "LAD": ["los angeles dodgers", "dodgers", "lad", "la dodgers"],
+    "MIA": ["miami marlins", "marlins", "mia", "miami"],
+    "MIL": ["milwaukee brewers", "brewers", "mil", "milwaukee"],
+    "MIN": ["minnesota twins", "twins", "min", "minnesota"],
+    "NYM": ["new york mets", "mets", "nym"],
+    "NYY": ["new york yankees", "yankees", "nyy"],
+    "ATH": ["athletics", "oakland athletics", "a's", "ath", "oakland", "sacramento athletics"],
+    "OAK": ["athletics", "oakland athletics", "a's", "ath", "oakland", "sacramento athletics"],
+    "PHI": ["philadelphia phillies", "phillies", "phi", "philadelphia"],
+    "PIT": ["pittsburgh pirates", "pirates", "pit", "pittsburgh"],
+    "SD": ["san diego padres", "padres", "sd", "sdp", "san diego"],
+    "SF": ["san francisco giants", "giants", "sf", "sfg", "san francisco"],
+    "SEA": ["seattle mariners", "mariners", "sea", "seattle"],
+    "STL": ["st louis cardinals", "st. louis cardinals", "cardinals", "stl", "st louis"],
+    "TB": ["tampa bay rays", "rays", "tb", "tbr", "tampa bay"],
+    "TEX": ["texas rangers", "rangers", "tex", "texas"],
+    "TOR": ["toronto blue jays", "blue jays", "tor", "toronto"],
+    "WSH": ["washington nationals", "nationals", "wsh", "was", "washington"],
+}
+
+def _team_alias_set(team):
+    raw = str(team or "").strip()
+    if not raw:
+        return set()
+    n = normalize_name(raw)
+    up = raw.upper().replace(".", "")
+    vals = {n, normalize_name(up)}
+    if up in MLB_TEAM_ALIASES:
+        vals.update(normalize_name(x) for x in MLB_TEAM_ALIASES[up])
+    for abbr, aliases in MLB_TEAM_ALIASES.items():
+        if n in {normalize_name(x) for x in aliases}:
+            vals.add(normalize_name(abbr))
+            vals.update(normalize_name(x) for x in aliases)
+    return {v for v in vals if v}
+
+def _odds_event_matches_game(event_obj, game_home, game_away):
+    home_aliases = _team_alias_set(game_home)
+    away_aliases = _team_alias_set(game_away)
+    target = home_aliases | away_aliases
+    ev_home = _team_alias_set(event_obj.get("home_team"))
+    ev_away = _team_alias_set(event_obj.get("away_team"))
+    if not target or not ev_home or not ev_away:
+        return False
+    # Require one event side to match each scheduled side when possible.
+    return bool(home_aliases & ev_home and away_aliases & ev_away) or bool(home_aliases & ev_away and away_aliases & ev_home) or bool(target & ev_home and target & ev_away)
+
+def _parse_oddsapi_pitcher_k_event(data, player_name, game_home=None, game_away=None):
+    rows = []
+    if not isinstance(data, dict):
+        return rows
+    if game_home or game_away:
+        if data.get("home_team") or data.get("away_team"):
+            if not _odds_event_matches_game(data, game_home, game_away):
+                return rows
+    for book in data.get("bookmakers", []) or []:
+        book_name = book.get("title") or book.get("key") or "Sportsbook"
+        for market in book.get("markets", []) or []:
+            if market.get("key") not in SPORTSBOOK_PITCHER_K_MARKETS:
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                desc = outcome.get("description") or outcome.get("player") or outcome.get("participant") or outcome.get("name") or ""
+                score = name_score(player_name, desc)
+                if score < 0.80:
+                    continue
+                point = safe_float(outcome.get("point"))
+                if point is None:
+                    continue
+                side = str(outcome.get("name", "")).upper()
+                # The Odds API usually has name = Over/Under and description = player.
+                if "OVER" not in side and "UNDER" not in side:
+                    blob = " ".join(str(outcome.get(k, "")) for k in ["name", "description", "label"])
+                    side = "OVER" if "over" in blob.lower() else "UNDER" if "under" in blob.lower() else side
+                rows.append({
+                    "Source": "OddsAPI",
+                    "Provider": book_name,
+                    "Player": player_name,
+                    "Matched Name": desc,
+                    "Match Score": round(score, 3),
+                    "Market": market.get("key"),
+                    "Line": point,
+                    "Side": side,
+                    "Price": outcome.get("price"),
+                    "Last Update": market.get("last_update") or book.get("last_update"),
+                    "Event": f"{data.get('away_team','')} @ {data.get('home_team','')}",
+                })
+    return rows
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_oddsapi_all_pitcher_k_lines(player_name, game_home=None, game_away=None):
+    """Fallback Odds API call for pitcher K markets across the slate.
+
+    This is market-only and intentionally does not alter the projection. It exists to
+    stop the Market/Sharp boxes from showing NO_MARKET when the event-id match misses
+    due to team-name differences like ATH/OAK/Sacramento Athletics.
+    """
+    if not ODDS_API_KEY:
+        return source_result("Sportsbook", "DISABLED", rows=[], message="Add ODDS_API_KEY to Streamlit secrets or environment")
+    data = safe_get_json(
+        f"{ODDS_BASE}/sports/baseball_mlb/odds",
+        params={
+            "apiKey": ODDS_API_KEY,
+            "regions": "us,us2",
+            # Official Odds API MLB player prop keys: pitcher_strikeouts and pitcher_strikeouts_alternate.
+            # Keep the extra aliases in the parser, but request only real API markets here.
+            "markets": "pitcher_strikeouts,pitcher_strikeouts_alternate",
+            "oddsFormat": "american",
+        },
+        timeout=20,
+    )
+    if not isinstance(data, list):
+        return source_result("Sportsbook", "FAILED", rows=[], message="Odds API call failed, quota blocked, or plan does not include MLB player props")
+    rows = []
+    for ev in data:
+        rows.extend(_parse_oddsapi_pitcher_k_event(ev, player_name, game_home, game_away))
+    if not rows:
+        return source_result("Sportsbook", "NO MATCH", rows=[], message="No Odds API pitcher-K market matched this pitcher/game")
+    line_vals = [safe_float(r.get("Line")) for r in rows if safe_float(r.get("Line")) is not None]
+    consensus = float(np.median(line_vals)) if line_vals else None
+    return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} Odds API outcomes from all-slate prop search")
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     if not event_id:
@@ -5278,21 +5656,7 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     )
     if not data or (isinstance(data, dict) and data.get("message")):
         return source_result("Sportsbook", "FAILED", rows=[], message="Event odds call failed or plan has no player props")
-    rows = []
-    for book in data.get("bookmakers", []):
-        book_name = book.get("title") or book.get("key") or "Sportsbook"
-        for market in book.get("markets", []):
-            if market.get("key") not in SPORTSBOOK_PITCHER_K_MARKETS:
-                continue
-            for outcome in market.get("outcomes", []):
-                desc = outcome.get("description") or outcome.get("player") or outcome.get("participant") or outcome.get("name") or ""
-                score = name_score(player_name, desc)
-                if score < 0.80:
-                    continue
-                point = safe_float(outcome.get("point"))
-                if point is None:
-                    continue
-                rows.append({"Source": "OddsAPI", "Provider": book_name, "Player": player_name, "Matched Name": desc, "Match Score": round(score, 3), "Market": market.get("key"), "Line": point, "Side": str(outcome.get("name", "")).upper(), "Price": outcome.get("price"), "Last Update": market.get("last_update") or book.get("last_update")})
+    rows = _parse_oddsapi_pitcher_k_event(data, player_name)
     if not rows:
         return source_result("Sportsbook", "NO MATCH", rows=[], message="No sportsbook K prop matched this pitcher")
     line_vals = [safe_float(r["Line"]) for r in rows if safe_float(r.get("Line")) is not None]
@@ -5300,16 +5664,52 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} sportsbook outcomes")
 
 def get_sportsbook_k_data(game_home, game_away, player_name):
-    events = get_odds_events()
-    event_id = None
-    target_teams = {normalize_name(game_home), normalize_name(game_away)}
-    for ev in events:
-        home = normalize_name(ev.get("home_team"))
-        away = normalize_name(ev.get("away_team"))
-        if {home, away} == target_teams or (home in target_teams and away in target_teams):
-            event_id = ev.get("id")
-            break
-    return get_sportsbook_event_pitcher_k_lines(event_id, player_name)
+    """Return real sportsbook K odds from SharpAPI for market/sharp only.
+
+    Projection independence rule: this source is never used to change pitcher skill,
+    BF, IP, pitch count, lineups, sabermetrics, DIPS, or active Underdog line.
+    It only fills Market / Sharp / agreement cards.
+    """
+    return get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
+
+def get_manual_market_k_data(player_name, active_line=None):
+    """Manual sportsbook odds fallback for Market/Sharp cards only.
+
+    Format accepted in the sidebar, one row per pitcher:
+      Pitcher Name, Line, OverOdds, UnderOdds
+      Cristopher Sanchez, 6.5, -145, +115
+
+    This never participates in active line selection or K projection. It only adds
+    priced rows that build_market_odds_intelligence() can read for the card.
+    """
+    txt = str(globals().get("MANUAL_MARKET_ODDS_TEXT", "") or "").strip()
+    if not txt:
+        return source_result("ManualMarket", "OFF", rows=[], message="Manual market odds empty")
+    rows = []
+    for raw in txt.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Accept comma, pipe, tab, or semicolon separators.
+        parts = [p.strip() for p in re.split(r"[,|;\t]+", line) if p.strip()]
+        if len(parts) < 4:
+            continue
+        nm = parts[0]
+        k_line = is_valid_k_line(safe_float(parts[1]), allow_integer=True)
+        over_px = safe_float(parts[2].replace("+", "")) if isinstance(parts[2], str) else safe_float(parts[2])
+        under_px = safe_float(parts[3].replace("+", "")) if isinstance(parts[3], str) else safe_float(parts[3])
+        if k_line is None or name_score(player_name, nm) < 0.80:
+            continue
+        # If an active UD/PP line exists, only use manual prices at that line so it cannot shift decisions.
+        if active_line is not None and safe_float(k_line) != safe_float(active_line):
+            continue
+        if over_px is not None:
+            rows.append({"Source": "ManualMarket", "Provider": "Manual", "Player": player_name, "Matched Name": nm, "Match Score": round(name_score(player_name, nm), 3), "Market": "pitcher_strikeouts", "Line": k_line, "Side": "OVER", "Price": int(over_px)})
+        if under_px is not None:
+            rows.append({"Source": "ManualMarket", "Provider": "Manual", "Player": player_name, "Matched Name": nm, "Match Score": round(name_score(player_name, nm), 3), "Market": "pitcher_strikeouts", "Line": k_line, "Side": "UNDER", "Price": int(under_px)})
+    if not rows:
+        return source_result("ManualMarket", "NO MATCH", rows=[], message="No manual market row matched this pitcher/line")
+    return source_result("ManualMarket", "FOUND", rows=rows, line=safe_float(rows[0].get("Line")), message=f"Manual market odds matched: {len(rows)} rows")
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_prizepicks_k_data(player_name):
@@ -6568,6 +6968,14 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         dips_k_note = dips_k_profile.get("note")
     pitcher_k_after_dips = safe_float(pitcher_k, pitcher_k_after_mechanics) or pitcher_k_after_mechanics
 
+    # BABIP regression: small DIPS context / reliability note only; it does not alter K%.
+    try:
+        babip_regression_profile = build_babip_regression_profile(profile)
+        babip_regression_note = babip_regression_profile.get("note", "BABIP unavailable")
+    except Exception as _babip_e:
+        babip_regression_profile = {"available": False, "babip": None, "score": 50, "label": "BABIP_ERROR", "reliability_nudge": 0, "note": f"BABIP regression skipped: {_babip_e}"}
+        babip_regression_note = babip_regression_profile.get("note")
+
     # v11.4 run-damage / game-script risk
     try:
         pitcher_damage_profile = pitcher_run_damage_profile(pid, recent_rows=recent_rows, statcast_profile=statcast_profile)
@@ -6768,7 +7176,12 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     sgo_data = get_sportsgameodds_k_data(pitcher_name) if use_sgo else source_result("SportsGameOdds", "OFF", message="Optional source turned off")
     optic_data = get_opticodds_k_data(pitcher_name) if use_optic else source_result("OpticOdds", "OFF", message="Optional source turned off")
 
-    active_line, active_source, consensus = choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data)
+    # Keep The Odds API isolated to Market/Sharp only. It should NOT set or shift the active K line.
+    # Active line still comes from Underdog/PrizePicks/optional sources.
+    market_only_blank = source_result("Sportsbook", "MARKET_ONLY", line=None, rows=[], message="Odds API kept out of active-line selection")
+    active_line, active_source, consensus = choose_active_line(market_only_blank, pp_data, ud_data, sgo_data, optic_data)
+
+    manual_market_data = get_manual_market_k_data(pitcher_name, active_line)
 
     # v11.8 TRUE CALIBRATION ENGINE:
     # Uses only graded official snapshots. It shifts projection slightly by proven bias buckets,
@@ -6841,7 +7254,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         price_is_real = False
         price_source = "NO REAL PRICE"
         priced_rows = []
-        for src in [sportsbook_data, sgo_data, optic_data]:
+        for src in [sportsbook_data, manual_market_data, sgo_data, optic_data]:
             priced_rows.extend(src.get("rows", []))
         market_intel = build_market_odds_intelligence(priced_rows, active_line, pick_side, fair_prob)
         line_history = build_line_history_audit(recent_rows, active_line, projection=mean)
@@ -6988,6 +7401,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         risk_notes = (risk_notes + "; " if risk_notes else "") + str(sabermetric_k_note)
     if "dips_k_note" in locals() and dips_k_note:
         risk_notes = (risk_notes + "; " if risk_notes else "") + str(dips_k_note)
+    if "babip_regression_note" in locals() and babip_regression_note:
+        risk_notes = (risk_notes + "; " if risk_notes else "") + str(babip_regression_note)
     if true_projection_calibration.get("note"):
         risk_notes = (risk_notes + "; " if risk_notes else "") + true_projection_calibration.get("note")
     if true_probability_calibration.get("note"):
@@ -7275,6 +7690,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "fip": dips_k_profile.get("fip") if "dips_k_profile" in locals() else None,
         "xfip": dips_k_profile.get("xfip") if "dips_k_profile" in locals() else None,
         "dips_k_note": dips_k_note if "dips_k_note" in locals() else "DIPS unavailable",
+        "pitcher_babip": babip_regression_profile.get("babip") if "babip_regression_profile" in locals() else None,
+        "babip_regression_score": babip_regression_profile.get("score") if "babip_regression_profile" in locals() else 50,
+        "babip_regression_label": babip_regression_profile.get("label") if "babip_regression_profile" in locals() else "BABIP_UNKNOWN",
+        "babip_regression_note": babip_regression_note if "babip_regression_note" in locals() else "BABIP unavailable",
         "mechanics_k_score": mechanics_k_profile.get("score") if "mechanics_k_profile" in locals() else 50,
         "mechanics_k_label": mechanics_k_profile.get("label") if "mechanics_k_profile" in locals() else "MECH_UNKNOWN",
         "mechanics_k_factor": mechanics_k_profile.get("k_factor") if "mechanics_k_profile" in locals() else 1.0,
@@ -7892,6 +8311,16 @@ with st.sidebar:
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
     use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
     use_optic = st.checkbox("Optional: OpticOdds API", value=False)
+    st.divider()
+    st.header("Market Odds Fallback")
+    st.caption("Optional. Only fills Market/Sharp cards. Does not change K projection, BF/IP, pitch count, lineups, or Underdog line.")
+    MANUAL_MARKET_ODDS_TEXT = st.text_area(
+        "Manual sportsbook odds",
+        value="",
+        height=90,
+        placeholder="Pitcher Name, Line, OverOdds, UnderOdds\nCristopher Sanchez, 6.5, -145, +115",
+        help="Use when Odds API does not return pitcher props. One pitcher per line.",
+    )
     if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
         st.cache_data.clear()
         st.session_state.loaded_picks = []
@@ -9115,6 +9544,8 @@ def render_kproj_pitcher_card(p):
     velo_sub = "" if p.get('fastball_velo_recent') is None else f"Recent {p.get('fastball_velo_recent')} | Season {p.get('fastball_velo_season')}"
     fstrike_display = "—" if p.get('first_strike_pct') is None else f"{safe_float(p.get('first_strike_pct'),0):.1f}%"
     usage_note_display = html.escape(str(p.get('pitch_usage_note') or 'No major usage shift'))
+    babip_display = '—' if p.get('pitcher_babip') is None else f"{safe_float(p.get('pitcher_babip'),0):.3f}"
+    babip_sub_display = html.escape(str(p.get('babip_regression_label') or 'BABIP_UNKNOWN'))
     attr_summary_display = html.escape(str(p.get('projection_attribution_summary') or 'Attribution unavailable'))
     attr_rows = p.get('projection_attribution_rows') or []
     attr_items = []
@@ -9149,6 +9580,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Form</div><div class="kpi-value" style="font-size:15px;">{p.get('recent_vs_season_flag', '—')}</div><div class="kpi-sub">L3 {p.get('recent_form_l3', '—')} | L10 {p.get('recent_form_l10', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Velocity Trend</div><div class="kpi-value" style="font-size:18px;">{velo_display}</div><div class="kpi-sub">{velo_sub}</div></div>
         <div class="mobile-info-card"><div class="small-muted">F-Strike / Usage</div><div class="kpi-value" style="font-size:18px;">{fstrike_display}</div><div class="kpi-sub">{usage_note_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">BABIP Regression</div><div class="kpi-value" style="font-size:18px;">{babip_display}</div><div class="kpi-sub">{babip_sub_display}</div></div>
       </div>
       <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
         <div class="small-muted">Projection Attribution</div>
@@ -9409,6 +9841,221 @@ def ml_team_score_from_pitcher(p):
         score -= 2
     return float(clamp(score, 25, 78))
 
+
+# =========================
+# MONEYLINE TEAM-WIN LOGIC 2.0
+# Separate from all prop engines. These factors only feed the Moneyline tab.
+# =========================
+MLB_AVG_RUNS_PER_GAME = 4.45
+MLB_AVG_OBP = 0.315
+MLB_AVG_OPS = 0.715
+
+ML_PARK_RUN_FACTORS = {
+    "Coors Field": 1.12,
+    "Great American Ball Park": 1.06,
+    "Fenway Park": 1.05,
+    "Citizens Bank Park": 1.04,
+    "Yankee Stadium": 1.03,
+    "Globe Life Field": 1.02,
+    "Chase Field": 1.02,
+    "Wrigley Field": 1.01,
+    "Dodger Stadium": 0.99,
+    "Oracle Park": 0.96,
+    "T-Mobile Park": 0.96,
+    "Petco Park": 0.95,
+    "Comerica Park": 0.97,
+    "PNC Park": 0.98,
+    "loanDepot park": 0.97,
+    "Oakland Coliseum": 0.94,
+}
+
+def _ml_stat_number(stat, *keys, default=None):
+    for k in keys:
+        v = safe_float((stat or {}).get(k), None)
+        if v is not None:
+            return v
+    return default
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def ml_team_hitting_profile(team_id):
+    """Team offense profile for Moneyline + light Hits/RBI run-environment support."""
+    empty = {
+        "available": False,
+        "team_id": team_id,
+        "games": None,
+        "runs_pg": MLB_AVG_RUNS_PER_GAME,
+        "baseruns_pg": MLB_AVG_RUNS_PER_GAME,
+        "obp": MLB_AVG_OBP,
+        "ops": MLB_AVG_OPS,
+        "lineup_strength_score": 50,
+        "message": "Team hitting profile unavailable; neutral run environment",
+    }
+    if not team_id:
+        return empty
+    try:
+        data = safe_get_json(f"{MLB_BASE}/teams/{int(team_id)}/stats", params={"stats":"season", "group":"hitting"}, timeout=12) or {}
+        split = get_first_stat_split(data)
+        stat = (split or {}).get("stat", {})
+        g = _ml_stat_number(stat, "gamesPlayed", "games", default=0) or 0
+        runs = _ml_stat_number(stat, "runs", default=0) or 0
+        h = _ml_stat_number(stat, "hits", default=0) or 0
+        doubles = _ml_stat_number(stat, "doubles", default=0) or 0
+        triples = _ml_stat_number(stat, "triples", default=0) or 0
+        hr = _ml_stat_number(stat, "homeRuns", default=0) or 0
+        bb = _ml_stat_number(stat, "baseOnBalls", default=0) or 0
+        hbp = _ml_stat_number(stat, "hitByPitch", default=0) or 0
+        ab = _ml_stat_number(stat, "atBats", default=0) or 0
+        sf = _ml_stat_number(stat, "sacFlies", default=0) or 0
+        sb = _ml_stat_number(stat, "stolenBases", default=0) or 0
+        cs = _ml_stat_number(stat, "caughtStealing", default=0) or 0
+        tb = _ml_stat_number(stat, "totalBases", default=None)
+        if tb is None:
+            singles = max(0, h - doubles - triples - hr)
+            tb = singles + 2*doubles + 3*triples + 4*hr
+        denom_obp = ab + bb + hbp + sf
+        obp = (h + bb + hbp) / denom_obp if denom_obp > 0 else MLB_AVG_OBP
+        slg = tb / ab if ab > 0 else None
+        ops = obp + slg if slg is not None else MLB_AVG_OPS
+        runs_pg = runs / g if g > 0 else MLB_AVG_RUNS_PER_GAME
+        # BaseRuns-style estimate using only common MLB team fields. This is intentionally capped.
+        A = max(0.0, h + bb + hbp - hr)
+        B = max(0.0, (1.4 * tb) - (0.6 * h) - (3.0 * hr) + (0.1 * (bb + hbp)) + (0.9 * (sb - cs)))
+        C = max(1.0, ab - h)
+        D = max(0.0, hr)
+        baseruns = (A * B / max(B + C, 1e-9)) + D
+        baseruns_pg = baseruns / g if g > 0 else MLB_AVG_RUNS_PER_GAME
+        lineup_strength = 50
+        lineup_strength += clamp((obp - MLB_AVG_OBP) * 260, -12, 14)
+        lineup_strength += clamp((ops - MLB_AVG_OPS) * 55, -10, 12)
+        lineup_strength += clamp((baseruns_pg - MLB_AVG_RUNS_PER_GAME) * 6.5, -10, 12)
+        return {
+            "available": True,
+            "team_id": team_id,
+            "games": g,
+            "runs_pg": round(runs_pg, 3),
+            "baseruns_pg": round(baseruns_pg, 3),
+            "obp": round(obp, 3),
+            "ops": round(ops, 3),
+            "lineup_strength_score": int(round(clamp(lineup_strength, 20, 80))),
+            "message": f"BaseRuns {baseruns_pg:.2f}/G, OBP {obp:.3f}, OPS {ops:.3f}",
+        }
+    except Exception as e:
+        out = dict(empty)
+        out["message"] = f"Team hitting profile unavailable: {e}"
+        return out
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def ml_team_pitching_allowed_profile(team_id):
+    """Run-prevention profile used only by the Moneyline tab."""
+    empty = {"available": False, "runs_allowed_pg": MLB_AVG_RUNS_PER_GAME, "message": "Pitching allowed profile unavailable"}
+    if not team_id:
+        return empty
+    try:
+        data = safe_get_json(f"{MLB_BASE}/teams/{int(team_id)}/stats", params={"stats":"season", "group":"pitching"}, timeout=12) or {}
+        split = get_first_stat_split(data)
+        stat = (split or {}).get("stat", {})
+        g = _ml_stat_number(stat, "gamesPlayed", "games", default=0) or 0
+        ra = _ml_stat_number(stat, "runs", default=None)
+        if ra is None:
+            ra = _ml_stat_number(stat, "earnedRuns", default=0) or 0
+        ra_pg = float(ra) / g if g > 0 else MLB_AVG_RUNS_PER_GAME
+        return {"available": True, "runs_allowed_pg": round(ra_pg, 3), "message": f"Runs allowed {ra_pg:.2f}/G"}
+    except Exception as e:
+        out = dict(empty)
+        out["message"] = f"Pitching allowed profile unavailable: {e}"
+        return out
+
+def ml_pythagorean_win_pct(rs_pg, ra_pg, exponent=1.83):
+    rs = max(0.1, safe_float(rs_pg, MLB_AVG_RUNS_PER_GAME) or MLB_AVG_RUNS_PER_GAME)
+    ra = max(0.1, safe_float(ra_pg, MLB_AVG_RUNS_PER_GAME) or MLB_AVG_RUNS_PER_GAME)
+    return (rs ** exponent) / ((rs ** exponent) + (ra ** exponent))
+
+def ml_park_factor_from_pitcher_rows(ap, hp):
+    venue = str((ap or {}).get("venue") or (hp or {}).get("venue") or "")
+    factor = ML_PARK_RUN_FACTORS.get(venue, 1.00)
+    label = "NEUTRAL"
+    if factor >= 1.04:
+        label = "HITTER_FRIENDLY"
+    elif factor <= 0.97:
+        label = "PITCHER_FRIENDLY"
+    return factor, label, venue or "Unknown venue"
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def ml_team_rest_edge(team_id, game_date):
+    """Simple travel/rest proxy: off day = plus, previous-day game/doubleheader = small tax."""
+    if not team_id or not game_date:
+        return 0.0, "REST_UNKNOWN"
+    try:
+        d = datetime.strptime(str(game_date)[:10], "%Y-%m-%d")
+        prev = (d - timedelta(days=1)).strftime("%Y-%m-%d")
+        sched = safe_get_json(f"{MLB_BASE}/schedule", params={"sportId":1, "teamId":int(team_id), "date":prev}, timeout=10) or {}
+        games = []
+        for dd in sched.get("dates", []):
+            games.extend(dd.get("games", []) or [])
+        if len(games) <= 0:
+            return 1.5, "REST_ADVANTAGE"
+        if len(games) >= 2:
+            return -2.0, "DOUBLEHEADER_TAX"
+        return -0.3, "PLAYED_YESTERDAY"
+    except Exception:
+        return 0.0, "REST_UNKNOWN"
+
+def ml_moneyline_factors(team_abbr, team_pitcher_row, opp_pitcher_row):
+    """Returns team model score + transparent factor details for the ML tab only."""
+    team_id = (team_pitcher_row or {}).get("team_id")
+    opp_id = (team_pitcher_row or {}).get("opp_team_id")
+    game_date = (team_pitcher_row or {}).get("date")
+    hit = ml_team_hitting_profile(team_id)
+    allow = ml_team_pitching_allowed_profile(team_id)
+    opp_hit = ml_team_hitting_profile(opp_id)
+    sp_score = ml_team_score_from_pitcher(team_pitcher_row)
+    opp_sp_score = ml_team_score_from_pitcher(opp_pitcher_row)
+    pyth = ml_pythagorean_win_pct(hit.get("runs_pg"), allow.get("runs_allowed_pg"))
+    bp_usage = get_recent_team_bullpen_usage(team_id, game_date, lookback_days=3) if team_id else {"available": False, "label":"UNKNOWN", "message":"Bullpen unavailable"}
+    bp_label = bp_usage.get("label", "UNKNOWN")
+    bp_adj = 0.0
+    if bp_label == "FRESH":
+        bp_adj = 2.0
+    elif bp_label == "TIRED":
+        bp_adj = -2.5
+    rest_adj, rest_label = ml_team_rest_edge(team_id, game_date)
+    park_factor, park_label, venue = ml_park_factor_from_pitcher_rows(team_pitcher_row, opp_pitcher_row)
+    # Hitter-friendly parks help the better offense slightly, pitcher parks help the better SP side slightly.
+    offense_delta = (hit.get("lineup_strength_score", 50) - opp_hit.get("lineup_strength_score", 50)) / 50.0
+    park_adj = clamp((park_factor - 1.0) * 18.0 * offense_delta, -2.0, 2.0)
+    # Blend team true strength + starting pitcher + bullpen/rest/park. Kept capped to avoid ML overpowering props.
+    score = 50.0
+    score += clamp((pyth - 0.500) * 70, -10, 10)
+    score += clamp((hit.get("baseruns_pg", MLB_AVG_RUNS_PER_GAME) - MLB_AVG_RUNS_PER_GAME) * 4.2, -8, 8)
+    score += clamp((hit.get("lineup_strength_score", 50) - 50) * 0.22, -7, 7)
+    score += clamp((sp_score - opp_sp_score) * 0.18, -7, 7)
+    score += bp_adj + rest_adj + park_adj
+    return float(clamp(score, 25, 78)), {
+        "BaseRuns/G": round(hit.get("baseruns_pg", MLB_AVG_RUNS_PER_GAME), 2),
+        "Pyth Win%": round(pyth * 100, 1),
+        "Lineup Strength": hit.get("lineup_strength_score"),
+        "Bullpen": bp_label,
+        "Bullpen Adj": round(bp_adj, 1),
+        "Rest": rest_label,
+        "Rest Adj": round(rest_adj, 1),
+        "Park": park_label,
+        "Park Factor": round(park_factor, 3),
+        "Park Adj": round(park_adj, 1),
+        "Venue": venue,
+    }
+
+def ml_factor_summary(factors):
+    if not isinstance(factors, dict):
+        return "—"
+    return (
+        f"BsR {factors.get('BaseRuns/G','—')}/G • "
+        f"Pyth {factors.get('Pyth Win%','—')}% • "
+        f"LU {factors.get('Lineup Strength','—')} • "
+        f"BP {factors.get('Bullpen','—')} • "
+        f"Rest {factors.get('Rest','—')} • "
+        f"Park {factors.get('Park','—')}"
+    )
+
 def ml_build_board(board):
     odds = ml_fetch_oddsapi_h2h()
     games = {}
@@ -9427,7 +10074,8 @@ def ml_build_board(board):
         ps = g["pitchers"]
         ap = next((p for p in ps if str(p.get("team") or "").upper()==a.upper()), None) or (ps[0] if ps else {})
         hp = next((p for p in ps if str(p.get("team") or "").upper()==h.upper()), None) or (ps[1] if len(ps)>1 else {})
-        ascore, hscore = ml_team_score_from_pitcher(ap), ml_team_score_from_pitcher(hp)
+        ascore, afactors = ml_moneyline_factors(a, ap, hp)
+        hscore, hfactors = ml_moneyline_factors(h, hp, ap)
         total = max(ascore+hscore, 1e-9)
         amodel = clamp(ascore/total*100, 25, 75)
         hmodel = 100-amodel
@@ -9456,7 +10104,21 @@ def ml_build_board(board):
             "Away Price": og.get("away_price") if og else None, "Home Price": og.get("home_price") if og else None,
             "Away SP": ap.get("pitcher","—") if isinstance(ap,dict) else "—",
             "Home SP": hp.get("pitcher","—") if isinstance(hp,dict) else "—",
-            "Source": "OddsAPI + K board" if og else "K board model only"
+            "Away BaseRuns/G": afactors.get("BaseRuns/G"),
+            "Home BaseRuns/G": hfactors.get("BaseRuns/G"),
+            "Away Pyth Win%": afactors.get("Pyth Win%"),
+            "Home Pyth Win%": hfactors.get("Pyth Win%"),
+            "Away Lineup Strength": afactors.get("Lineup Strength"),
+            "Home Lineup Strength": hfactors.get("Lineup Strength"),
+            "Away Bullpen": afactors.get("Bullpen"),
+            "Home Bullpen": hfactors.get("Bullpen"),
+            "Away Rest": afactors.get("Rest"),
+            "Home Rest": hfactors.get("Rest"),
+            "Park": afactors.get("Park"),
+            "Park Factor": afactors.get("Park Factor"),
+            "Away ML Factors": ml_factor_summary(afactors),
+            "Home ML Factors": ml_factor_summary(hfactors),
+            "Source": "OddsAPI + ML 2.0" if og else "ML 2.0 model only"
         })
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -9513,6 +10175,8 @@ def render_moneyline_logo_card(r):
           <div class="small-muted">Moneyline Edge • Logo Card</div>
           <div class="player-name">{html.escape(matchup)}</div>
           <div class="small-muted">Source: {html.escape(str(r.get("Source","—")))}</div>
+          <div class="small-muted">Away: {html.escape(str(r.get("Away ML Factors","—")))}</div>
+          <div class="small-muted">Home: {html.escape(str(r.get("Home ML Factors","—")))}</div>
         </div>
         <div class="badge {badge_cls}">{html.escape(grade)}</div>
       </div>
@@ -9616,11 +10280,479 @@ def render_moneyline_edge_tab(board, dates=None):
 
 
 
+
+
+# =========================
+# BATTER PROP TABS — HITS + RBI (UNDERDOG LINE ONLY)
+# =========================
+# Isolated batter-prop module. This does NOT change K projections, BF/IP,
+# pitcher cards, market/sharp boxes, or Underdog pitcher-K line selection.
+# It only builds separate tabs for Underdog batter Hits and RBI lines.
+
+BATTER_PROP_MARKETS = {
+    "HITS": {
+        "label": "Batter Hits",
+        "terms": ["hits", "hit"],
+        "bad_terms": ["hits allowed", "pitcher hits", "hits+runs", "hits + runs", "h+r+rbi", "hr+rbi", "total bases", "fantasy"],
+        "min_line": 0.5,
+        "max_line": 3.5,
+    },
+    "RBI": {
+        "label": "Batter RBI",
+        "terms": ["rbi", "runs batted in", "runs batted"],
+        "bad_terms": ["hits+runs", "hits + runs", "h+r+rbi", "fantasy", "team rbi"],
+        "min_line": 0.5,
+        "max_line": 4.5,
+    },
+}
+
+
+def _bp_attrs(obj):
+    return obj.get("attributes", obj) if isinstance(obj, dict) else {}
+
+
+def _bp_collect_objects(obj, parent_key=""):
+    out = []
+    if isinstance(obj, dict):
+        if "type" in obj or "attributes" in obj or "relationships" in obj or any(k in obj for k in ["title", "name", "line", "stat_value"]):
+            x = dict(obj)
+            x["_parent_key"] = parent_key
+            out.append(x)
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                out.extend(_bp_collect_objects(v, str(k)))
+    elif isinstance(obj, list):
+        for v in obj:
+            out.extend(_bp_collect_objects(v, parent_key))
+    return out
+
+
+def _bp_text_from_obj(obj):
+    if not isinstance(obj, dict):
+        return ""
+    vals = []
+    a = _bp_attrs(obj)
+    for d in [obj, a]:
+        if not isinstance(d, dict):
+            continue
+        for k, v in d.items():
+            if isinstance(v, (str, int, float, bool)):
+                vals.append(f"{k} {v}")
+    try:
+        vals.append(json.dumps(obj, default=str)[:1400])
+    except Exception:
+        pass
+    return " | ".join(vals)
+
+
+def _bp_market_from_text(text):
+    low = str(text or "").lower()
+    for market, cfg in BATTER_PROP_MARKETS.items():
+        if any(bad in low for bad in cfg["bad_terms"]):
+            continue
+        if any(term in low for term in cfg["terms"]):
+            # Keep hitter props away from pitcher prop rows.
+            if "allowed" in low or "pitcher" in low and market == "HITS":
+                continue
+            return market
+    return None
+
+
+def _bp_extract_line_from_text(text, market):
+    import re
+    cfg = BATTER_PROP_MARKETS.get(market, {})
+    mn = cfg.get("min_line", 0.5)
+    mx = cfg.get("max_line", 4.5)
+    vals = []
+    for m in re.finditer(r"(?<!\d)(\d+(?:\.5|\.0)?)(?!\d)", str(text or "")):
+        v = safe_float(m.group(1), None)
+        if v is None:
+            continue
+        # Prefer no-push half lines from Underdog but accept integer-like API fields if present.
+        if mn <= v <= mx and abs(v * 2 - round(v * 2)) < 1e-9:
+            vals.append(float(v))
+    # Prefer 0.5/1.5/2.5 lines since Underdog usually uses half-points.
+    half = [v for v in vals if abs(v % 1 - 0.5) < 1e-9]
+    return half[0] if half else (vals[0] if vals else None)
+
+
+def _bp_find_line(obj, market):
+    if not isinstance(obj, dict):
+        return None
+    a = _bp_attrs(obj)
+    for d in [a, obj]:
+        if not isinstance(d, dict):
+            continue
+        for key in ["line", "stat_value", "target_value", "line_score", "over_under_line", "points", "value", "total"]:
+            v = safe_float(d.get(key), None)
+            if v is not None:
+                cfg = BATTER_PROP_MARKETS.get(market, {})
+                if cfg.get("min_line", 0.5) <= v <= cfg.get("max_line", 4.5):
+                    return float(v)
+    return _bp_extract_line_from_text(_bp_text_from_obj(obj), market)
+
+
+def _bp_candidate_name(obj):
+    if not isinstance(obj, dict):
+        return ""
+    a = _bp_attrs(obj)
+    keys = ["player_name", "playerName", "player", "participant", "participant_name", "name", "title", "display_name", "description", "appearance_name"]
+    candidates = []
+    for d in [a, obj]:
+        if not isinstance(d, dict):
+            continue
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, dict):
+                v = v.get("full_name") or v.get("fullName") or v.get("display_name") or v.get("name")
+            if isinstance(v, str) and 2 <= len(v) <= 60:
+                candidates.append(v)
+    if candidates:
+        # Prefer the string that looks most like a real name.
+        candidates = sorted(candidates, key=lambda s: (len(s.split()) >= 2, len(s)), reverse=True)
+        return candidates[0]
+    return ""
+
+
+def _bp_active_ok(obj):
+    low = _bp_text_from_obj(obj).lower()
+    return not any(x in low for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_batter_prop_rows():
+    """Return only Underdog batter Hits/RBI rows. Never creates synthetic lines."""
+    rows = []
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            continue
+        objects = _bp_collect_objects(data)
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            blob = _bp_text_from_obj(obj)
+            low = blob.lower()
+            if is_bad_sport_text(low):
+                continue
+            market = _bp_market_from_text(blob)
+            if not market:
+                continue
+            if not _bp_active_ok(obj):
+                continue
+            line = _bp_find_line(obj, market)
+            if line is None:
+                continue
+            player = _bp_candidate_name(obj)
+            if not player or len(normalize_name(player).split()) < 2:
+                # Some Underdog objects need relationship joining; avoid guessing names.
+                continue
+            # Prevent pitcher rows from leaking into batter tabs.
+            if any(x in normalize_name(player) for x in ["team", "first inning", "game"]):
+                continue
+            rows.append({
+                "Source": "Underdog",
+                "Player": player.strip(),
+                "Market": market,
+                "Market Label": BATTER_PROP_MARKETS[market]["label"],
+                "Line": float(line),
+                "Evidence": blob[:240],
+            })
+    # Deduplicate by player/market/line.
+    dedup = {}
+    for r in rows:
+        key = (normalize_name(r.get("Player")), r.get("Market"), float(r.get("Line")))
+        if key not in dedup:
+            dedup[key] = r
+    return list(dedup.values())
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _moneyball_score_from_components(components):
+    vals = [(safe_float(v, None), safe_float(w, 0) or 0) for v, w in components]
+    vals = [(v, w) for v, w in vals if v is not None and w > 0]
+    if not vals:
+        return 50
+    return int(round(clamp(sum(v * w for v, w in vals) / sum(w for _, w in vals), 0, 100)))
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_batter_hits_rbi_profile_by_name(player_name):
+    """Moneyball batter profile for separate Hits/RBI tabs only.
+
+    Uses MLB Stats API batter data. Lines still come from Underdog only.
+    This does not affect the K Upside pitcher strikeout engine.
+    """
+    pid = _mlb_search_player_id_by_name(player_name)
+    out = {
+        "player_id": pid,
+        "season_hits_per_game": None,
+        "season_rbi_per_game": None,
+        "season_obp": None,
+        "season_pa": None,
+        "bb_pct": None,
+        "k_pct": None,
+        "contact_rate": None,
+        "babip": None,
+        "avg": None,
+        "slg": None,
+        "ops": None,
+        "recent_hits_avg": None,
+        "recent_rbi_avg": None,
+        "recent_hit_rate_05": None,
+        "recent_rbi_rate_05": None,
+        "recent_hits_l10": None,
+        "recent_rbi_l10": None,
+        "moneyball_value_score": None,
+        "hits_moneyball_score": None,
+        "rbi_opportunity_score": None,
+        "team_id": None,
+        "team_run_env_score": None,
+        "team_baseruns_pg": None,
+        "team_obp": None,
+        "note": "No MLB player id" if not pid else "MLB Moneyball profile loaded",
+    }
+    if not pid:
+        return out
+    try:
+        season = safe_get_json(f"{MLB_BASE}/people/{pid}/stats", params={"stats": "season", "group": "hitting"}, timeout=12) or {}
+        split = get_first_stat_split(season)
+        stat = (split or {}).get("stat", {})
+        h = safe_float(stat.get("hits"), 0) or 0
+        ab = safe_float(stat.get("atBats"), 0) or 0
+        bb = safe_float(stat.get("baseOnBalls"), 0) or 0
+        hbp = safe_float(stat.get("hitByPitch"), 0) or 0
+        sf = safe_float(stat.get("sacFlies"), 0) or 0
+        so = safe_float(stat.get("strikeOuts"), 0) or 0
+        hr = safe_float(stat.get("homeRuns"), 0) or 0
+        rbi = safe_float(stat.get("rbi"), 0) or 0
+        gp = safe_float(stat.get("gamesPlayed"), 0) or 0
+        pa = safe_float(stat.get("plateAppearances"), None)
+        total_bases = safe_float(stat.get("totalBases"), None)
+        denom_obp = ab + bb + hbp + sf
+        obp = (h + bb + hbp) / denom_obp if denom_obp > 0 else None
+        avg = h / ab if ab > 0 else None
+        bb_pct = bb / pa if pa and pa > 0 else None
+        k_pct = so / pa if pa and pa > 0 else None
+        contact_rate = None if k_pct is None else 1.0 - k_pct
+        babip_denom = ab - so - hr + sf
+        babip = (h - hr) / babip_denom if babip_denom > 0 else None
+        slg = (total_bases / ab) if total_bases is not None and ab > 0 else None
+        ops = (obp + slg) if obp is not None and slg is not None else None
+
+        obp_score = None if obp is None else clamp((obp - 0.280) / 0.120 * 100, 0, 100)
+        contact_score = None if contact_rate is None else clamp((contact_rate - 0.650) / 0.220 * 100, 0, 100)
+        k_avoid_score = None if k_pct is None else clamp((0.310 - k_pct) / 0.190 * 100, 0, 100)
+        babip_score = None if babip is None else clamp((babip - 0.255) / 0.105 * 100, 0, 100)
+        bb_score = None if bb_pct is None else clamp((bb_pct - 0.055) / 0.090 * 100, 0, 100)
+        rbi_base_score = clamp((rbi / max(gp, 1)) / 0.85 * 100, 0, 100) if gp and gp > 0 else None
+        power_score = None if slg is None else clamp((slg - 0.330) / 0.220 * 100, 0, 100)
+
+        hits_moneyball_score = _moneyball_score_from_components([
+            (obp_score, 0.30), (contact_score, 0.28), (k_avoid_score, 0.18), (babip_score, 0.14), (bb_score, 0.10)
+        ])
+        rbi_opportunity_score = _moneyball_score_from_components([
+            (rbi_base_score, 0.34), (obp_score, 0.20), (power_score, 0.20), (contact_score, 0.16), (bb_score, 0.10)
+        ])
+
+        out.update({
+            "season_hits_per_game": None if gp <= 0 else h / gp,
+            "season_rbi_per_game": None if gp <= 0 else rbi / gp,
+            "season_obp": obp,
+            "season_pa": pa,
+            "bb_pct": bb_pct,
+            "k_pct": k_pct,
+            "contact_rate": contact_rate,
+            "babip": babip,
+            "avg": avg,
+            "slg": slg,
+            "ops": ops,
+            "moneyball_value_score": int(round(obp_score)) if obp_score is not None else None,
+            "hits_moneyball_score": hits_moneyball_score,
+            "rbi_opportunity_score": rbi_opportunity_score,
+        })
+        try:
+            team_obj = (split or {}).get("team", {}) or {}
+            team_id = team_obj.get("id")
+            team_env = ml_team_hitting_profile(team_id) if team_id else {}
+            run_env_score = clamp(50 + (safe_float(team_env.get("baseruns_pg"), MLB_AVG_RUNS_PER_GAME) - MLB_AVG_RUNS_PER_GAME) * 9 + (safe_float(team_env.get("lineup_strength_score"), 50) - 50) * 0.35, 25, 80) if team_env else None
+            out.update({
+                "team_id": team_id,
+                "team_run_env_score": None if run_env_score is None else int(round(run_env_score)),
+                "team_baseruns_pg": team_env.get("baseruns_pg") if team_env else None,
+                "team_obp": team_env.get("obp") if team_env else None,
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        out["note"] = f"Season Moneyball profile unavailable: {e}"
+
+    try:
+        logs = safe_get_json(f"{MLB_BASE}/people/{pid}/stats", params={"stats": "gameLog", "group": "hitting"}, timeout=12) or {}
+        splits = (((logs.get("stats") or [{}])[0]).get("splits") or [])[:10]
+        hits, rbis = [], []
+        for g in splits:
+            stt = g.get("stat", {})
+            hits.append(safe_float(stt.get("hits"), 0) or 0)
+            rbis.append(safe_float(stt.get("rbi"), 0) or 0)
+        if hits:
+            out["recent_hits_l10"] = hits
+            out["recent_hits_avg"] = float(np.mean(hits))
+            out["recent_hit_rate_05"] = float(np.mean([1 if x >= 1 else 0 for x in hits]))
+        if rbis:
+            out["recent_rbi_l10"] = rbis
+            out["recent_rbi_avg"] = float(np.mean(rbis))
+            out["recent_rbi_rate_05"] = float(np.mean([1 if x >= 1 else 0 for x in rbis]))
+    except Exception:
+        pass
+    return out
+
+
+def project_batter_prop(row):
+    """Project HITS or RBI from MLB batter Moneyball profile.
+
+    Underdog is the only line source. This module is isolated from K projections.
+    """
+    player = row.get("Player")
+    market = row.get("Market")
+    line = safe_float(row.get("Line"), None)
+    prof = get_batter_hits_rbi_profile_by_name(player)
+    obp = safe_float(prof.get("season_obp"), None)
+    contact = safe_float(prof.get("contact_rate"), None)
+    k_pct = safe_float(prof.get("k_pct"), None)
+    babip = safe_float(prof.get("babip"), None)
+    hits_score = safe_float(prof.get("hits_moneyball_score"), safe_float(prof.get("moneyball_value_score"), 50)) or 50
+    rbi_score = safe_float(prof.get("rbi_opportunity_score"), 50) or 50
+    team_run_score = safe_float(prof.get("team_run_env_score"), 50) or 50
+    team_bsr = safe_float(prof.get("team_baseruns_pg"), None)
+
+    if market == "HITS":
+        season = safe_float(prof.get("season_hits_per_game"), None)
+        recent = safe_float(prof.get("recent_hits_avg"), None)
+        # OBP and contact are Moneyball-style support signals, not the line source.
+        obp_proxy = None if obp is None else obp * 3.25
+        contact_proxy = None if contact is None else contact * 1.45
+        babip_proxy = None if babip is None else babip * 3.10
+        vals, weights = [], []
+        run_env_proxy = None if team_bsr is None else max(0.15, min(1.65, team_bsr / max(MLB_AVG_RUNS_PER_GAME, 0.1) * 0.95))
+        for v, w in [(season, 0.40), (recent, 0.24), (obp_proxy, 0.14), (contact_proxy, 0.11), (babip_proxy, 0.07), (run_env_proxy, 0.04)]:
+            if v is not None:
+                vals.append(v * w); weights.append(w)
+        proj = sum(vals) / sum(weights) if weights else None
+        hit_rate = prof.get("recent_hit_rate_05")
+        model_score = hits_score
+        value_label = "HITS_MONEYBALL"
+    else:
+        season = safe_float(prof.get("season_rbi_per_game"), None)
+        recent = safe_float(prof.get("recent_rbi_avg"), None)
+        # RBI is opportunity-driven: recent RBI + season RBI + OBP/power/contact proxies.
+        obp_proxy = None if obp is None else max(0.08, (obp - 0.245) * 2.15)
+        contact_proxy = None if contact is None else max(0.04, (contact - 0.62) * 0.95)
+        run_env_proxy = max(0.08, ((rbi_score * 0.60 + team_run_score * 0.40) / 100.0) * 0.78)
+        vals, weights = [], []
+        for v, w in [(season, 0.40), (recent, 0.25), (run_env_proxy, 0.22), (obp_proxy, 0.08), (contact_proxy, 0.05)]:
+            if v is not None:
+                vals.append(v * w); weights.append(w)
+        proj = sum(vals) / sum(weights) if weights else None
+        hit_rate = prof.get("recent_rbi_rate_05")
+        model_score = rbi_score
+        value_label = "RBI_OPPORTUNITY"
+
+    if proj is None or line is None:
+        side, conf, edge = "PASS", None, None
+    else:
+        edge = float(proj - line)
+        # Batter props are high variance; require a wider edge than K props.
+        if edge >= 0.20:
+            side = "OVER"
+        elif edge <= -0.20:
+            side = "UNDER"
+        else:
+            side = "PASS"
+        score_nudge = ((model_score - 50) / 1000.0) if side == "OVER" else ((50 - model_score) / 1400.0 if side == "UNDER" else 0)
+        conf = clamp(0.50 + min(0.22, abs(edge) * 0.17) + score_nudge, 0.50, 0.79)
+
+    return {
+        **row,
+        "Projection": None if proj is None else round(float(proj), 2),
+        "Edge": None if edge is None else round(float(edge), 2),
+        "Decision": side,
+        "Confidence %": None if conf is None else round(float(conf) * 100, 1),
+        "OBP": None if obp is None else round(float(obp), 3),
+        "BB%": None if prof.get("bb_pct") is None else round(float(prof.get("bb_pct")) * 100, 1),
+        "K%": None if k_pct is None else round(float(k_pct) * 100, 1),
+        "Contact%": None if contact is None else round(float(contact) * 100, 1),
+        "BABIP": None if babip is None else round(float(babip), 3),
+        "Moneyball Score": None if hits_score is None else int(hits_score),
+        "RBI Opp Score": None if rbi_score is None else int(rbi_score),
+        "Team Run Env": None if team_run_score is None else int(team_run_score),
+        "Team BaseRuns/G": None if team_bsr is None else round(float(team_bsr), 2),
+        "Model Label": value_label,
+        "Recent Avg": None if (market == "HITS" and prof.get("recent_hits_avg") is None) or (market == "RBI" and prof.get("recent_rbi_avg") is None) else round(float(prof.get("recent_hits_avg") if market == "HITS" else prof.get("recent_rbi_avg")), 2),
+        "Recent Hit Rate %": None if hit_rate is None else round(float(hit_rate) * 100, 1),
+        "Profile Note": prof.get("note"),
+    }
+
+def build_batter_prop_board(market):
+    rows = [r for r in fetch_underdog_batter_prop_rows() if r.get("Market") == market]
+    out = [project_batter_prop(r) for r in rows]
+    if not out:
+        return pd.DataFrame()
+    df = pd.DataFrame(out)
+    # Keep mobile table compact.
+    cols = ["Player", "Market Label", "Line", "Projection", "Edge", "Decision", "Confidence %", "OBP", "Contact%", "K%", "BABIP", "Moneyball Score", "RBI Opp Score", "Team Run Env", "Team BaseRuns/G", "Recent Avg", "Recent Hit Rate %", "Source"]
+    cols = [c for c in cols if c in df.columns]
+    df = df[cols].sort_values(["Decision", "Confidence %", "Edge"], ascending=[True, False, False])
+    return df
+
+
+def render_batter_prop_tab(market):
+    cfg = BATTER_PROP_MARKETS[market]
+    title = "Batter Hits" if market == "HITS" else "Batter RBI"
+    st.markdown(f'<div class="section-title-pro">{title} — Underdog Only</div>', unsafe_allow_html=True)
+    st.caption("Separate batter-prop engine. Lines come from Underdog only. This does not change the K Upside model.")
+    df = build_batter_prop_board(market)
+    if df.empty:
+        st.warning(f"No active Underdog {cfg['label']} rows found. This tab will stay empty rather than creating fake lines.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("UD Rows", len(df))
+    c2.metric("Overs", int((df["Decision"].astype(str) == "OVER").sum()))
+    c3.metric("Unders", int((df["Decision"].astype(str) == "UNDER").sum()))
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.markdown("#### Mobile cards")
+    for _, r in df.head(20).iterrows():
+        dec = str(r.get("Decision", "PASS"))
+        color = "#2ecc71" if dec == "OVER" else "#ff4d4d" if dec == "UNDER" else "#f5c542"
+        st.markdown(f"""
+        <div class="pro-card" style="padding:18px;margin-bottom:12px;">
+          <div style="font-size:24px;font-weight:900;">{html.escape(str(r.get('Player','')))}</div>
+          <div class="small-muted">{html.escape(str(r.get('Market Label','')))} · Underdog line {r.get('Line')}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
+            <div><div class="small-muted">Projection</div><div class="big-number green">{r.get('Projection','—')}</div></div>
+            <div><div class="small-muted">Decision</div><div style="font-size:30px;font-weight:900;color:{color};">{dec}</div><div class="small-muted">Conf {r.get('Confidence %','—')}%</div></div>
+          </div>
+          <div class="kpi-strip" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-top:12px;">
+            <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{r.get('Edge','—')}</div></div>
+            <div class="kpi-box"><div class="kpi-label">OBP</div><div class="kpi-value">{r.get('OBP','—')}</div><div class="kpi-sub">Moneyball core</div></div>
+            <div class="kpi-box"><div class="kpi-label">Contact</div><div class="kpi-value">{r.get('Contact%','—')}%</div><div class="kpi-sub">K% {r.get('K%','—')}%</div></div>
+            <div class="kpi-box"><div class="kpi-label">BABIP</div><div class="kpi-value">{r.get('BABIP','—')}</div><div class="kpi-sub">Hit quality/luck</div></div>
+            <div class="kpi-box"><div class="kpi-label">Value Score</div><div class="kpi-value">{r.get('Moneyball Score','—')}</div><div class="kpi-sub">Hits model</div></div>
+            <div class="kpi-box"><div class="kpi-label">RBI Opp</div><div class="kpi-value">{r.get('RBI Opp Score','—')}</div><div class="kpi-sub">RBI model</div></div>
+            <div class="kpi-box"><div class="kpi-label">Team Run Env</div><div class="kpi-value">{r.get('Team Run Env','—')}</div><div class="kpi-sub">BsR {r.get('Team BaseRuns/G','—')}/G</div></div>
+            <div class="kpi-box"><div class="kpi-label">L10 Rate</div><div class="kpi-value">{r.get('Recent Hit Rate %','—')}%</div></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
 # =========================
 # PROJECTION DRIFT + TRAP LINE 2.0
 # =========================
-tab_kproj, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_hits, tab_rbi, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
+    "BATTER HITS",
+    "BATTER RBI",
     "MONEYLINE EDGE",
     "CALIBRATION AUDIT",
     "TOP PLAYS",
@@ -9634,6 +10766,12 @@ tab_kproj, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, ta
 
 with tab_kproj:
     render_kproj_tab(board)
+
+with tab_hits:
+    render_batter_prop_tab("HITS")
+
+with tab_rbi:
+    render_batter_prop_tab("RBI")
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
