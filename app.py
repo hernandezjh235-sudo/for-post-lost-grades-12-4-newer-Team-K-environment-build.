@@ -12720,6 +12720,340 @@ def build_batter_prop_board(market):
     return df
 
 
+
+# =========================
+# H+R+R UNDERDOG LOADER FIX — TYPE-AWARE RELATIONSHIP + TITLE FALLBACK
+# =========================
+# This override fixes empty H+R+R tabs caused by Underdog storing player, market,
+# and line in separate relationship objects. It affects only the Batter H+R+R tab.
+# K projection, Moneyline, and pitcher props are untouched.
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_batter_prop_rows():
+    import re, json
+
+    hrr_terms = [
+        "hits + runs + rbis", "hits+runs+rbis", "hits + runs + rbi", "hits+runs+rbi",
+        "hits runs rbis", "hits runs rbi", "h+r+r", "h + r + r", "h+r+rbi", "h + r + rbi",
+        "hrr", "h r r"
+    ]
+    hard_bad = re.compile(
+        r"Total Bases|Home Runs|\bRuns\s+O/U\b|\bRBIs?\s+O/U\b|Runs Batted In|"
+        r"Batter Strikeouts|Batter Walks|Walks O/U|Stolen Bases|Singles|Doubles|Fantasy|"
+        r"Shots|Goals|Assists|Saves|Blocks|Tackles|Strokes|Tourney|Finishing Position|"
+        r"Soccer|NHL|NBA|NFL|Golf|Hockey|Basketball|Football",
+        re.I,
+    )
+    hrr_title_re = re.compile(
+        r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.|Sr\.|II|III|IV)){1,5})\s+"
+        r"(?:Hits\s*\+\s*Runs\s*\+\s*RBIs?|H\s*\+\s*R\s*\+\s*RBIs?|H\s*\+\s*R\s*\+\s*R)\s+O/U",
+        re.I,
+    )
+
+    def attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+                out[k] = v
+        return out
+
+    def typ(obj, fallback=""):
+        if not isinstance(obj, dict):
+            return str(fallback or "").lower().replace("-", "_")
+        return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_")
+
+    def oid(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or attrs(obj).get("id")
+        return str(v) if v not in [None, ""] else None
+
+    def collect(data):
+        out = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return out
+
+    def build_maps(objects):
+        by_key, by_id = {}, {}
+        for o in objects:
+            i = oid(o)
+            if not i:
+                continue
+            t = typ(o)
+            for tt in {t, t.rstrip('s'), t + 's'}:
+                by_key[(tt, i)] = o
+            by_id.setdefault(i, []).append(o)
+        return by_key, by_id
+
+    def rel_obj(obj, names, by_key, by_id):
+        if not isinstance(obj, dict):
+            return None
+        rels = obj.get("relationships") or {}
+        for name in names:
+            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip('s'), name + 's'}
+            for key in keys:
+                node = rels.get(key)
+                if node is None:
+                    continue
+                data = node.get("data") if isinstance(node, dict) else node
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    ri = item.get("id")
+                    rt = str(item.get("type") or key or "").lower().replace("-", "_")
+                    if ri in [None, ""]:
+                        continue
+                    for cand_t in [rt, rt.rstrip('s'), rt + 's', key, key.rstrip('s'), key + 's']:
+                        hit = by_key.get((cand_t, str(ri)))
+                        if hit is not None:
+                            return hit
+                    candidates = by_id.get(str(ri), [])
+                    if candidates:
+                        for c in candidates:
+                            ct = typ(c)
+                            if key.rstrip('s') in ct or ct.rstrip('s') in key:
+                                return c
+                        return candidates[0]
+        return None
+
+    def text_from(*objs):
+        parts = []
+        wanted = [
+            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
+            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
+            "market_name", "sport", "league", "sport_name", "league_name", "description",
+            "over_under", "over_under_title", "scoring_type", "projection_type", "stat_value", "line_score",
+            "appearance_name", "position", "stat_value"
+        ]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in wanted:
+                    v = d.get(k)
+                    if isinstance(v, dict):
+                        for kk in wanted:
+                            if v.get(kk) not in [None, ""]:
+                                parts.append(str(v.get(kk)))
+                    elif v not in [None, ""] and not isinstance(v, (dict, list)):
+                        parts.append(str(v))
+        # small JSON tail helps if Underdog nests title differently, but avoid parsing numbers from it.
+        try:
+            for obj in objs:
+                if isinstance(obj, dict):
+                    parts.append(json.dumps(obj, default=str)[:700])
+        except Exception:
+            pass
+        return " | ".join(parts)
+
+    def looks_like_hrr(txt):
+        low = str(txt or "").lower()
+        return any(t in low for t in hrr_terms) or bool(hrr_title_re.search(str(txt or "")))
+
+    def active_ok(*objs):
+        blob = " ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]).lower()
+        return not any(x in blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
+
+    def structured_line(*objs):
+        keys = ["stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine", "display_stat_value"]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in keys:
+                    raw = d.get(k)
+                    v = safe_float(raw, None)
+                    if v is None and isinstance(raw, str):
+                        v = _bp_extract_line_from_text(raw, "HRR")
+                    if v is not None and 0.5 <= v <= 5.5 and abs(v * 2 - round(v * 2)) < 1e-9:
+                        return float(v)
+        return None
+
+    def clean_player_from(*objs):
+        combined = text_from(*objs)
+        m = hrr_title_re.search(combined or "")
+        if m:
+            return _hrr_clean_player_name(m.group(1))
+        candidates = []
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            first_last = (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip()
+            for k in ["display_name", "full_name", "name", "player_name", "title", "description", "appearance_name"]:
+                v = a.get(k)
+                if isinstance(v, str):
+                    candidates.append(v)
+            if first_last:
+                candidates.append(first_last)
+        cleaned = []
+        for c in candidates:
+            cc = _hrr_clean_player_name(c)
+            if cc and len(normalize_name(cc).split()) >= 2 and len(cc) <= 60:
+                if not re.search(r"\b(Hits|Runs|RBIs?|Over|Under|Batter|Line|Total|Bases)\b", cc, re.I):
+                    cleaned.append(cc)
+        if cleaned:
+            return sorted(set(cleaned), key=lambda x: (len(x.split()), len(x)), reverse=True)[0]
+        return ""
+
+    rows = []
+    debug = {"urls": 0, "objects": 0, "line_candidates": 0, "hrr_market_hits": 0, "mlb_valid": 0, "sample_markets": []}
+
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            continue
+        debug["urls"] += 1
+        objects = collect(data)
+        debug["objects"] += len(objects)
+        by_key, by_id = build_maps(objects)
+        line_candidates = []
+        for o in objects:
+            a = attrs(o)
+            t = typ(o)
+            if "over_under_line" in t or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "line"]):
+                line_candidates.append(o)
+        debug["line_candidates"] += len(line_candidates)
+
+        # Relationship path: line -> over_under -> appearance -> player.
+        for line_obj in line_candidates:
+            ou_obj = rel_obj(line_obj, ["over_under", "over_unders"], by_key, by_id)
+            app_obj = rel_obj(ou_obj, ["appearance", "appearances"], by_key, by_id) or rel_obj(line_obj, ["appearance", "appearances"], by_key, by_id)
+            player_obj = rel_obj(app_obj, ["player", "players"], by_key, by_id) or rel_obj(ou_obj, ["player", "players"], by_key, by_id) or rel_obj(line_obj, ["player", "players"], by_key, by_id)
+            blob = text_from(line_obj, ou_obj, app_obj, player_obj)
+            if len(debug["sample_markets"]) < 8 and ("hits" in blob.lower() or "rbi" in blob.lower() or "h+r" in blob.lower()):
+                debug["sample_markets"].append(blob[:180])
+            if not looks_like_hrr(blob):
+                continue
+            if hard_bad.search(blob) and not looks_like_hrr(blob):
+                continue
+            if not active_ok(line_obj, ou_obj, app_obj, player_obj):
+                continue
+            line = structured_line(line_obj, ou_obj, app_obj)
+            if line is None:
+                # Parse only near explicit H+R+R wording, not full nested JSON.
+                m = hrr_title_re.search(blob)
+                if m:
+                    line = _bp_extract_line_from_text(blob[max(0, m.start()-120):min(len(blob), m.end()+260)], "HRR")
+            if line is None:
+                continue
+            player = clean_player_from(player_obj, app_obj, ou_obj, line_obj)
+            if not player:
+                continue
+            debug["hrr_market_hits"] += 1
+            if not _mlb_search_player_id_by_name(player):
+                continue
+            debug["mlb_valid"] += 1
+            rows.append({"Source":"Underdog", "Player":player.strip(), "Market":"HRR", "Market Label":"Batter H+R+R", "Line":float(line), "Evidence":blob[:260]})
+
+        # Exact title fallback: covers flattened objects like "CJ Abrams Hits + Runs + RBIs O/U".
+        for obj in objects:
+            blob = text_from(obj)
+            if not blob or not looks_like_hrr(blob):
+                continue
+            sport_blob = " ".join(str(attrs(obj).get(k, "")) for k in ["sport", "sport_name", "league", "league_name"]).lower()
+            if any(x in sport_blob for x in ["nhl", "nba", "nfl", "soccer", "golf", "tennis", "hockey", "basketball", "football"]):
+                continue
+            m = hrr_title_re.search(blob)
+            if not m:
+                continue
+            line = structured_line(obj)
+            if line is None:
+                line = _bp_extract_line_from_text(blob[max(0, m.start()-120):min(len(blob), m.end()+260)], "HRR")
+            if line is None:
+                continue
+            player = _hrr_clean_player_name(m.group(1))
+            if not player or len(normalize_name(player).split()) < 2:
+                continue
+            debug["hrr_market_hits"] += 1
+            if not _mlb_search_player_id_by_name(player):
+                continue
+            debug["mlb_valid"] += 1
+            rows.append({"Source":"Underdog", "Player":player.strip(), "Market":"HRR", "Market Label":"Batter H+R+R", "Line":float(line), "Evidence":"exact H+R+R title fallback: " + blob[:230]})
+
+    try:
+        st.session_state["hrr_ud_debug"] = debug
+    except Exception:
+        pass
+
+    dedup = {}
+    for r in rows:
+        key = (normalize_name(r.get("Player")), "HRR")
+        if key not in dedup:
+            dedup[key] = r
+    return list(dedup.values())
+
+_prev_hrr_debug_render_batter_prop_tab = render_batter_prop_tab
+
+def render_batter_prop_tab(market):
+    cfg = BATTER_PROP_MARKETS[market]
+    title = "Batter H+R+R"
+    st.markdown(f'<div class="section-title-pro">{title} — Underdog Only</div>', unsafe_allow_html=True)
+    st.caption("Separate batter-prop engine. Lines come from Underdog only. This does not change the K Upside model.")
+    df = build_batter_prop_board(market)
+    if df.empty:
+        st.warning(f"No active Underdog {cfg['label']} rows found. This tab will stay empty rather than creating fake lines.")
+        dbg = st.session_state.get("hrr_ud_debug") if hasattr(st, "session_state") else None
+        if isinstance(dbg, dict):
+            st.caption(f"UD debug: urls={dbg.get('urls')} objects={dbg.get('objects')} line_candidates={dbg.get('line_candidates')} hrr_hits={dbg.get('hrr_market_hits')} mlb_valid={dbg.get('mlb_valid')}")
+            samples = dbg.get("sample_markets") or []
+            if samples:
+                with st.expander("Underdog market text samples"):
+                    for s in samples[:8]:
+                        st.code(str(s)[:500])
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("UD Rows", len(df))
+    c2.metric("Overs", int((df["Decision"].astype(str) == "OVER").sum()))
+    c3.metric("Unders", int((df["Decision"].astype(str) == "UNDER").sum()))
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.markdown("#### Mobile cards")
+    for _, r in df.head(20).iterrows():
+        dec = str(r.get("Decision", "PASS"))
+        color = "#2ecc71" if dec == "OVER" else "#ff4d4d" if dec == "UNDER" else "#f5c542"
+        st.markdown(f"""
+        <div class="pro-card" style="padding:18px;margin-bottom:12px;">
+          <div style="font-size:24px;font-weight:900;">{html.escape(str(r.get('Player','')))}</div>
+          <div class="small-muted">{html.escape(str(r.get('Market Label','')))} · Underdog line {r.get('Line')}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
+            <div><div class="small-muted">Projection</div><div class="big-number green">{r.get('Projection','—')}</div></div>
+            <div><div class="small-muted">Decision</div><div style="font-size:30px;font-weight:900;color:{color};">{dec}</div><div class="small-muted">Conf {r.get('Confidence %','—')}%</div></div>
+          </div>
+          <div class="metric-grid" style="margin-top:12px;">
+            <div class="mobile-info-card"><div class="small-muted">Edge</div><div class="kpi-value">{r.get('Edge','—')}</div></div>
+            <div class="mobile-info-card"><div class="small-muted">OBP</div><div class="kpi-value">{r.get('OBP','—')}</div><div class="kpi-sub">Moneyball core</div></div>
+            <div class="mobile-info-card"><div class="small-muted">Contact</div><div class="kpi-value">{r.get('Contact%','—')}%</div><div class="kpi-sub">K% {r.get('K%','—')}%</div></div>
+            <div class="mobile-info-card"><div class="small-muted">Projected PA</div><div class="kpi-value">{r.get('Projected PA','—')}</div><div class="kpi-sub">Slot {r.get('Lineup Slot','—')}</div></div>
+            <div class="mobile-info-card"><div class="small-muted">Team Runs</div><div class="kpi-value">{r.get('Team Implied Runs','—')}</div><div class="kpi-sub">wRC+ {r.get('Team wRC+ Split','—')}</div></div>
+            <div class="mobile-info-card"><div class="small-muted">Opportunity</div><div class="kpi-value">{r.get('HRR Opportunity Score', r.get('RBI Opp Score','—'))}</div><div class="kpi-sub">H+R+R model</div></div>
+          </div>
+          <div class="small-muted" style="margin-top:10px;line-height:1.35;">{html.escape(str(r.get('Attribution','')))}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
 # =========================
 # PROJECTION DRIFT + TRAP LINE 2.0
 # =========================
