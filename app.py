@@ -11176,6 +11176,285 @@ def project_batter_prop(row):
         "Profile Note": prof.get("note"),
     }
 
+
+# =========================
+# BATTER PROP LOADER 2.2 — RELATIONSHIP-TYPE SAFE + EXACT TITLE FALLBACK
+# =========================
+# Overrides the earlier loader. Fixes the Underdog JSON:API relationship issue where
+# ids can collide across object types. Uses (type,id) maps, then exact-title fallback.
+# Still uses Underdog only and never creates synthetic lines.
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_batter_prop_rows():
+    import re
+
+    def attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+                out[k] = v
+        return out
+
+    def typ(obj, fallback=""):
+        return str((obj or {}).get("type") or fallback or "").lower().replace("-", "_") if isinstance(obj, dict) else ""
+
+    def oid(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or attrs(obj).get("id")
+        return str(v) if v not in [None, ""] else None
+
+    def collect(data):
+        objs = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                # Keep only meaningful object-like dicts to reduce false matches.
+                if any(k in y for k in ["type", "attributes", "relationships", "id"]):
+                    objs.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return objs
+
+    def build_maps(objects):
+        by_key = {}
+        by_id = {}
+        for o in objects:
+            i = oid(o)
+            if not i:
+                continue
+            t = typ(o, o.get("_parent_key", ""))
+            if t:
+                by_key[(t, i)] = o
+                # also singular/plural aliases
+                by_key[(t.rstrip('s'), i)] = o
+                by_key[(t + 's', i)] = o
+            by_id.setdefault(i, []).append(o)
+        return by_key, by_id
+
+    def rel_obj(obj, names, by_key, by_id):
+        if not isinstance(obj, dict):
+            return None
+        rels = obj.get("relationships") or {}
+        for name in names:
+            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip('s'), name + 's'}
+            for key in keys:
+                node = rels.get(key)
+                if node is None:
+                    continue
+                data = node.get("data") if isinstance(node, dict) else node
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    ri = item.get("id")
+                    rt = str(item.get("type") or key or "").lower().replace("-", "_")
+                    if ri in [None, ""]:
+                        continue
+                    # Type-aware lookup first. This fixes id collisions.
+                    for cand_t in [rt, rt.rstrip('s'), rt + 's', key, key.rstrip('s'), key + 's']:
+                        hit = by_key.get((cand_t, str(ri)))
+                        if hit is not None:
+                            return hit
+                    # Last resort by id only; prefer object whose type resembles the relationship key.
+                    candidates = by_id.get(str(ri), [])
+                    if candidates:
+                        for c in candidates:
+                            ct = typ(c, c.get("_parent_key", ""))
+                            if key.rstrip('s') in ct or ct.rstrip('s') in key:
+                                return c
+                        return candidates[0]
+        return None
+
+    def text_from(*objs):
+        parts = []
+        wanted = [
+            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
+            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
+            "market_name", "sport", "league", "sport_name", "league_name", "description",
+            "over_under", "over_under_title", "scoring_type", "projection_type", "stat_value", "line_score",
+            "appearance_name", "position"
+        ]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            for d in [a, obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in wanted:
+                    v = d.get(k)
+                    if isinstance(v, dict):
+                        for kk in wanted:
+                            if v.get(kk) not in [None, ""]:
+                                parts.append(str(v.get(kk)))
+                    elif v not in [None, ""] and not isinstance(v, (dict, list)):
+                        parts.append(str(v))
+        return " | ".join(parts)
+
+    bad_re = re.compile(r"Total Bases|Home Runs|Runs O/U|Batter Strikeouts|Batter Walks|Walks O/U|Stolen Bases|Singles|Doubles|Fantasy|Shots|Goals|Assists|Saves|Blocks|Tackles|Strokes|Tourney|Finishing Position|Soccer|NHL|NBA|NFL|Golf|Hockey|Basketball|Football", re.I)
+    hits_re = re.compile(r"\b(Batter\s+)?Hits\s+O/U\b|\bHits\s+Over/Under\b", re.I)
+    rbi_re = re.compile(r"\bRBIs?\s+O/U\b|\bRuns\s+Batted\s+In\s+O/U\b|\bRuns\s+Batted\s+In\s+Over/Under\b", re.I)
+    title_re = re.compile(r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.|Sr\.|II|III|IV)){1,5})\s+(Hits|RBIs?)\s+O/U", re.I)
+
+    def classify(*objs):
+        blob = text_from(*objs)
+        if bad_re.search(blob or ""):
+            return None
+        # Structured/title fields get priority over the huge JSON blob.
+        key_text = " | ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["title","display_title","stat","stat_type","appearance_stat","display_stat","market_name","name"])
+        if bad_re.search(key_text or ""):
+            return None
+        if rbi_re.search(key_text) or re.search(r"\bRBIs?\b|Runs Batted In", key_text, re.I):
+            return "RBI"
+        if hits_re.search(key_text) or re.search(r"\bHits\b", key_text, re.I):
+            return "HITS"
+        m = title_re.search(blob or "")
+        if m:
+            return "RBI" if m.group(2).lower().startswith("rbi") else "HITS"
+        return None
+
+    def line_from(*objs, market=None):
+        # Accept only structured line fields first. Underdog often stores pick'em lines as 1/2/3/4.
+        keys = ["stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine", "display_stat_value"]
+        mn, mx = 0.0, 4.5
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in keys:
+                    raw = d.get(k)
+                    v = safe_float(raw, None)
+                    if v is None and isinstance(raw, str):
+                        v = _bp_extract_line_from_text(raw, market)
+                    if v is not None and mn <= v <= mx and abs(v * 2 - round(v * 2)) < 1e-9:
+                        return float(v)
+        return None
+
+    def active_ok(*objs):
+        status_blob = " ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]).lower()
+        return not any(x in status_blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
+
+    def player_from(*objs):
+        candidates = []
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            first_last = (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip()
+            for k in ["display_name", "full_name", "name", "player_name", "title", "description", "appearance_name"]:
+                v = a.get(k)
+                if isinstance(v, str):
+                    candidates.append(v)
+            if first_last.strip():
+                candidates.append(first_last)
+        # Explicit title pattern is highly reliable.
+        for c in candidates:
+            m = title_re.search(str(c))
+            if m:
+                return _bp_clean_player_name(m.group(1))
+        cleaned = []
+        for c in candidates:
+            cc = _bp_clean_player_name(c)
+            if cc and len(normalize_name(cc).split()) >= 2 and len(cc) <= 60:
+                # Avoid market names becoming players.
+                if not re.search(r"\b(Hits|RBIs?|Over|Under|Batter|Line)\b", cc, re.I):
+                    cleaned.append(cc)
+        if cleaned:
+            cleaned = sorted(set(cleaned), key=lambda x: (len(x.split()), len(x)), reverse=True)
+            return cleaned[0]
+        return ""
+
+    rows = []
+    debug_counts = {"urls": 0, "objects": 0, "line_candidates": 0, "market_hits": 0, "mlb_valid": 0}
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            continue
+        debug_counts["urls"] += 1
+        objects = collect(data)
+        debug_counts["objects"] += len(objects)
+        by_key, by_id = build_maps(objects)
+        line_candidates = []
+        for o in objects:
+            t = typ(o, o.get("_parent_key", ""))
+            a = attrs(o)
+            if "over_under_line" in t or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "line"]):
+                line_candidates.append(o)
+        debug_counts["line_candidates"] += len(line_candidates)
+
+        # relationship path
+        for line_obj in line_candidates:
+            ou_obj = rel_obj(line_obj, ["over_under", "over_unders"], by_key, by_id)
+            app_obj = rel_obj(ou_obj, ["appearance", "appearances"], by_key, by_id) or rel_obj(line_obj, ["appearance", "appearances"], by_key, by_id)
+            player_obj = rel_obj(app_obj, ["player", "players"], by_key, by_id) or rel_obj(ou_obj, ["player", "players"], by_key, by_id) or rel_obj(line_obj, ["player", "players"], by_key, by_id)
+            market = classify(line_obj, ou_obj, app_obj, player_obj)
+            if not market or not active_ok(line_obj, ou_obj, app_obj, player_obj):
+                continue
+            line = line_from(line_obj, ou_obj, app_obj, market=market)
+            if line is None:
+                continue
+            player = player_from(player_obj, app_obj, ou_obj, line_obj)
+            if not player:
+                continue
+            debug_counts["market_hits"] += 1
+            if not _mlb_search_player_id_by_name(player):
+                continue
+            debug_counts["mlb_valid"] += 1
+            rows.append({"Source":"Underdog","Player":player.strip(),"Market":market,"Market Label":BATTER_PROP_MARKETS[market]["label"],"Line":float(line),"Evidence":text_from(line_obj, ou_obj, app_obj, player_obj)[:260]})
+
+        # exact-title fallback across all objects if relationship path missed titles
+        for obj in objects:
+            blob = text_from(obj)
+            if not blob or bad_re.search(blob):
+                continue
+            m = title_re.search(blob)
+            if not m:
+                continue
+            market = "RBI" if m.group(2).lower().startswith("rbi") else "HITS"
+            line = line_from(obj, market=market)
+            if line is None:
+                # Only parse close to the title, not the whole nested JSON.
+                start = max(0, m.start() - 80); end = min(len(blob), m.end() + 180)
+                line = _bp_extract_line_from_text(blob[start:end], market)
+            if line is None:
+                continue
+            player = _bp_clean_player_name(m.group(1))
+            if not player or len(normalize_name(player).split()) < 2:
+                continue
+            debug_counts["market_hits"] += 1
+            if not _mlb_search_player_id_by_name(player):
+                continue
+            debug_counts["mlb_valid"] += 1
+            rows.append({"Source":"Underdog","Player":player.strip(),"Market":market,"Market Label":BATTER_PROP_MARKETS[market]["label"],"Line":float(line),"Evidence":"exact title fallback: " + blob[:240]})
+
+    # Keep debug info in session for the UI when empty.
+    try:
+        st.session_state["batter_prop_ud_debug"] = debug_counts
+    except Exception:
+        pass
+
+    dedup = {}
+    for r in rows:
+        key = (normalize_name(r.get("Player")), r.get("Market"))
+        # If duplicate, prefer source/evidence with an explicit title fallback or smaller line sanity.
+        if key not in dedup:
+            dedup[key] = r
+    return list(dedup.values())
+
 def build_batter_prop_board(market):
     rows = [r for r in fetch_underdog_batter_prop_rows() if r.get("Market") == market]
     out = [project_batter_prop(r) for r in rows]
