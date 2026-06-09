@@ -10537,6 +10537,112 @@ def _moneyball_score_from_components(components):
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
+def _batter_basic_obp_by_id(player_id):
+    """Small helper for RBI context: OBP for hitters projected ahead in lineup."""
+    if not player_id:
+        return None
+    try:
+        season = safe_get_json(f"{MLB_BASE}/people/{player_id}/stats", params={"stats": "season", "group": "hitting"}, timeout=10) or {}
+        split = get_first_stat_split(season)
+        stat = (split or {}).get("stat", {})
+        h = safe_float(stat.get("hits"), 0) or 0
+        ab = safe_float(stat.get("atBats"), 0) or 0
+        bb = safe_float(stat.get("baseOnBalls"), 0) or 0
+        hbp = safe_float(stat.get("hitByPitch"), 0) or 0
+        sf = safe_float(stat.get("sacFlies"), 0) or 0
+        denom = ab + bb + hbp + sf
+        return (h + bb + hbp) / denom if denom > 0 else None
+    except Exception:
+        return None
+
+
+def _lineup_slot_score(slot):
+    """Batter props only: more PA for hits, better RBI chances in heart of order."""
+    try:
+        slot = int(round(float(slot)))
+    except Exception:
+        return 50
+    mapping = {1: 88, 2: 84, 3: 82, 4: 78, 5: 70, 6: 58, 7: 48, 8: 42, 9: 38}
+    return mapping.get(slot, 50)
+
+
+def _rbi_slot_score(slot):
+    try:
+        slot = int(round(float(slot)))
+    except Exception:
+        return 50
+    mapping = {1: 48, 2: 62, 3: 86, 4: 92, 5: 84, 6: 66, 7: 50, 8: 42, 9: 38}
+    return mapping.get(slot, 50)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_batter_lineup_context(team_id, player_name):
+    """Projected lineup context for Batter Hits/RBI tabs only.
+
+    Uses the stable MLB projected/pre-lineup engine already in the app.
+    It does not alter K projections or Underdog line selection.
+    """
+    out = {
+        "lineup_slot": None,
+        "lineup_slot_score": 50,
+        "rbi_slot_score": 50,
+        "obp_ahead": None,
+        "obp_ahead_score": 50,
+        "batters_ahead_count": 0,
+        "lineup_source": "NO_LINEUP_CONTEXT",
+    }
+    if not team_id or not player_name:
+        return out
+    try:
+        rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None) or []
+        if not rows:
+            return out
+        target_norm = normalize_name(player_name)
+        match = None
+        for r in rows:
+            if normalize_name(r.get("Batter")) == target_norm:
+                match = r
+                break
+        if not match:
+            # Fuzzy fallback for suffixes/accents/middle initials.
+            for r in rows:
+                rn = normalize_name(r.get("Batter"))
+                if target_norm in rn or rn in target_norm:
+                    match = r
+                    break
+        if not match:
+            out["lineup_source"] = "PROJECTED_LINEUP_PLAYER_NOT_FOUND"
+            return out
+        slot = safe_float(match.get("Order") or match.get("Projected Order"), None)
+        ahead = []
+        if slot is not None:
+            for r in rows:
+                o = safe_float(r.get("Order") or r.get("Projected Order"), None)
+                if o is not None and o < slot:
+                    ahead.append(r)
+        obps = []
+        for r in ahead[-3:]:  # immediate hitters ahead matter most for RBI chances
+            oid = r.get("Player ID")
+            obp = _batter_basic_obp_by_id(oid)
+            if obp is not None:
+                obps.append(obp)
+        obp_ahead = float(np.mean(obps)) if obps else None
+        obp_score = None if obp_ahead is None else clamp((obp_ahead - 0.285) / 0.095 * 100, 0, 100)
+        out.update({
+            "lineup_slot": None if slot is None else int(round(float(slot))),
+            "lineup_slot_score": _lineup_slot_score(slot),
+            "rbi_slot_score": _rbi_slot_score(slot),
+            "obp_ahead": obp_ahead,
+            "obp_ahead_score": 50 if obp_score is None else int(round(obp_score)),
+            "batters_ahead_count": len(ahead),
+            "lineup_source": match.get("Lineup Source") or "MLB_PROJECTED_CONTEXT",
+        })
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
 def get_batter_hits_rbi_profile_by_name(player_name):
     """Moneyball batter profile for separate Hits/RBI tabs only.
 
@@ -10570,6 +10676,16 @@ def get_batter_hits_rbi_profile_by_name(player_name):
         "team_run_env_score": None,
         "team_baseruns_pg": None,
         "team_obp": None,
+        "lineup_slot": None,
+        "lineup_slot_score": 50,
+        "rbi_slot_score": 50,
+        "obp_ahead": None,
+        "obp_ahead_score": 50,
+        "batters_ahead_count": 0,
+        "lineup_source": "NO_LINEUP_CONTEXT",
+        "pitcher_hit_allow_score": 50,
+        "bullpen_hit_score": 50,
+        "risp_score": 50,
         "note": "No MLB player id" if not pid else "MLB Moneyball profile loaded",
     }
     if not pid:
@@ -10642,6 +10758,21 @@ def get_batter_hits_rbi_profile_by_name(player_name):
                 "team_baseruns_pg": team_env.get("baseruns_pg") if team_env else None,
                 "team_obp": team_env.get("obp") if team_env else None,
             })
+            # Hits/RBI context only: projected lineup slot and OBP of hitters ahead.
+            try:
+                lu_ctx = get_batter_lineup_context(team_id, player_name) if team_id else {}
+                out.update({k: v for k, v in (lu_ctx or {}).items() if k in out})
+            except Exception:
+                pass
+            # Conservative contextual placeholders from available team/run environment.
+            # These are neutral when opponent starter/bullpen matchup is not available in UD row.
+            try:
+                risp_proxy = clamp(50 + ((rbi / max(gp, 1)) - 0.45) * 35 + ((ops or 0.700) - 0.700) * 40, 25, 85) if gp and gp > 0 else 50
+                out["risp_score"] = int(round(risp_proxy))
+                out["pitcher_hit_allow_score"] = 50
+                out["bullpen_hit_score"] = 50
+            except Exception:
+                pass
         except Exception:
             pass
     except Exception as e:
@@ -10685,6 +10816,14 @@ def project_batter_prop(row):
     rbi_score = safe_float(prof.get("rbi_opportunity_score"), 50) or 50
     team_run_score = safe_float(prof.get("team_run_env_score"), 50) or 50
     team_bsr = safe_float(prof.get("team_baseruns_pg"), None)
+    lineup_slot = safe_float(prof.get("lineup_slot"), None)
+    lineup_slot_score = safe_float(prof.get("lineup_slot_score"), 50) or 50
+    rbi_slot_score = safe_float(prof.get("rbi_slot_score"), 50) or 50
+    obp_ahead = safe_float(prof.get("obp_ahead"), None)
+    obp_ahead_score = safe_float(prof.get("obp_ahead_score"), 50) or 50
+    pitcher_hit_score = safe_float(prof.get("pitcher_hit_allow_score"), 50) or 50
+    bullpen_hit_score = safe_float(prof.get("bullpen_hit_score"), 50) or 50
+    risp_score = safe_float(prof.get("risp_score"), 50) or 50
 
     if market == "HITS":
         season = safe_float(prof.get("season_hits_per_game"), None)
@@ -10701,28 +10840,46 @@ def project_batter_prop(row):
         babip_proxy = babip * 2.70
         vals, weights = [], []
         run_env_proxy = max(0.15, min(1.65, (team_bsr if team_bsr is not None else MLB_AVG_RUNS_PER_GAME) / max(MLB_AVG_RUNS_PER_GAME, 0.1) * 0.85))
-        for v, w in [(season, 0.46), (recent, 0.18), (obp_proxy, 0.14), (contact_proxy, 0.11), (babip_proxy, 0.07), (run_env_proxy, 0.04)]:
+        lineup_pa_mult = 1.0 + ((lineup_slot_score - 50) / 100.0) * 0.16
+        pitcher_hit_mult = 1.0 + ((pitcher_hit_score - 50) / 100.0) * 0.08
+        bullpen_hit_mult = 1.0 + ((bullpen_hit_score - 50) / 100.0) * 0.05
+        for v, w in [(season, 0.38), (recent, 0.17), (obp_proxy, 0.13), (contact_proxy, 0.10), (babip_proxy, 0.07), (run_env_proxy, 0.04)]:
             if v is not None:
                 vals.append(v * w); weights.append(w)
         proj = sum(vals) / sum(weights) if weights else None
+        if proj is not None:
+            proj = float(proj) * lineup_pa_mult * pitcher_hit_mult * bullpen_hit_mult
         hit_rate = prof.get("recent_hit_rate_05")
-        model_score = hits_score
-        value_label = "HITS_MONEYBALL"
+        model_score = _moneyball_score_from_components([
+            (hits_score, 0.44), (lineup_slot_score, 0.18), (pitcher_hit_score, 0.12),
+            (bullpen_hit_score, 0.08), (team_run_score, 0.08), (50 + (safe_float(prof.get("recent_hit_rate_05"), 0.5) - 0.5) * 70, 0.10)
+        ])
+        value_label = "HITS_MONEYBALL_PLUS"
     else:
         season = safe_float(prof.get("season_rbi_per_game"), None)
         recent = safe_float(prof.get("recent_rbi_avg"), None)
         # RBI is opportunity-driven: recent RBI + season RBI + OBP/power/contact proxies.
         obp_proxy = None if obp is None else max(0.08, (obp - 0.245) * 2.15)
         contact_proxy = None if contact is None else max(0.04, (contact - 0.62) * 0.95)
-        run_env_proxy = max(0.08, ((rbi_score * 0.60 + team_run_score * 0.40) / 100.0) * 0.78)
+        run_env_proxy = max(0.08, ((rbi_score * 0.42 + team_run_score * 0.28 + obp_ahead_score * 0.18 + rbi_slot_score * 0.12) / 100.0) * 0.86)
+        rbi_slot_mult = 1.0 + ((rbi_slot_score - 50) / 100.0) * 0.28
+        obp_ahead_mult = 1.0 + ((obp_ahead_score - 50) / 100.0) * 0.18
+        risp_mult = 1.0 + ((risp_score - 50) / 100.0) * 0.10
+        pitcher_runner_mult = 1.0 + ((pitcher_hit_score - 50) / 100.0) * 0.08
+        bullpen_run_mult = 1.0 + ((bullpen_hit_score - 50) / 100.0) * 0.06
         vals, weights = [], []
-        for v, w in [(season, 0.40), (recent, 0.25), (run_env_proxy, 0.22), (obp_proxy, 0.08), (contact_proxy, 0.05)]:
+        for v, w in [(season, 0.31), (recent, 0.20), (run_env_proxy, 0.22), (obp_proxy, 0.07), (contact_proxy, 0.04)]:
             if v is not None:
                 vals.append(v * w); weights.append(w)
         proj = sum(vals) / sum(weights) if weights else None
+        if proj is not None:
+            proj = float(proj) * rbi_slot_mult * obp_ahead_mult * risp_mult * pitcher_runner_mult * bullpen_run_mult
         hit_rate = prof.get("recent_rbi_rate_05")
-        model_score = rbi_score
-        value_label = "RBI_OPPORTUNITY"
+        model_score = _moneyball_score_from_components([
+            (rbi_score, 0.30), (rbi_slot_score, 0.22), (obp_ahead_score, 0.20),
+            (team_run_score, 0.13), (risp_score, 0.10), (bullpen_hit_score, 0.05)
+        ])
+        value_label = "RBI_OPPORTUNITY_PLUS"
 
     if proj is None or line is None:
         side, conf, edge = "PASS", None, None
@@ -10753,7 +10910,19 @@ def project_batter_prop(row):
         "RBI Opp Score": None if rbi_score is None else int(rbi_score),
         "Team Run Env": None if team_run_score is None else int(team_run_score),
         "Team BaseRuns/G": None if team_bsr is None else round(float(team_bsr), 2),
+        "Lineup Slot": None if lineup_slot is None else int(lineup_slot),
+        "Lineup Slot Score": int(lineup_slot_score),
+        "OBP Ahead": None if obp_ahead is None else round(float(obp_ahead), 3),
+        "OBP Ahead Score": int(obp_ahead_score),
+        "Pitcher Hit Score": int(pitcher_hit_score),
+        "Bullpen Hit Score": int(bullpen_hit_score),
+        "RISP Score": int(risp_score),
         "Model Label": value_label,
+        "Attribution": (
+            f"OBP/contact {round(float(hits_score),0)} | Slot {int(lineup_slot_score)} | Pitcher H {int(pitcher_hit_score)} | Bullpen {int(bullpen_hit_score)} | RunEnv {int(team_run_score)}"
+            if market == "HITS" else
+            f"OBP ahead {int(obp_ahead_score)} | RBI slot {int(rbi_slot_score)} | Team runs {int(team_run_score)} | RISP {int(risp_score)} | Bullpen {int(bullpen_hit_score)}"
+        ),
         "Recent Avg": None if (market == "HITS" and prof.get("recent_hits_avg") is None) or (market == "RBI" and prof.get("recent_rbi_avg") is None) else round(float(prof.get("recent_hits_avg") if market == "HITS" else prof.get("recent_rbi_avg")), 2),
         "Recent Hit Rate %": None if hit_rate is None else round(float(hit_rate) * 100, 1),
         "Profile Note": prof.get("note"),
@@ -10766,7 +10935,7 @@ def build_batter_prop_board(market):
         return pd.DataFrame()
     df = pd.DataFrame(out)
     # Keep mobile table compact.
-    cols = ["Player", "Market Label", "Line", "Projection", "Edge", "Decision", "Confidence %", "OBP", "Contact%", "K%", "BABIP", "Moneyball Score", "RBI Opp Score", "Team Run Env", "Team BaseRuns/G", "Recent Avg", "Recent Hit Rate %", "Source"]
+    cols = ["Player", "Market Label", "Line", "Projection", "Edge", "Decision", "Confidence %", "OBP", "Contact%", "K%", "BABIP", "Lineup Slot", "OBP Ahead", "Moneyball Score", "RBI Opp Score", "Team Run Env", "Team BaseRuns/G", "Pitcher Hit Score", "Bullpen Hit Score", "RISP Score", "Recent Avg", "Recent Hit Rate %", "Attribution", "Source"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols].sort_values(["Decision", "Confidence %", "Edge"], ascending=[True, False, False])
     return df
@@ -10806,7 +10975,15 @@ def render_batter_prop_tab(market):
             <div class="kpi-box"><div class="kpi-label">Value Score</div><div class="kpi-value">{r.get('Moneyball Score','—')}</div><div class="kpi-sub">Hits model</div></div>
             <div class="kpi-box"><div class="kpi-label">RBI Opp</div><div class="kpi-value">{r.get('RBI Opp Score','—')}</div><div class="kpi-sub">RBI model</div></div>
             <div class="kpi-box"><div class="kpi-label">Team Run Env</div><div class="kpi-value">{r.get('Team Run Env','—')}</div><div class="kpi-sub">BsR {r.get('Team BaseRuns/G','—')}/G</div></div>
+            <div class="kpi-box"><div class="kpi-label">Lineup Slot</div><div class="kpi-value">{r.get('Lineup Slot','—')}</div><div class="kpi-sub">PA/RBI context</div></div>
+            <div class="kpi-box"><div class="kpi-label">OBP Ahead</div><div class="kpi-value">{r.get('OBP Ahead','—')}</div><div class="kpi-sub">RBI chances</div></div>
+            <div class="kpi-box"><div class="kpi-label">Pitcher/BP</div><div class="kpi-value">{r.get('Pitcher Hit Score','—')}/{r.get('Bullpen Hit Score','—')}</div><div class="kpi-sub">Hit/run allowance</div></div>
+            <div class="kpi-box"><div class="kpi-label">RISP</div><div class="kpi-value">{r.get('RISP Score','—')}</div><div class="kpi-sub">RBI support</div></div>
             <div class="kpi-box"><div class="kpi-label">L10 Rate</div><div class="kpi-value">{r.get('Recent Hit Rate %','—')}%</div></div>
+          </div>
+          <div style="margin-top:10px;padding:10px;border:1px solid #1f2a34;border-radius:12px;background:#0b0f14;">
+            <div class="small-muted">Attribution</div>
+            <div style="font-size:13px;font-weight:700;line-height:1.35;">{html.escape(str(r.get('Attribution','—')))}</div>
           </div>
         </div>
         """, unsafe_allow_html=True)
