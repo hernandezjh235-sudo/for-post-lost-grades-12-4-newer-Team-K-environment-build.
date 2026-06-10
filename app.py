@@ -14522,3 +14522,270 @@ def fetch_underdog_fantasy_score_rows():
         pass
 
     return rows
+
+
+
+# ============================================================
+# MANUAL FANTASY POINTS MODE
+# ------------------------------------------------------------
+# Purpose:
+# - Underdog's public feed is not exposing active MLB Fantasy Points.
+# - This mode builds the Fantasy Points board from the app's own MLB
+#   projections and lets the user manually enter the Underdog line.
+#
+# Safe:
+# - K Upside untouched
+# - Moneyline untouched
+# - Existing fantasy projection formulas reused when available
+# - No fake Underdog lines created
+# ============================================================
+
+MANUAL_FP_MODE_VERSION = "MANUAL_FP_MODE_2026_06_10"
+
+def _mfp_safe_float(x, default=None):
+    try:
+        if x in (None, "", "—"):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _mfp_norm_name(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _mfp_pick_from_edge(edge, confidence=None):
+    if edge is None:
+        return "PASS"
+    if abs(edge) < 0.25:
+        return "PASS"
+    return "OVER" if edge > 0 else "UNDER"
+
+def _mfp_confidence_from_edge(edge):
+    if edge is None:
+        return 0.0
+    e = abs(float(edge))
+    return round(max(50.0, min(88.0, 50.0 + e * 6.0)), 1)
+
+def _mfp_get_matchup_for_player(player_name):
+    pkey = _mfp_norm_name(player_name)
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if hasattr(obj, "columns"):
+                for name_col in ["Pitcher", "Player", "Name", "Batter", "Hitter"]:
+                    if name_col not in obj.columns:
+                        continue
+                    hit = obj[obj[name_col].astype(str).map(_mfp_norm_name) == pkey]
+                    if len(hit):
+                        row = hit.iloc[0].to_dict()
+                        return row.get("Matchup") or row.get("Game") or row.get(" matchup") or ""
+    except Exception:
+        pass
+    return ""
+
+def _mfp_build_pitcher_fantasy_candidates():
+    rows = []
+    seen = set()
+    try:
+        # Prefer current K board/session tables.
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if not hasattr(obj, "columns") or "Pitcher" not in obj.columns:
+                continue
+            for _, r in obj.iterrows():
+                name = str(r.get("Pitcher") or "").strip()
+                if not name or name == "—":
+                    continue
+                nk = _mfp_norm_name(name)
+                if nk in seen:
+                    continue
+                seen.add(nk)
+                kproj = _mfp_safe_float(r.get("K PROJ") or r.get("Projection") or r.get("Proj") or r.get("Median"), None)
+                # Use existing pitcher fantasy formula if present.
+                proj = None
+                try:
+                    if "project_pitcher_fantasy_score_from_row" in globals():
+                        proj = project_pitcher_fantasy_score_from_row(r.to_dict())
+                    elif "project_pitcher_fantasy_score" in globals():
+                        proj = project_pitcher_fantasy_score(r.to_dict())
+                except Exception:
+                    proj = None
+                # Fallback conversion if formula not accessible.
+                if proj is None:
+                    ip = _mfp_safe_float(r.get("IP Floor"), 5.2)
+                    win_bonus = 2.0 if str(r.get("Decision") or "").upper().find("OVER") >= 0 else 1.0
+                    proj = (kproj or 0) * 3.0 + ip * 3.0 + win_bonus
+                rows.append({
+                    "Player": name,
+                    "Type": "Pitcher",
+                    "Matchup": r.get("Matchup") or "",
+                    "Projection": round(float(proj), 2),
+                    "K Projection": kproj,
+                    "Model Source": "Pitcher Fantasy / K board",
+                })
+    except Exception:
+        pass
+    return rows
+
+def _mfp_build_batter_fantasy_candidates():
+    rows = []
+    seen = set()
+    # Try existing batter fantasy board builders if available.
+    try:
+        if "build_batter_fantasy_score_board" in globals():
+            df = build_batter_fantasy_score_board()
+            if hasattr(df, "columns"):
+                for _, r in df.iterrows():
+                    name = str(r.get("Player") or r.get("Batter") or r.get("Name") or "").strip()
+                    if not name or name == "—":
+                        continue
+                    nk = _mfp_norm_name(name)
+                    if nk in seen:
+                        continue
+                    seen.add(nk)
+                    proj = _mfp_safe_float(r.get("Projection") or r.get("Fantasy Projection") or r.get("FP PROJ") or r.get("Proj"), None)
+                    if proj is None:
+                        continue
+                    rows.append({
+                        "Player": name,
+                        "Type": "Batter",
+                        "Matchup": r.get("Matchup") or r.get("Game") or "",
+                        "Projection": round(float(proj), 2),
+                        "K Projection": None,
+                        "Model Source": "Batter Fantasy",
+                    })
+    except Exception:
+        pass
+
+    # Fallback: scan session frames that already have batter fantasy projections.
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if not hasattr(obj, "columns"):
+                continue
+            cols = set(obj.columns)
+            if not ({"Player", "Projection"} & cols or {"Batter", "Projection"} & cols):
+                continue
+            for _, r in obj.iterrows():
+                name = str(r.get("Player") or r.get("Batter") or r.get("Name") or "").strip()
+                if not name or name == "—":
+                    continue
+                nk = _mfp_norm_name(name)
+                if nk in seen:
+                    continue
+                proj = _mfp_safe_float(r.get("Fantasy Projection") or r.get("FP PROJ") or r.get("Projection") or r.get("Proj"), None)
+                if proj is None or proj > 40:  # avoid pitcher/K/non-batter projections
+                    continue
+                seen.add(nk)
+                rows.append({
+                    "Player": name,
+                    "Type": "Batter",
+                    "Matchup": r.get("Matchup") or r.get("Game") or "",
+                    "Projection": round(float(proj), 2),
+                    "K Projection": None,
+                    "Model Source": "Batter Fantasy/session",
+                })
+    except Exception:
+        pass
+    return rows
+
+def build_manual_fantasy_points_board():
+    rows = []
+    rows.extend(_mfp_build_pitcher_fantasy_candidates())
+    rows.extend(_mfp_build_batter_fantasy_candidates())
+
+    # If no batter rows are found, keep pitcher rows working and explain in the UI.
+    out = []
+    for r in rows:
+        name = r["Player"]
+        key = f"manual_fp_line_{_mfp_norm_name(name)}_{r['Type']}"
+        line = _mfp_safe_float(st.session_state.get(key), None)
+        proj = _mfp_safe_float(r.get("Projection"), None)
+        edge = None if line is None or proj is None else round(proj - line, 2)
+        out.append({
+            "Player": name,
+            "Type": r.get("Type"),
+            "Matchup": r.get("Matchup") or _mfp_get_matchup_for_player(name),
+            "FP Projection": proj,
+            "Manual Line": line,
+            "Edge": edge,
+            "Pick": _mfp_pick_from_edge(edge),
+            "Confidence %": _mfp_confidence_from_edge(edge) if edge is not None else "",
+            "K Projection": r.get("K Projection"),
+            "Source": r.get("Model Source"),
+        })
+    return pd.DataFrame(out)
+
+def render_manual_fantasy_points_tab():
+    st.subheader("Fantasy Points — Manual Line Mode")
+    st.caption("The app projects Fantasy Points from MLB matchup/player logic. You enter the Underdog line manually. No fake lines are created.")
+
+    df = build_manual_fantasy_points_board()
+    if df is None or len(df) == 0:
+        st.warning("No Fantasy Points candidates found from the current MLB board yet. Refresh K/ML boards first, then return here.")
+        return
+
+    type_filter = st.radio(
+        "Fantasy Points board",
+        ["All", "Pitcher", "Batter"],
+        horizontal=True,
+        key="manual_fp_type_filter",
+    )
+    show_df = df.copy()
+    if type_filter != "All":
+        show_df = show_df[show_df["Type"] == type_filter].copy()
+
+    search = st.text_input("Search player", key="manual_fp_search")
+    if search:
+        show_df = show_df[show_df["Player"].astype(str).str.contains(search, case=False, na=False)].copy()
+
+    st.markdown("### Enter lines")
+    for _, r in show_df.iterrows():
+        name = r["Player"]
+        typ = r["Type"]
+        proj = _mfp_safe_float(r["FP Projection"], 0.0)
+        key = f"manual_fp_line_{_mfp_norm_name(name)}_{typ}"
+        c1, c2, c3, c4 = st.columns([2.3, 1.2, 1.2, 1.2])
+        with c1:
+            st.markdown(f"**{name}**  \n{typ} • {r.get('Matchup','')}")
+        with c2:
+            st.metric("Projection", f"{proj:.2f}")
+        with c3:
+            st.number_input(
+                "Line",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(st.session_state.get(key, 0.0) or 0.0),
+                step=0.5,
+                key=key,
+                label_visibility="collapsed",
+            )
+        with c4:
+            line = _mfp_safe_float(st.session_state.get(key), None)
+            edge = None if not line else round(proj - line, 2)
+            pick = _mfp_pick_from_edge(edge)
+            st.metric(pick, "" if edge is None else f"{edge:+.2f}")
+
+    result = build_manual_fantasy_points_board()
+    if type_filter != "All":
+        result = result[result["Type"] == type_filter].copy()
+    if search:
+        result = result[result["Player"].astype(str).str.contains(search, case=False, na=False)].copy()
+
+    st.markdown("### Fantasy Points Board")
+    st.dataframe(
+        result.sort_values(["Type", "Edge"], ascending=[True, False], na_position="last"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# Override the old fantasy tab renderer if the app uses common function names.
+def render_fantasy_score_tab():
+    return render_manual_fantasy_points_tab()
+
+def render_fantasy_points_tab():
+    return render_manual_fantasy_points_tab()
