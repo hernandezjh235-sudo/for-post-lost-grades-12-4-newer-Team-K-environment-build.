@@ -12139,7 +12139,7 @@ def render_batter_prop_tab(market):
     st.caption("Separate batter-prop engine. Lines come from Underdog only. This does not change the K Upside model.")
     df = build_batter_prop_board(market)
     if df.empty:
-        st.warning(f"No active Underdog {cfg['label']} rows found. This tab will stay empty rather than creating fake lines.")
+        st.warning(f"No active Underdog {cfg['label']} rows found. ")
         dbg = st.session_state.get("hrr_ud_debug") if hasattr(st, "session_state") else None
         if isinstance(dbg, dict):
             st.caption(f" urls={dbg.get('urls')} objects={dbg.get('objects')} line_candidates={dbg.get('line_candidates')} hrr_hits={dbg.get('hrr_market_hits')} mlb_valid={dbg.get('mlb_valid')}")
@@ -16725,7 +16725,7 @@ def _fs_pitcher_projection_from_row(r):
 # Version: SELF_PROJECTED_FS_FORCED_ROUTE_2026_06_10
 #
 # This is intentionally the LAST override in the file.
-# It prevents the old "Fantasy Points — Underdog Only" block from rendering.
+# It prevents the old "" block from rendering.
 #
 # No Underdog Fantasy line pulling.
 # Separate tabs:
@@ -16899,3 +16899,109 @@ def build_fantasy_score_board():
         return build_self_projected_batter_fs_board()
     except Exception:
         return pd.DataFrame()
+
+
+
+# ============================================================
+# NO-UD-BLOCK SELF PROJECTED FANTASY FINAL
+# Version: SELF_PROJECTED_FS_NO_UD_BLOCK_2026_06_10
+#
+# Removes/neutralizes old Underdog Fantasy panel behavior.
+# Fantasy Points tab is projection-only:
+#   ⚾ Pitcher FS
+#   🏆 Batter FS
+#
+# NO Underdog Fantasy line pulling.
+# NO UD debug.
+# NO market samples.
+# ============================================================
+
+SELF_PROJECTED_FS_NO_UD_BLOCK_VERSION = "SELF_PROJECTED_FS_NO_UD_BLOCK_2026_06_10"
+
+def _fs_no_ud_clear_debug():
+    try:
+        st.session_state["fantasy_ud_debug"] = {}
+    except Exception:
+        pass
+
+def _render_self_projected_fs_no_ud_block():
+    _fs_no_ud_clear_debug()
+
+    st.subheader("Self-Projected MLB Fantasy Points")
+    st.caption(
+        f"Version: {SELF_PROJECTED_FS_NO_UD_BLOCK_VERSION}. "
+        "Projection-only. No Underdog Fantasy line pulling."
+    )
+
+    tab_p, tab_b = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
+
+    with tab_p:
+        try:
+            dfp = build_self_projected_pitcher_fs_board()
+        except Exception as e:
+            dfp = pd.DataFrame()
+            st.warning(f"Pitcher FS board could not build yet: {e}")
+
+        if dfp is None or len(dfp) == 0:
+            st.warning("No Pitcher FS rows yet. Refresh/open K PROJ / UPSIDE first so pitcher projections load.")
+        else:
+            if "FS Projection" in dfp.columns:
+                dfp = dfp.sort_values("FS Projection", ascending=False)
+            st.dataframe(dfp, use_container_width=True, hide_index=True)
+
+    with tab_b:
+        try:
+            dfb = build_self_projected_batter_fs_board()
+        except Exception as e:
+            dfb = pd.DataFrame()
+            st.warning(f"Batter FS board could not build yet: {e}")
+
+        if dfb is None or len(dfb) == 0:
+            st.warning("No Batter FS rows yet. Load H+R+R/batter board or confirmed lineups first.")
+        else:
+            if "FS Projection" in dfb.columns:
+                dfb = dfb.sort_values("FS Projection", ascending=False)
+            st.dataframe(dfb, use_container_width=True, hide_index=True)
+
+    return None
+
+# Final hard overrides for every Fantasy renderer name found in prior versions.
+def render_fantasy_score_tab():
+    return _render_self_projected_fs_no_ud_block()
+
+def render_fantasy_points_tab():
+    return _render_self_projected_fs_no_ud_block()
+
+def render_fantasy_tab():
+    return _render_self_projected_fs_no_ud_block()
+
+def render_ud_fantasy_points_tab():
+    return _render_self_projected_fs_no_ud_block()
+
+def render_underdog_fantasy_points_tab():
+    return _render_self_projected_fs_no_ud_block()
+
+def render_manual_fantasy_points_tab():
+    return _render_self_projected_fs_no_ud_block()
+
+def render_self_projected_fantasy_tabs():
+    return _render_self_projected_fs_no_ud_block()
+
+def _render_fantasy_score_table_and_cards(*args, **kwargs):
+    return _render_self_projected_fs_no_ud_block()
+
+# Final no-op for old UD fantasy data path.
+def fetch_underdog_fantasy_score_rows():
+    _fs_no_ud_clear_debug()
+    return []
+
+def build_fantasy_score_board():
+    _fs_no_ud_clear_debug()
+    try:
+        return build_self_projected_batter_fs_board()
+    except Exception:
+        return pd.DataFrame()
+
+# If old inline code asks for debug samples, keep them empty.
+def _fantasy_ud_debug_samples(*args, **kwargs):
+    return []
