@@ -7881,6 +7881,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "xgboost_adjustment": safe_float(xgb_info.get("adjustment"), 0.0),
         "xgboost_note": xgb_info.get("message"),
         "umpire": ump_name,
+        "umpire_strike_zone_score": int(round(clamp(50 + ((safe_float(ump_mult, 1.0) - 1.0) * 1000), 0, 100))),
+        "umpire_k_nudge": round((safe_float(ump_mult, 1.0) - 1.0) * safe_float(mean, 0.0), 2),
         "ump_factor": round(ump_mult, 3),
         "umpire_learning_factor": round(safe_float(locals().get("ump_learn_mult", 1.0), 1.0), 3),
         "umpire_learning_key": locals().get("ump_learn_key"),
@@ -8336,6 +8338,7 @@ def render_pick_card(p):
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {p.get('market_over_odds', '—')} | U {p.get('market_under_odds', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp / Line</div><div class="kpi-value" style="font-size:16px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('line_history_grade', '—')} | L10 {p.get('line_l10_avg', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Umpire Zone</div><div class="kpi-value" style="font-size:16px;">{p.get('umpire_strike_zone_score', '—')}</div><div class="kpi-sub">K nudge {p.get('umpire_k_nudge', 0)} | {p.get('umpire', 'Unknown')}</div></div>
       </div>
       <div style="display:grid;grid-template-columns:.7fr .7fr .7fr .7fr .7fr .7fr 2.2fr;gap:14px;align-items:end;">
         <div><div class="small-muted">Data Score</div><div style="font-size:22px;font-weight:900;">{p.get('data_score')}/100</div></div>
@@ -11046,9 +11049,7 @@ try:
 except Exception:
     pass
 
-_old_ud_batter_prop_fetch = fetch_underdog_batter_prop_rows
-_old_batter_profile = get_batter_hits_rbi_profile_by_name
-_old_project_batter_prop = project_batter_prop
+# CLEANUP: removed stale alias references to old batter prop functions.
 
 
 def _hrr_clean_player_name(name):
@@ -12685,6 +12686,88 @@ with tab4:
     else:
         st.info("Load the board first.")
 
+
+
+# =========================
+# FINISHING AUDIT DASHBOARDS — calibration, confidence, miss reasons
+# UI/audit only. Does not change K projections.
+# =========================
+def build_k_projection_bucket_audit(results):
+    rows = []
+    for p in results or []:
+        actual = safe_float(p.get("actual"), None)
+        proj = safe_float(p.get("projection"), safe_float(p.get("K PROJ"), None))
+        result = str(p.get("graded_result") or "")
+        if actual is None or proj is None or result not in ["WIN", "LOSS"]:
+            continue
+        bucket = calibration_bucket(proj, [3.5, 4.5, 5.5, 6.5, 7.5], ["<3.5", "3.5-4.5", "4.5-5.5", "5.5-6.5", "6.5-7.5", "7.5+"])
+        rows.append({"Bucket": bucket, "Projection": proj, "Actual": actual, "Error": actual - proj, "Win": 1 if result == "WIN" else 0})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    out = df.groupby("Bucket", as_index=False).agg(
+        Plays=("Win", "count"),
+        Win_Rate=("Win", "mean"),
+        Avg_Projection=("Projection", "mean"),
+        Avg_Actual=("Actual", "mean"),
+        Avg_Error=("Error", "mean"),
+    )
+    out["Win Rate %"] = (out["Win_Rate"] * 100).round(1)
+    out["Avg Projection"] = out["Avg_Projection"].round(2)
+    out["Avg Actual"] = out["Avg_Actual"].round(2)
+    out["Avg Error"] = out["Avg_Error"].round(2)
+    return out[["Bucket", "Plays", "Win Rate %", "Avg Projection", "Avg Actual", "Avg Error"]]
+
+
+def build_k_confidence_audit(results):
+    rows = []
+    for p in results or []:
+        result = str(p.get("graded_result") or "")
+        if result not in ["WIN", "LOSS"]:
+            continue
+        conf = safe_float(p.get("confidence"), safe_float(p.get("Confidence %"), None))
+        if conf is None:
+            fp = safe_float(p.get("fair_probability"), None)
+            conf = fp * 100 if fp is not None and fp <= 1 else fp
+        if conf is None:
+            continue
+        bucket = calibration_bucket(conf, [55, 60, 65, 70, 75, 80], ["<55", "55-60", "60-65", "65-70", "70-75", "75-80", "80+"])
+        rows.append({"Confidence Bucket": bucket, "Confidence": conf, "Win": 1 if result == "WIN" else 0})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    out = df.groupby("Confidence Bucket", as_index=False).agg(Plays=("Win", "count"), Win_Rate=("Win", "mean"), Avg_Confidence=("Confidence", "mean"))
+    out["Win Rate %"] = (out["Win_Rate"] * 100).round(1)
+    out["Avg Confidence %"] = out["Avg_Confidence"].round(1)
+    out["Calibration Gap"] = (out["Win Rate %"] - out["Avg Confidence %"]).round(1)
+    return out[["Confidence Bucket", "Plays", "Avg Confidence %", "Win Rate %", "Calibration Gap"]]
+
+
+def build_better_miss_reason_analytics(results):
+    rows = []
+    for p in results or []:
+        result = str(p.get("graded_result") or "")
+        if result not in ["WIN", "LOSS"]:
+            continue
+        reason = p.get("miss_reason")
+        if not reason:
+            try:
+                reason = classify_k_miss_reason(p).get("miss_reason")
+            except Exception:
+                reason = "UNCLASSIFIED"
+        rows.append({
+            "Miss Reason": reason or "UNCLASSIFIED",
+            "Loss": 1 if result == "LOSS" else 0,
+            "Win": 1 if result == "WIN" else 0,
+            "Early Pull": 1 if (p.get("early_pull_flag") is True or str(reason).upper().find("EARLY_PULL") >= 0) else 0,
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    out = df.groupby("Miss Reason", as_index=False).agg(Plays=("Loss", "count"), Losses=("Loss", "sum"), Wins=("Win", "sum"), Early_Pulls=("Early Pull", "sum"))
+    out["Loss Rate %"] = ((out["Losses"] / out["Plays"].replace(0, 1)) * 100).round(1)
+    return out.sort_values(["Losses", "Plays"], ascending=False)
+
 with tab5:
     st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
     if st.button("✅ AFTER GAMES — Grade Results + Update Learning", use_container_width=True):
@@ -12714,6 +12797,24 @@ with tab5:
             st.dataframe(sig, use_container_width=True, hide_index=True)
         else:
             st.info("Signal tracking starts after graded wins/losses.")
+        st.markdown('<div class="section-title-pro">Calibration Dashboard</div>', unsafe_allow_html=True)
+        cal_dash = build_k_projection_bucket_audit(results)
+        if not cal_dash.empty:
+            st.dataframe(cal_dash, use_container_width=True, hide_index=True)
+        else:
+            st.info("Calibration dashboard will populate after graded K props.")
+        st.markdown('<div class="section-title-pro">Confidence Calibration Audit</div>', unsafe_allow_html=True)
+        conf_dash = build_k_confidence_audit(results)
+        if not conf_dash.empty:
+            st.dataframe(conf_dash, use_container_width=True, hide_index=True)
+        else:
+            st.info("Confidence audit will populate after graded K props with confidence values.")
+        st.markdown('<div class="section-title-pro">Better Miss-Reason Analytics</div>', unsafe_allow_html=True)
+        miss_analytics = build_better_miss_reason_analytics(results)
+        if not miss_analytics.empty:
+            st.dataframe(miss_analytics, use_container_width=True, hide_index=True)
+        else:
+            st.info("Miss-reason analytics will populate after grading.")
         st.markdown('<div class="section-title-pro">K Miss Reason Learning</div>', unsafe_allow_html=True)
         miss_data = load_json(MISS_REASON_FILE, {})
         if miss_data:
