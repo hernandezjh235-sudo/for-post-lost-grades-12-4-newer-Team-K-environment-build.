@@ -16134,32 +16134,27 @@ def build_hrr_restored_board():
 
 
 # ============================================================
-# SELF-PROJECTED UNDERDOG MLB FANTASY POINTS
-# Version: SELF_PROJECTED_FS_TABS_2026_06_10
+
+
+# ============================================================
+# CLEAN SELF-PROJECTED FANTASY POINTS PAGE
+# Version: CLEAN_SELF_PROJECTED_FS_PAGE_2026_06_10
 #
-# NO Underdog fantasy line pulling.
+# Clean rebuild:
+# - NO Underdog Fantasy line pulling
+# - NO UD debug
+# - NO old Fantasy warning block
+# - One page only
+# - Two inner tabs:
+#     ⚾ Pitcher FS
+#     🏆 Batter FS
 #
-# Separate tabs:
-# - Pitcher FS
-# - Batter FS
-#
-# Underdog scoring:
-# Pitcher:
-#   Win +5, Quality Start +5, Strikeout +3,
-#   Inning Pitched +3, Earned Run -3
-#
-# Hitter:
-#   Single +3, Double +6, Triple +8, HR +10,
-#   Walk +3, HBP +3, RBI +2, Run +2, SB +4
-#
-# K Upside untouched.
-# Moneyline untouched.
-# H+R+R untouched.
+# K Upside, Moneyline, and H+R+R are untouched.
 # ============================================================
 
-SELF_PROJECTED_FS_VERSION = "SELF_PROJECTED_FS_TABS_2026_06_10"
+CLEAN_SELF_PROJECTED_FS_PAGE_VERSION = "CLEAN_SELF_PROJECTED_FS_PAGE_2026_06_10"
 
-def _fs_self_float(x, default=0.0):
+def _clean_fs_float(x, default=0.0):
     try:
         if x in (None, "", "—"):
             return default
@@ -16167,55 +16162,17 @@ def _fs_self_float(x, default=0.0):
     except Exception:
         return default
 
-def _fs_self_norm(x):
+def _clean_fs_norm(x):
     try:
         return normalize_name(x)
     except Exception:
         import re
         return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
 
-def _fs_grade(score):
-    s = _fs_self_float(score, 0)
-    if s >= 75:
-        return "A"
-    if s >= 62:
-        return "B"
-    if s >= 50:
-        return "C"
-    return "D"
-
-def _fs_conf_from_range(proj, floor, ceiling):
-    spread = max(0.1, float(ceiling) - float(floor))
-    base = 78 - spread * 3.2
-    return round(max(45, min(88, base)), 1)
-
-def _fs_moneyball_grade(ctx):
-    obp = _fs_self_float(ctx.get("OBP") or ctx.get("Projected OBP"), 0.320)
-    wrc = _fs_self_float(ctx.get("wRC+") or ctx.get("Team wRC+") or ctx.get("Lineup wRC+"), 100)
-    iso = _fs_self_float(ctx.get("ISO"), 0.150)
-    bb = _fs_self_float(ctx.get("BB%") or ctx.get("Walk%"), 8.0)
-    k = _fs_self_float(ctx.get("K%"), 22.0)
-
-    score = 50
-    score += (obp - 0.320) * 120
-    score += (wrc - 100) * 0.25
-    score += (iso - 0.150) * 55
-    score += (bb - 8.0) * 0.8
-    score -= max(0, k - 22.0) * 0.4
-
-    score = round(_hrr95_clamp(score, 20, 95), 1) if "_hrr95_clamp" in globals() else round(max(20, min(95, score)), 1)
-    if score >= 75:
-        label = "ELITE MONEYBALL"
-    elif score >= 62:
-        label = "GOOD MONEYBALL"
-    elif score >= 45:
-        label = "NEUTRAL"
-    else:
-        label = "POOR"
-    return score, label
-
-def _fs_get_pitcher_rows_source():
+def _clean_fs_pitcher_rows():
     rows, seen = [], set()
+
+    # Read from existing K board/session tables.
     try:
         for key in list(st.session_state.keys()):
             obj = st.session_state.get(key)
@@ -16225,92 +16182,121 @@ def _fs_get_pitcher_rows_source():
                 name = str(r.get("Pitcher") or "").strip()
                 if not name or name == "—":
                     continue
-                nk = _fs_self_norm(name)
+                nk = _clean_fs_norm(name)
                 if nk in seen:
                     continue
                 seen.add(nk)
                 rows.append(r.to_dict())
     except Exception:
         pass
+
     return rows
 
-def _fs_pitcher_projection_from_row(r):
+def _clean_fs_pitcher_projection(r):
     name = str(r.get("Pitcher") or r.get("Player") or "").strip()
     matchup = r.get("Matchup") or r.get("Game") or ""
 
-    k_proj = _fs_self_float(r.get("K PROJ") or r.get("Median") or r.get("Projection") or r.get("Proj"), 0.0)
-    ip_floor = _fs_self_float(r.get("IP Floor"), 5.0)
-    exp_bf = _fs_self_float(r.get("Exp BF"), 22.0)
-
-    # Better IP estimate from BF when available.
+    k_proj = _clean_fs_float(r.get("K PROJ") or r.get("Median") or r.get("Projection") or r.get("Proj"), 0.0)
+    exp_bf = _clean_fs_float(r.get("Exp BF"), 22.0)
+    ip_floor = _clean_fs_float(r.get("IP Floor"), 5.0)
     ip_proj = max(ip_floor, min(7.2, exp_bf / 4.35))
-    er_proj = _fs_self_float(r.get("ER Proj") or r.get("Earned Runs Projection"), None)
-    if er_proj is None:
-        # conservative ER estimate based on run environment if available
-        opp_runs = _fs_self_float(r.get("Opp Implied Runs") or r.get("Opp Team Runs"), 4.25)
-        er_proj = max(1.2, min(4.5, opp_runs * (ip_proj / 9.0) * 0.82))
 
-    win_prob = _fs_self_float(r.get("Win %") or r.get("Win Probability") or r.get("Team Win%"), None)
-    if win_prob is None:
-        win_prob = 0.47
-    elif win_prob > 1:
-        win_prob = win_prob / 100.0
+    opp_runs = _clean_fs_float(r.get("Opp Implied Runs") or r.get("Opp Team Runs"), 4.25)
+    er_proj = _clean_fs_float(r.get("ER Proj") or r.get("Earned Runs Projection"), opp_runs * (ip_proj / 9.0) * 0.82)
 
-    qs_prob = _fs_self_float(r.get("QS %") or r.get("Quality Start %"), None)
+    win_prob = _clean_fs_float(r.get("Win %") or r.get("Win Probability") or r.get("Team Win%"), 47.0)
+    if win_prob > 1:
+        win_prob /= 100.0
+
+    qs_prob = _clean_fs_float(r.get("QS %") or r.get("Quality Start %"), None)
     if qs_prob is None:
         qs_prob = max(0.05, min(0.65, (ip_proj - 5.4) * 0.35))
     elif qs_prob > 1:
-        qs_prob = qs_prob / 100.0
+        qs_prob /= 100.0
 
-    # Underdog Pitcher FS
-    fs = (k_proj * 3.0) + (ip_proj * 3.0) - (er_proj * 3.0) + (win_prob * 5.0) + (qs_prob * 5.0)
-    floor = fs - (2.5 + max(0, 6.0 - ip_proj) * 0.8)
-    ceiling = fs + (3.0 + k_proj * 0.55)
+    opp_k = _clean_fs_float(r.get("Opp K%") or r.get("Opponent K%") or r.get("Lineup K%"), 22.0)
+    opp_wrc = _clean_fs_float(r.get("Opp wRC+") or r.get("Opponent wRC+") or r.get("Lineup wRC+"), 100.0)
+    matchup_adj = max(-0.65, min(0.65, ((opp_k - 22.0) * 0.04) - ((opp_wrc - 100) * 0.01)))
 
-    conf = _fs_conf_from_range(fs, floor, ceiling)
-    grade = _fs_grade(conf)
+    # Underdog pitcher scoring
+    fs = (k_proj * 3.0) + (ip_proj * 3.0) - (er_proj * 3.0) + (win_prob * 5.0) + (qs_prob * 5.0) + matchup_adj
+
+    floor = max(0, fs - 4.5)
+    ceiling = fs + 4.5 + k_proj * 0.35
+    conf = round(max(45, min(88, 78 - (ceiling - floor) * 1.8)), 1)
 
     return {
         "Pitcher": name,
         "Matchup": matchup,
         "FS Projection": round(fs, 2),
-        "Floor": round(max(0, floor), 2),
+        "Floor": round(floor, 2),
         "Median": round(fs, 2),
-        "Ceiling": round(max(fs, ceiling), 2),
+        "Ceiling": round(ceiling, 2),
         "Confidence %": conf,
-        "Grade": grade,
         "K Projection": round(k_proj, 2),
         "IP Projection": round(ip_proj, 2),
         "ER Projection": round(er_proj, 2),
         "Win %": round(win_prob * 100, 1),
         "QS %": round(qs_prob * 100, 1),
-        "Source": "Self Projected Pitcher FS",
+        "Opp K%": round(opp_k, 1),
+        "Opp wRC+": round(opp_wrc, 1),
+        "Matchup Adj": round(matchup_adj, 2),
     }
 
 def build_self_projected_pitcher_fs_board():
-    return pd.DataFrame([_fs_pitcher_projection_from_row(r) for r in _fs_get_pitcher_rows_source()])
+    out = []
+    for r in _clean_fs_pitcher_rows():
+        try:
+            row = _clean_fs_pitcher_projection(r)
+            if row.get("Pitcher"):
+                out.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(out)
 
-def _fs_get_batter_context_rows():
+def _clean_fs_batter_rows():
     rows, seen = [], set()
 
-    # Prefer existing batter/H+R+R/session rows.
+    # Prefer H+R+R board because it already carries hitter context.
+    for fn_name in ["build_hrr_restored_board", "build_batter_prop_board"]:
+        try:
+            fn = globals().get(fn_name)
+            if not callable(fn):
+                continue
+            df = fn()
+            if not hasattr(df, "columns"):
+                continue
+            for _, r in df.iterrows():
+                name = str(r.get("Player") or r.get("Batter") or r.get("Hitter") or r.get("Name") or "").strip()
+                if not name or name == "—":
+                    continue
+                nk = _clean_fs_norm(name)
+                if nk in seen:
+                    continue
+                seen.add(nk)
+                row = r.to_dict()
+                row["Player"] = name
+                rows.append(row)
+        except Exception:
+            continue
+
+    # Session fallback.
     try:
         for key in list(st.session_state.keys()):
             obj = st.session_state.get(key)
             if not hasattr(obj, "columns"):
                 continue
-            for name_col in ["Player", "Batter", "Hitter", "Name"]:
-                if name_col not in obj.columns:
+            for col in ["Player", "Batter", "Hitter", "Name"]:
+                if col not in obj.columns:
                     continue
                 for _, r in obj.iterrows():
-                    name = str(r.get(name_col) or "").strip()
+                    name = str(r.get(col) or "").strip()
                     if not name or name == "—":
                         continue
-                    nk = _fs_self_norm(name)
-                    if nk in seen:
+                    if "Pitcher" in obj.columns:
                         continue
-                    # avoid pitcher rows
-                    if "Pitcher" in obj.columns and name_col == "Player":
+                    nk = _clean_fs_norm(name)
+                    if nk in seen:
                         continue
                     seen.add(nk)
                     row = r.to_dict()
@@ -16321,107 +16307,99 @@ def _fs_get_batter_context_rows():
 
     return rows
 
-def _fs_batter_component_projection(ctx):
-    """
-    Component-based Underdog hitter fantasy:
-    single/double/triple/hr/bb/hbp/run/rbi/sb.
-    Uses H+R+R / Moneyball / run creation context when available.
-    """
-    name = str(ctx.get("Player") or ctx.get("Batter") or ctx.get("Name") or "").strip()
+def _clean_fs_moneyball(ctx):
+    obp = _clean_fs_float(ctx.get("OBP"), 0.320)
+    wrc = _clean_fs_float(ctx.get("wRC+") or ctx.get("Team wRC+") or ctx.get("Lineup wRC+"), 100)
+    iso = _clean_fs_float(ctx.get("ISO"), 0.150)
+    bb = _clean_fs_float(ctx.get("BB%") or ctx.get("Walk%"), 8.0)
+    score = 50 + (obp - 0.320) * 120 + (wrc - 100) * 0.25 + (iso - 0.150) * 55 + (bb - 8.0) * 0.8
+    score = round(max(20, min(95, score)), 1)
+    label = "ELITE" if score >= 75 else ("GOOD" if score >= 62 else ("NEUTRAL" if score >= 45 else "POOR"))
+    return score, label
+
+def _clean_fs_batter_projection(ctx):
+    name = str(ctx.get("Player") or ctx.get("Batter") or ctx.get("Hitter") or ctx.get("Name") or "").strip()
     matchup = ctx.get("Matchup") or ctx.get("Game") or ""
 
-    # Opportunity
     slot = ctx.get("Lineup Slot") or ctx.get("Batting Order") or ctx.get("Order") or ctx.get("Slot")
-    team_implied = ctx.get("Team Implied Runs") or ctx.get("ImpR") or ctx.get("Team Runs")
-    lineup_confirmed = str(ctx.get("Lineup") or ctx.get("Lineup Status") or "").upper().find("CONFIRMED") >= 0
+    team_runs = _clean_fs_float(ctx.get("Team Implied Runs") or ctx.get("ImpR") or ctx.get("Team Runs"), 4.45)
 
-    if "_hrr95_projected_pa" in globals():
-        pa = _hrr95_projected_pa(slot, team_implied, lineup_confirmed, False)
-    else:
-        pa = 4.1
+    try:
+        pa = _hrr95_projected_pa(slot, team_runs, True, False)
+    except Exception:
+        s = int(slot) if _clean_fs_float(slot, None) else 4
+        pa = {1:4.75,2:4.65,3:4.5,4:4.35,5:4.2,6:4.05,7:3.9,8:3.75,9:3.6}.get(s,4.05)
 
-    # Rates / fallback Moneyball-style
-    avg = _fs_self_float(ctx.get("AVG"), 0.245)
-    obp = _fs_self_float(ctx.get("OBP"), 0.320)
-    iso = _fs_self_float(ctx.get("ISO"), 0.150)
-    bb_rate = _fs_self_float(ctx.get("BB%") or ctx.get("Walk%"), 8.0) / 100.0
-    k_rate = _fs_self_float(ctx.get("K%"), 22.0) / 100.0
-    hr_rate = _fs_self_float(ctx.get("HR%"), None)
+    avg = _clean_fs_float(ctx.get("AVG"), 0.245)
+    obp = _clean_fs_float(ctx.get("OBP"), 0.320)
+    iso = _clean_fs_float(ctx.get("ISO"), 0.150)
+    bb_rate = _clean_fs_float(ctx.get("BB%") or ctx.get("Walk%"), 8.0) / 100.0
+    hbp_rate = _clean_fs_float(ctx.get("HBP%"), 1.0) / 100.0
+
+    hr_rate = _clean_fs_float(ctx.get("HR%"), None)
     if hr_rate is None:
         hr_rate = max(0.015, min(0.075, iso * 0.22))
-    else:
-        hr_rate = hr_rate / 100.0 if hr_rate > 1 else hr_rate
+    elif hr_rate > 1:
+        hr_rate /= 100.0
 
-    hbp_rate = _fs_self_float(ctx.get("HBP%"), 1.0) / 100.0
-    sb_rate = _fs_self_float(ctx.get("SB/G") or ctx.get("SB Rate"), None)
-    if sb_rate is None:
-        sb = _fs_self_float(ctx.get("SB") or ctx.get("Season SB"), 0)
-        sb_rate = min(0.30, sb / 120.0)
-
-    # Contact and bases
     ab = max(0.1, pa * (1 - bb_rate - hbp_rate))
-    hits = max(0.0, ab * avg)
-    hr = max(0.0, pa * hr_rate)
-    non_hr_hits = max(0.0, hits - hr)
+    hits = max(0, ab * avg)
+    hr = max(0, pa * hr_rate)
+    non_hr_hits = max(0, hits - hr)
 
-    # XBH split from ISO. More ISO => more doubles/triples/HR.
     double_share = max(0.12, min(0.32, 0.16 + iso * 0.35))
-    triple_share = max(0.005, min(0.035, _fs_self_float(ctx.get("3B/G"), 0.01)))
-    doubles = max(0.0, non_hr_hits * double_share)
-    triples = max(0.0, non_hr_hits * triple_share)
-    singles = max(0.0, non_hr_hits - doubles - triples)
+    triple_share = max(0.005, min(0.035, _clean_fs_float(ctx.get("3B/G"), 0.01)))
+    doubles = max(0, non_hr_hits * double_share)
+    triples = max(0, non_hr_hits * triple_share)
+    singles = max(0, non_hr_hits - doubles - triples)
 
-    walks = max(0.0, pa * bb_rate)
-    hbp = max(0.0, pa * hbp_rate)
+    walks = max(0, pa * bb_rate)
+    hbp = max(0, pa * hbp_rate)
 
-    # Runs/RBI from H+R+R logic/team environment
-    imp = _fs_self_float(team_implied, 4.45)
-    slot_num = int(slot) if _fs_self_float(slot, None) else 4
+    s = int(slot) if _clean_fs_float(slot, None) else 4
+    runs = 0.45 + (team_runs - 4.45) * 0.10
+    rbi = 0.45 + (team_runs - 4.45) * 0.10
+    if s in [1, 2]:
+        runs += 0.18
+        rbi -= 0.05
+    elif s in [3, 4, 5]:
+        rbi += 0.18
+        runs += 0.05
+    elif s >= 7:
+        runs -= 0.10
+        rbi -= 0.10
 
-    run_base = 0.45 + (imp - 4.45) * 0.10
-    rbi_base = 0.45 + (imp - 4.45) * 0.10
-    if slot_num in [1, 2]:
-        run_base += 0.18
-        rbi_base -= 0.05
-    elif slot_num in [3, 4, 5]:
-        rbi_base += 0.18
-        run_base += 0.05
-    elif slot_num >= 7:
-        run_base -= 0.10
-        rbi_base -= 0.10
-
-    runs = max(0.05, min(1.35, run_base))
-    rbi = max(0.05, min(1.35, rbi_base))
-    sb = max(0.0, sb_rate)
-
-    # Apply HR effects already include run/RBI probability, small boost only
     runs += hr * 0.55
     rbi += hr * 0.75
+    sb = _clean_fs_float(ctx.get("SB/G") or ctx.get("SB Rate"), None)
+    if sb is None:
+        sb = min(0.30, _clean_fs_float(ctx.get("SB") or ctx.get("Season SB"), 0) / 120.0)
 
-    # Moneyball and H+R+R context nudges
-    mb_score, mb_grade = _fs_moneyball_grade(ctx)
-    if mb_score >= 70:
-        walks += 0.05
-        runs += 0.04
-    elif mb_score < 40:
-        walks -= 0.03
+    mb_score, mb_label = _clean_fs_moneyball(ctx)
+
+    # Batter matchup adjustments
+    hand_score = _clean_fs_float(ctx.get("Hand Split Score"), 50)
+    pitcher_quality = _clean_fs_float(ctx.get("Pitcher Attack Score") or ctx.get("Pitcher Quality Score"), 50)
+    park_score = _clean_fs_float(ctx.get("Park Score") or ctx.get("Run Environment Score"), 50)
+    matchup_adj = max(-0.65, min(0.75, ((hand_score - 50) / 100) + ((pitcher_quality - 50) / 120) + ((park_score - 50) / 150)))
 
     # Underdog hitter scoring
     fs = (
-        singles * 3.0
-        + doubles * 6.0
-        + triples * 8.0
-        + hr * 10.0
-        + walks * 3.0
-        + hbp * 3.0
-        + rbi * 2.0
-        + runs * 2.0
-        + sb * 4.0
+        singles * 3
+        + doubles * 6
+        + triples * 8
+        + hr * 10
+        + walks * 3
+        + hbp * 3
+        + rbi * 2
+        + runs * 2
+        + sb * 4
+        + matchup_adj
     )
 
-    floor = fs * 0.45
+    floor = max(0, fs * 0.45)
     ceiling = fs + 3.0 + hr * 5.0 + sb * 2.0
-    conf = _fs_conf_from_range(fs, floor, ceiling)
+    conf = round(max(45, min(88, 78 - (ceiling - floor) * 3.0)), 1)
 
     return {
         "Player": name,
@@ -16431,7 +16409,6 @@ def _fs_batter_component_projection(ctx):
         "Median": round(fs, 2),
         "Ceiling": round(ceiling, 2),
         "Confidence %": conf,
-        "Grade": _fs_grade(conf),
         "PA": round(pa, 2),
         "Singles": round(singles, 2),
         "Doubles": round(doubles, 2),
@@ -16439,631 +16416,51 @@ def _fs_batter_component_projection(ctx):
         "HR": round(hr, 2),
         "Walks": round(walks, 2),
         "HBP": round(hbp, 2),
-        "Runs": round(runs, 2),
-        "RBI": round(rbi, 2),
-        "SB": round(sb, 2),
+        "Runs": round(max(0, runs), 2),
+        "RBI": round(max(0, rbi), 2),
+        "SB": round(max(0, sb), 2),
         "Moneyball Score": mb_score,
-        "Moneyball Grade": mb_grade,
-        "Source": "Self Projected Batter FS",
+        "Moneyball": mb_label,
+        "Matchup Adj": round(matchup_adj, 2),
     }
 
 def build_self_projected_batter_fs_board():
-    rows = []
-    for ctx in _fs_get_batter_context_rows():
+    out = []
+    for ctx in _clean_fs_batter_rows():
         try:
-            rows.append(_fs_batter_component_projection(ctx))
+            row = _clean_fs_batter_projection(ctx)
+            if row.get("Player"):
+                out.append(row)
         except Exception:
             continue
-    return pd.DataFrame(rows)
-
-def render_self_projected_fantasy_tabs():
-    st.subheader("Self-Projected MLB Fantasy Points")
-    st.caption(f"Version: {SELF_PROJECTED_FS_VERSION}. No Underdog Fantasy line pulling. Uses true MLB stats, lineups, matchups, and Underdog scoring.")
-
-    tab1, tab2 = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
-
-    with tab1:
-        dfp = build_self_projected_pitcher_fs_board()
-        if dfp is None or len(dfp) == 0:
-            st.warning("No pitcher fantasy rows yet. Open/refresh K Upside first so pitcher projections load.")
-        else:
-            st.dataframe(
-                dfp.sort_values("FS Projection", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with tab2:
-        dfb = build_self_projected_batter_fs_board()
-        if dfb is None or len(dfb) == 0:
-            st.warning("No batter fantasy rows yet. Load batter/H+R+R board or confirmed lineups first.")
-        else:
-            st.dataframe(
-                dfb.sort_values("FS Projection", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-# Force fantasy tab names to self-projected tabs.
-def render_fantasy_score_tab():
-    return render_self_projected_fantasy_tabs()
-
-def render_fantasy_points_tab():
-    return render_self_projected_fantasy_tabs()
-
-def render_fantasy_tab():
-    return render_self_projected_fantasy_tabs()
-
-def render_ud_fantasy_points_tab():
-    return render_self_projected_fantasy_tabs()
-
-def render_underdog_fantasy_points_tab():
-    return render_self_projected_fantasy_tabs()
-
-
-
-# ============================================================
-# FANTASY MATCHUP LAYER 1.0 — SELF-PROJECTED FS ONLY
-# Version: FANTASY_MATCHUP_LAYER_1_2026_06_10
-#
-# Added ONLY to self-projected Fantasy tabs:
-# - Batter vs Pitcher Hand
-# - Batter vs Pitcher Quality
-# - Pitcher vs Opponent K%
-# - Pitcher vs Opponent Run Creation
-# - Bullpen Adjustment
-# - Park Adjustment
-#
-# No Underdog Fantasy line pulling.
-# K Upside, Moneyline, and H+R+R tabs are untouched.
-# ============================================================
-
-FANTASY_MATCHUP_LAYER_VERSION = "FANTASY_MATCHUP_LAYER_1_2026_06_10"
-
-def _fs_matchup_clamp(x, lo, hi):
-    try:
-        return max(lo, min(hi, float(x)))
-    except Exception:
-        return lo
-
-def _fs_matchup_label(score):
-    s = _fs_self_float(score, 50)
-    if s >= 72:
-        return "PLUS"
-    if s >= 56:
-        return "GOOD"
-    if s >= 44:
-        return "NEUTRAL"
-    return "BAD"
-
-def _fs_batter_vs_pitcher_hand_score(ctx):
-    hand = str(ctx.get("Opp SP Hand") or ctx.get("Pitcher Hand") or ctx.get("Opp Hand") or ctx.get("SP Hand") or "").upper()
-    if hand.startswith("L"):
-        wrc = _fs_self_float(ctx.get("wRC+ vs LHP") or ctx.get("vs LHP wRC+") or ctx.get("LHP wRC+"), None)
-        ops = _fs_self_float(ctx.get("OPS vs LHP") or ctx.get("vs LHP OPS"), None)
-    elif hand.startswith("R"):
-        wrc = _fs_self_float(ctx.get("wRC+ vs RHP") or ctx.get("vs RHP wRC+") or ctx.get("RHP wRC+"), None)
-        ops = _fs_self_float(ctx.get("OPS vs RHP") or ctx.get("vs RHP OPS"), None)
-    else:
-        wrc = _fs_self_float(ctx.get("wRC+"), None)
-        ops = _fs_self_float(ctx.get("OPS"), None)
-
-    score = 50.0
-    if wrc is not None:
-        score += (wrc - 100) * 0.45
-    if ops is not None:
-        score += (ops - 0.720) * 45
-    score = round(_fs_matchup_clamp(score, 20, 92), 1)
-    return score, _fs_matchup_label(score), hand or "UNK"
-
-def _fs_batter_vs_pitcher_quality_score(ctx):
-    era = _fs_self_float(ctx.get("Opp SP ERA") or ctx.get("Pitcher ERA"), None)
-    fip = _fs_self_float(ctx.get("Opp SP FIP") or ctx.get("Pitcher FIP") or ctx.get("xFIP"), None)
-    whip = _fs_self_float(ctx.get("Opp SP WHIP") or ctx.get("Pitcher WHIP"), None)
-    k9 = _fs_self_float(ctx.get("Opp SP K/9") or ctx.get("Pitcher K/9"), None)
-    hard = _fs_self_float(ctx.get("HardHit% Allowed") or ctx.get("Opp SP HardHit%"), None)
-
-    score = 50.0
-    if era is not None:
-        score += (era - 4.10) * 4.0
-    if fip is not None:
-        score += (fip - 4.10) * 4.0
-    if whip is not None:
-        score += (whip - 1.25) * 18
-    if k9 is not None:
-        score -= (k9 - 8.5) * 1.8
-    if hard is not None:
-        score += (hard - 39.0) * 0.55
-
-    score = round(_fs_matchup_clamp(score, 20, 92), 1)
-    label = "ATTACK" if score >= 68 else ("AVOID" if score <= 38 else "NEUTRAL")
-    return score, label
-
-def _fs_bullpen_adj_score(ctx):
-    bp = _fs_self_float(ctx.get("Opp Bullpen Score") or ctx.get("Bullpen Attack Score"), None)
-    era = _fs_self_float(ctx.get("Opp Bullpen ERA") or ctx.get("Bullpen ERA"), None)
-    xfi = _fs_self_float(ctx.get("Opp Bullpen xFIP") or ctx.get("Bullpen xFIP"), None)
-    workload = _fs_self_float(ctx.get("Bullpen Workload") or ctx.get("Opp Bullpen 3D Pitches"), None)
-
-    score = 50.0
-    if bp is not None:
-        score += (bp - 50) * 0.35
-    if era is not None:
-        score += (era - 4.10) * 3.2
-    if xfi is not None:
-        score += (xfi - 4.10) * 3.0
-    if workload is not None:
-        score += min(10, workload / 18.0)
-
-    score = round(_fs_matchup_clamp(score, 20, 92), 1)
-    label = "BULLPEN_TARGET" if score >= 68 else ("BULLPEN_AVOID" if score <= 38 else "BULLPEN_NEUTRAL")
-    return score, label
-
-def _fs_park_adj_score(ctx):
-    pf = _fs_self_float(ctx.get("Park Factor") or ctx.get("Park"), 1.0)
-    temp = _fs_self_float(ctx.get("Temp") or ctx.get("Temperature"), None)
-    wind = _fs_self_float(ctx.get("Wind Out") or ctx.get("Wind"), None)
-
-    score = 50 + (pf - 1.0) * 55
-    if temp is not None:
-        score += (temp - 72) * 0.20
-    if wind is not None:
-        score += wind * 0.25
-
-    score = round(_fs_matchup_clamp(score, 20, 92), 1)
-    label = "PARK_PLUS" if score >= 66 else ("PARK_MINUS" if score <= 40 else "PARK_NEUTRAL")
-    return score, label
-
-def _fs_pitcher_opp_k_score(r):
-    opp_k = _fs_self_float(r.get("Opp K%") or r.get("Opponent K%") or r.get("Lineup K%"), None)
-    if opp_k is None:
-        return 50.0, "OPP_K_UNKNOWN"
-    # MLB avg around 22%
-    score = 50 + (opp_k - 22.0) * 2.2
-    score = round(_fs_matchup_clamp(score, 20, 92), 1)
-    label = "K_UP_MATCHUP" if score >= 65 else ("K_DOWN_MATCHUP" if score <= 40 else "K_NEUTRAL")
-    return score, label
-
-def _fs_pitcher_opp_run_creation_score(r):
-    wrc = _fs_self_float(r.get("Opp wRC+") or r.get("Opponent wRC+") or r.get("Lineup wRC+"), None)
-    ops = _fs_self_float(r.get("Opp OPS") or r.get("Opponent OPS") or r.get("Lineup OPS"), None)
-    imp = _fs_self_float(r.get("Opp Implied Runs") or r.get("Opp Team Runs"), None)
-
-    score = 50.0
-    if wrc is not None:
-        score -= (wrc - 100) * 0.35
-    if ops is not None:
-        score -= (ops - 0.720) * 42
-    if imp is not None:
-        score -= (imp - 4.45) * 7.0
-
-    score = round(_fs_matchup_clamp(score, 20, 92), 1)
-    label = "RUN_SUPPRESS_PLUS" if score >= 65 else ("RUN_RISK" if score <= 40 else "RUN_NEUTRAL")
-    return score, label
-
-# Wrap batter component projection with matchup adjustments.
-_prev_fs_batter_component_projection_matchup = _fs_batter_component_projection
-
-def _fs_batter_component_projection(ctx):
-    row = _prev_fs_batter_component_projection_matchup(ctx)
-
-    hand_score, hand_label, hand = _fs_batter_vs_pitcher_hand_score(ctx)
-    quality_score, quality_label = _fs_batter_vs_pitcher_quality_score(ctx)
-    bullpen_score, bullpen_label = _fs_bullpen_adj_score(ctx)
-    park_score, park_label = _fs_park_adj_score(ctx)
-
-    # Add small capped matchup nudge to FS projection.
-    adj = 0.0
-    adj += _fs_matchup_clamp((hand_score - 50) / 80, -0.30, 0.40)
-    adj += _fs_matchup_clamp((quality_score - 50) / 90, -0.25, 0.35)
-    adj += _fs_matchup_clamp((bullpen_score - 50) / 120, -0.15, 0.25)
-    adj += _fs_matchup_clamp((park_score - 50) / 120, -0.15, 0.25)
-
-    base = _fs_self_float(row.get("FS Projection"), 0.0)
-    new_proj = round(max(0, base + adj), 2)
-    row["Base FS Projection"] = base
-    row["FS Projection"] = new_proj
-    row["Median"] = new_proj
-    row["Ceiling"] = round(_fs_self_float(row.get("Ceiling"), new_proj) + max(0, adj) * 1.5, 2)
-    row["Floor"] = round(max(0, _fs_self_float(row.get("Floor"), 0) + min(0, adj) * 1.2), 2)
-
-    row["Pitcher Hand"] = hand
-    row["Hand Split Score"] = hand_score
-    row["Hand Split"] = hand_label
-    row["Pitcher Quality Score"] = quality_score
-    row["Pitcher Quality"] = quality_label
-    row["Bullpen Score"] = bullpen_score
-    row["Bullpen Adj"] = bullpen_label
-    row["Park Score"] = park_score
-    row["Park Adj"] = park_label
-    row["Matchup Adj"] = round(adj, 2)
-    row["Fantasy Matchup Version"] = FANTASY_MATCHUP_LAYER_VERSION
-    return row
-
-# Wrap pitcher projection with opponent matchup adjustments.
-_prev_fs_pitcher_projection_from_row_matchup = _fs_pitcher_projection_from_row
-
-def _fs_pitcher_projection_from_row(r):
-    row = _prev_fs_pitcher_projection_from_row_matchup(r)
-
-    opp_k_score, opp_k_label = _fs_pitcher_opp_k_score(r)
-    run_score, run_label = _fs_pitcher_opp_run_creation_score(r)
-    park_score, park_label = _fs_park_adj_score(r)
-    bullpen_score, bullpen_label = _fs_bullpen_adj_score(r)
-
-    adj = 0.0
-    adj += _fs_matchup_clamp((opp_k_score - 50) / 75, -0.35, 0.45)
-    adj += _fs_matchup_clamp((run_score - 50) / 95, -0.30, 0.35)
-    adj += _fs_matchup_clamp((park_score - 50) / 130, -0.18, 0.15)
-    # For pitchers, strong offensive bullpen is less direct; use tiny support/risk effect only.
-    adj -= _fs_matchup_clamp((bullpen_score - 50) / 200, -0.08, 0.12)
-
-    base = _fs_self_float(row.get("FS Projection"), 0.0)
-    new_proj = round(max(0, base + adj), 2)
-    row["Base FS Projection"] = base
-    row["FS Projection"] = new_proj
-    row["Median"] = new_proj
-    row["Ceiling"] = round(_fs_self_float(row.get("Ceiling"), new_proj) + max(0, adj) * 1.2, 2)
-    row["Floor"] = round(max(0, _fs_self_float(row.get("Floor"), 0) + min(0, adj) * 1.2), 2)
-
-    row["Opp K Score"] = opp_k_score
-    row["Opp K Matchup"] = opp_k_label
-    row["Opp Run Creation Score"] = run_score
-    row["Opp Run Creation"] = run_label
-    row["Park Score"] = park_score
-    row["Park Adj"] = park_label
-    row["Bullpen Score"] = bullpen_score
-    row["Bullpen Adj"] = bullpen_label
-    row["Matchup Adj"] = round(adj, 2)
-    row["Fantasy Matchup Version"] = FANTASY_MATCHUP_LAYER_VERSION
-    return row
-
-
-
-# ============================================================
-# FORCE FANTASY POINTS TAB TO SELF-PROJECTED FS
-# Version: SELF_PROJECTED_FS_FORCED_ROUTE_2026_06_10
-#
-# This is intentionally the LAST override in the file.
-# It prevents the old "" block from rendering.
-#
-# No Underdog Fantasy line pulling.
-# Separate tabs:
-#   ⚾ Pitcher FS
-#   🏆 Batter FS
-#
-# K Upside, Moneyline, and H+R+R are untouched.
-# ============================================================
-
-SELF_PROJECTED_FS_FORCED_ROUTE_VERSION = "SELF_PROJECTED_FS_FORCED_ROUTE_2026_06_10"
-
-def _render_self_projected_fs_forced():
-    st.subheader("Self-Projected MLB Fantasy Points")
-    st.caption(
-        f"Version: {SELF_PROJECTED_FS_FORCED_ROUTE_VERSION}. "
-        "No Underdog Fantasy line pulling. Uses true MLB stats, lineups, matchups, and Underdog scoring."
-    )
-
-    tab_p, tab_b = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
-
-    with tab_p:
-        try:
-            dfp = build_self_projected_pitcher_fs_board()
-        except Exception as e:
-            dfp = pd.DataFrame()
-            st.warning(f"Pitcher FS board could not build yet: {e}")
-
-        if dfp is None or len(dfp) == 0:
-            st.warning("No Pitcher FS rows yet. Refresh/open K PROJ / UPSIDE first so pitcher projections load.")
-        else:
-            cols = list(dfp.columns)
-            st.dataframe(
-                dfp.sort_values("FS Projection", ascending=False) if "FS Projection" in cols else dfp,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with tab_b:
-        try:
-            dfb = build_self_projected_batter_fs_board()
-        except Exception as e:
-            dfb = pd.DataFrame()
-            st.warning(f"Batter FS board could not build yet: {e}")
-
-        if dfb is None or len(dfb) == 0:
-            st.warning("No Batter FS rows yet. Load H+R+R/batter board or confirmed lineups first.")
-        else:
-            cols = list(dfb.columns)
-            st.dataframe(
-                dfb.sort_values("FS Projection", ascending=False) if "FS Projection" in cols else dfb,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-# Final forced renderer names.
-def render_fantasy_score_tab():
-    return _render_self_projected_fs_forced()
-
-def render_fantasy_points_tab():
-    return _render_self_projected_fs_forced()
-
-def render_fantasy_tab():
-    return _render_self_projected_fs_forced()
-
-def render_ud_fantasy_points_tab():
-    return _render_self_projected_fs_forced()
-
-def render_underdog_fantasy_points_tab():
-    return _render_self_projected_fs_forced()
-
-def render_manual_fantasy_points_tab():
-    return _render_self_projected_fs_forced()
-
-# Some versions call this table/cards function directly from the tab block.
-def _render_fantasy_score_table_and_cards(*args, **kwargs):
-    return _render_self_projected_fs_forced()
-
-# Some versions build the old UD-only board first. Make it harmless if called.
-def fetch_underdog_fantasy_score_rows():
-    return []
-
-def build_fantasy_score_board():
-    # If the app calls the old board-builder directly, return the self-projected batter board
-    # instead of an empty Underdog-only board.
-    try:
-        return build_self_projected_batter_fs_board()
-    except Exception:
-        return pd.DataFrame()
-
-
-
-# ============================================================
-# FINAL CLEAN ROUTE — SELF PROJECTED FS ONLY
-# Version: SELF_PROJECTED_FS_CLEAN_ROUTE_2026_06_10
-# ============================================================
-
-SELF_PROJECTED_FS_CLEAN_ROUTE_VERSION = "SELF_PROJECTED_FS_CLEAN_ROUTE_2026_06_10"
-
-def _render_self_projected_fs_clean_route():
-    st.subheader("Self-Projected MLB Fantasy Points")
-    st.caption(
-        f"Version: {SELF_PROJECTED_FS_CLEAN_ROUTE_VERSION}. "
-        "No Underdog Fantasy line pulling. Uses true MLB stats, lineups, matchups, and Underdog scoring."
-    )
-
-    tab_p, tab_b = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
-
-    with tab_p:
-        try:
-            dfp = build_self_projected_pitcher_fs_board()
-        except Exception as e:
-            dfp = pd.DataFrame()
-            st.warning(f"Pitcher FS board could not build yet: {e}")
-
-        if dfp is None or len(dfp) == 0:
-            st.warning("No Pitcher FS rows yet. Refresh/open K PROJ / UPSIDE first so pitcher projections load.")
-        else:
-            sort_col = "FS Projection" if "FS Projection" in dfp.columns else dfp.columns[0]
-            st.dataframe(dfp.sort_values(sort_col, ascending=False), use_container_width=True, hide_index=True)
-
-    with tab_b:
-        try:
-            dfb = build_self_projected_batter_fs_board()
-        except Exception as e:
-            dfb = pd.DataFrame()
-            st.warning(f"Batter FS board could not build yet: {e}")
-
-        if dfb is None or len(dfb) == 0:
-            st.warning("No Batter FS rows yet. Load H+R+R/batter board or confirmed lineups first.")
-        else:
-            sort_col = "FS Projection" if "FS Projection" in dfb.columns else dfb.columns[0]
-            st.dataframe(dfb.sort_values(sort_col, ascending=False), use_container_width=True, hide_index=True)
-
-def render_fantasy_score_tab():
-    _render_self_projected_fs_clean_route()
-    return None
-
-def render_fantasy_points_tab():
-    _render_self_projected_fs_clean_route()
-    return None
-
-def render_fantasy_tab():
-    _render_self_projected_fs_clean_route()
-    return None
-
-def render_ud_fantasy_points_tab():
-    _render_self_projected_fs_clean_route()
-    return None
-
-def render_underdog_fantasy_points_tab():
-    _render_self_projected_fs_clean_route()
-    return None
-
-def render_manual_fantasy_points_tab():
-    _render_self_projected_fs_clean_route()
-    return None
-
-def _render_fantasy_score_table_and_cards(*args, **kwargs):
-    _render_self_projected_fs_clean_route()
-    return None
-
-def fetch_underdog_fantasy_score_rows():
-    try:
-        st.session_state["fantasy_ud_debug"] = {}
-    except Exception:
-        pass
-    return []
-
-def build_fantasy_score_board():
-    try:
-        return build_self_projected_batter_fs_board()
-    except Exception:
-        return pd.DataFrame()
-
-
-
-# ============================================================
-# NO-UD-BLOCK SELF PROJECTED FANTASY FINAL
-# Version: SELF_PROJECTED_FS_NO_UD_BLOCK_2026_06_10
-#
-# Removes/neutralizes old Underdog Fantasy panel behavior.
-# Fantasy Points tab is projection-only:
-#   ⚾ Pitcher FS
-#   🏆 Batter FS
-#
-# NO Underdog Fantasy line pulling.
-# NO UD debug.
-# NO market samples.
-# ============================================================
-
-SELF_PROJECTED_FS_NO_UD_BLOCK_VERSION = "SELF_PROJECTED_FS_NO_UD_BLOCK_2026_06_10"
-
-def _fs_no_ud_clear_debug():
-    try:
-        st.session_state["fantasy_ud_debug"] = {}
-    except Exception:
-        pass
-
-def _render_self_projected_fs_no_ud_block():
-    _fs_no_ud_clear_debug()
-
-    st.subheader("Self-Projected MLB Fantasy Points")
-    st.caption(
-        f"Version: {SELF_PROJECTED_FS_NO_UD_BLOCK_VERSION}. "
-        "Projection-only. No Underdog Fantasy line pulling."
-    )
-
-    tab_p, tab_b = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
-
-    with tab_p:
-        try:
-            dfp = build_self_projected_pitcher_fs_board()
-        except Exception as e:
-            dfp = pd.DataFrame()
-            st.warning(f"Pitcher FS board could not build yet: {e}")
-
-        if dfp is None or len(dfp) == 0:
-            st.warning("No Pitcher FS rows yet. Refresh/open K PROJ / UPSIDE first so pitcher projections load.")
-        else:
-            if "FS Projection" in dfp.columns:
-                dfp = dfp.sort_values("FS Projection", ascending=False)
-            st.dataframe(dfp, use_container_width=True, hide_index=True)
-
-    with tab_b:
-        try:
-            dfb = build_self_projected_batter_fs_board()
-        except Exception as e:
-            dfb = pd.DataFrame()
-            st.warning(f"Batter FS board could not build yet: {e}")
-
-        if dfb is None or len(dfb) == 0:
-            st.warning("No Batter FS rows yet. Load H+R+R/batter board or confirmed lineups first.")
-        else:
-            if "FS Projection" in dfb.columns:
-                dfb = dfb.sort_values("FS Projection", ascending=False)
-            st.dataframe(dfb, use_container_width=True, hide_index=True)
-
-    return None
-
-# Final hard overrides for every Fantasy renderer name found in prior versions.
-def render_fantasy_score_tab():
-    return _render_self_projected_fs_no_ud_block()
-
-def render_fantasy_points_tab():
-    return _render_self_projected_fs_no_ud_block()
-
-def render_fantasy_tab():
-    return _render_self_projected_fs_no_ud_block()
-
-def render_ud_fantasy_points_tab():
-    return _render_self_projected_fs_no_ud_block()
-
-def render_underdog_fantasy_points_tab():
-    return _render_self_projected_fs_no_ud_block()
-
-def render_manual_fantasy_points_tab():
-    return _render_self_projected_fs_no_ud_block()
-
-def render_self_projected_fantasy_tabs():
-    return _render_self_projected_fs_no_ud_block()
-
-def _render_fantasy_score_table_and_cards(*args, **kwargs):
-    return _render_self_projected_fs_no_ud_block()
-
-# Final no-op for old UD fantasy data path.
-def fetch_underdog_fantasy_score_rows():
-    _fs_no_ud_clear_debug()
-    return []
-
-def build_fantasy_score_board():
-    _fs_no_ud_clear_debug()
-    try:
-        return build_self_projected_batter_fs_board()
-    except Exception:
-        return pd.DataFrame()
-
-# If old inline code asks for debug samples, keep them empty.
-def _fantasy_ud_debug_samples(*args, **kwargs):
-    return []
-
-
-
-# ============================================================
-# FULL PAGE FIX — FANTASY POINTS PAGE BODY
-# Version: SELF_PROJECTED_FS_FULL_PAGE_FIX_2026_06_10
-#
-# Fantasy page now renders ONLY:
-#   ⚾ Pitcher FS
-#   🏆 Batter FS
-#
-# No Underdog fantasy parser.
-# No UD debug.
-# No market samples.
-# K Upside, Moneyline, H+R+R untouched.
-# ============================================================
-
-SELF_PROJECTED_FS_FULL_PAGE_FIX_VERSION = "SELF_PROJECTED_FS_FULL_PAGE_FIX_2026_06_10"
+    return pd.DataFrame(out)
 
 def render_fantasy_points_page():
     st.subheader("Self-Projected MLB Fantasy Points")
     st.caption(
-        f"Version: {SELF_PROJECTED_FS_FULL_PAGE_FIX_VERSION}. "
+        f"Version: {CLEAN_SELF_PROJECTED_FS_PAGE_VERSION}. "
         "Projection-only. No Underdog Fantasy line pulling."
     )
 
-    tab_pitcher_fs, tab_batter_fs = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
+    tab_p, tab_b = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
 
-    with tab_pitcher_fs:
-        try:
-            pitcher_fs = build_self_projected_pitcher_fs_board()
-        except Exception as e:
-            pitcher_fs = pd.DataFrame()
-            st.warning(f"Pitcher FS could not build yet: {e}")
-
-        if pitcher_fs is None or len(pitcher_fs) == 0:
-            st.warning("No Pitcher FS rows yet. Refresh K PROJ / UPSIDE first, then return here.")
+    with tab_p:
+        dfp = build_self_projected_pitcher_fs_board()
+        if dfp is None or len(dfp) == 0:
+            st.warning("No Pitcher FS rows yet. Open or refresh K PROJ / UPSIDE first.")
         else:
-            if "FS Projection" in pitcher_fs.columns:
-                pitcher_fs = pitcher_fs.sort_values("FS Projection", ascending=False)
-            st.dataframe(pitcher_fs, use_container_width=True, hide_index=True)
+            st.dataframe(dfp.sort_values("FS Projection", ascending=False), use_container_width=True, hide_index=True)
 
-    with tab_batter_fs:
-        try:
-            batter_fs = build_self_projected_batter_fs_board()
-        except Exception as e:
-            batter_fs = pd.DataFrame()
-            st.warning(f"Batter FS could not build yet: {e}")
-
-        if batter_fs is None or len(batter_fs) == 0:
+    with tab_b:
+        dfb = build_self_projected_batter_fs_board()
+        if dfb is None or len(dfb) == 0:
             st.warning("No Batter FS rows yet. Load H+R+R/batter data or confirmed lineups first.")
         else:
-            if "FS Projection" in batter_fs.columns:
-                batter_fs = batter_fs.sort_values("FS Projection", ascending=False)
-            st.dataframe(batter_fs, use_container_width=True, hide_index=True)
+            st.dataframe(dfb.sort_values("FS Projection", ascending=False), use_container_width=True, hide_index=True)
 
     return None
 
-# Alias every likely page/tab renderer to the page body.
+# Clean final route
 def render_fantasy_score_tab():
     return render_fantasy_points_page()
 
@@ -17085,28 +16482,11 @@ def render_manual_fantasy_points_tab():
 def render_self_projected_fantasy_tabs():
     return render_fantasy_points_page()
 
-def _render_self_projected_fs_no_ud_block():
-    return render_fantasy_points_page()
-
-def _render_self_projected_fs_clean_route():
-    return render_fantasy_points_page()
-
-def _render_self_projected_fs_forced():
-    return render_fantasy_points_page()
-
 def _render_fantasy_score_table_and_cards(*args, **kwargs):
     return render_fantasy_points_page()
 
-# Old UD data path disabled.
 def fetch_underdog_fantasy_score_rows():
-    try:
-        st.session_state["fantasy_ud_debug"] = {}
-    except Exception:
-        pass
     return []
 
 def build_fantasy_score_board():
-    try:
-        return build_self_projected_batter_fs_board()
-    except Exception:
-        return pd.DataFrame()
+    return build_self_projected_batter_fs_board()
