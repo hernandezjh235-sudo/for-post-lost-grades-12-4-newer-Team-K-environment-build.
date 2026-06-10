@@ -12716,6 +12716,161 @@ def render_fantasy_score_tab(board_rows=None):
 # =========================
 # PROJECTION DRIFT + TRAP LINE 2.0
 # =========================
+
+
+# =========================
+# MONEYLINE PRE-LINEUP DATA FEED FIX
+# Purpose: stop ML board from defaulting every matchup to 50/50 before lineups.
+# K Upside, Pitcher Fantasy, Batter Fantasy are untouched.
+# Logic:
+# - Resolve team_id from row or team abbreviation.
+# - Use season team hitting/pitching profile when confirmed lineup is unavailable.
+# - Apply confirmed lineup delta once MLB lineups post.
+# - Keep fallbacks neutral only as last resort.
+# =========================
+
+ML_TEAM_ID_MAP_FALLBACK = {
+    "ARI":109,"ATL":144,"BAL":110,"BOS":111,"CHC":112,"CWS":145,"CHW":145,
+    "CIN":113,"CLE":114,"COL":115,"DET":116,"HOU":117,"KC":118,"KCR":118,
+    "LAA":108,"LAD":119,"MIA":146,"MIL":158,"MIN":142,"NYM":121,"NYY":147,
+    "ATH":133,"OAK":133,"PHI":143,"PIT":134,"SD":135,"SDP":135,"SF":137,
+    "SFG":137,"SEA":136,"STL":138,"TB":139,"TBR":139,"TEX":140,"TOR":141,
+    "WSH":120,"WAS":120
+}
+
+def ml_resolve_team_id(team_abbr=None, row=None):
+    """Best-effort team_id resolver for ML only."""
+    try:
+        if isinstance(row, dict):
+            for k in ["team_id", "Team ID", "mlb_team_id", "teamId"]:
+                v = row.get(k)
+                if v not in [None, "", "—"]:
+                    return int(v)
+    except Exception:
+        pass
+    ab = str(team_abbr or "").upper().strip()
+    try:
+        logo_map = globals().get("ML_LOGO_IDS", {}) or {}
+        if ab in logo_map:
+            return int(logo_map[ab])
+    except Exception:
+        pass
+    return ML_TEAM_ID_MAP_FALLBACK.get(ab)
+
+# Preserve the best current ML factor function, then wrap it with real pre-lineup team profiles.
+_prev_prefeed_ml_moneyline_factors = globals().get('ml_moneyline_factors', lambda team_abbr, team_pitcher_row, opp_pitcher_row: (50.0, {}))
+
+def ml_moneyline_factors(team_abbr, team_pitcher_row, opp_pitcher_row):
+    """Pre-lineup ML data-feed fix.
+
+    This only affects the Moneyline board. It does not modify K projections, Fantasy projections,
+    Underdog prop lines, or grading logic.
+    """
+    team_abbr = str(team_abbr or "").upper().strip()
+    row = team_pitcher_row if isinstance(team_pitcher_row, dict) else {}
+    opp_row = opp_pitcher_row if isinstance(opp_pitcher_row, dict) else {}
+
+    # Start with existing model factors if available.
+    try:
+        base_score, base_factors = _prev_prefeed_ml_moneyline_factors(team_abbr, row, opp_row)
+    except Exception:
+        base_score, base_factors = 50.0, {}
+    factors = dict(base_factors or {})
+
+    team_id = ml_resolve_team_id(team_abbr, row)
+    opp_team_abbr = str(opp_row.get('team') or row.get('opponent') or '').upper().strip() if isinstance(opp_row, dict) else ''
+    opp_team_id = ml_resolve_team_id(opp_team_abbr, opp_row)
+
+    # Season team profiles are the pre-lineup foundation.
+    team_prof = ml_team_hitting_profile(team_id) if team_id else {}
+    team_pitch_allowed = ml_team_pitching_allowed_profile(team_id) if team_id else {}
+    opp_pitch_allowed = ml_team_pitching_allowed_profile(opp_team_id) if opp_team_id else {}
+
+    park_factor, park_label, venue = ml_park_factor_from_pitcher_rows(row, opp_row)
+    opp_hand = _pitcher_hand_from_row(opp_row)
+    wrc_prof = ml_team_wrc_split_profile(team_id, opp_hand) if team_id else {}
+
+    runs_pg = safe_float(team_prof.get('runs_pg'), MLB_AVG_RUNS_PER_GAME) or MLB_AVG_RUNS_PER_GAME
+    baseruns_pg = safe_float(team_prof.get('baseruns_pg'), runs_pg) or runs_pg
+    own_ra_pg = safe_float(team_pitch_allowed.get('runs_allowed_pg'), MLB_AVG_RUNS_PER_GAME) or MLB_AVG_RUNS_PER_GAME
+    opp_ra_pg = safe_float(opp_pitch_allowed.get('runs_allowed_pg'), MLB_AVG_RUNS_PER_GAME) or MLB_AVG_RUNS_PER_GAME
+    pyth = ml_pythagorean_win_pct(baseruns_pg, own_ra_pg)
+    lineup_strength = safe_float(team_prof.get('lineup_strength_score'), 50) or 50
+    wrc = safe_float(wrc_prof.get('wrc_plus_split'), 100) or 100
+    implied_runs = _team_implied_runs_proxy_from_env(team_prof, wrc_prof, park_factor)
+    env_score = _offense_environment_score(implied_runs, wrc, baseruns_pg, park_factor)
+
+    # Rest is safe and low-impact.
+    game_date = row.get('game_date') or row.get('date') or row.get('Game Date')
+    rest_edge, rest_label = ml_team_rest_edge(team_id, game_date) if team_id else (0.0, 'REST_UNKNOWN')
+
+    # Confirmed lineup should replace/refine season baseline when posted.
+    conf_delta, conf_label, conf_count = _team_confirmed_lineup_strength_delta(team_id) if team_id else (0.0, 'NO_CONFIRMED_LINEUP', None)
+
+    # If previous score is stuck neutral, rebuild it from non-neutral season factors.
+    prev_score = safe_float(base_score, 50) or 50
+    neutralish = abs(prev_score - 50) < 0.05 and safe_float(factors.get('Lineup Strength'), 50) == 50
+
+    score = prev_score
+    if neutralish:
+        score = 50.0
+        score += clamp((pyth - 0.500) * 55.0, -8.0, 8.0)
+        score += clamp((baseruns_pg - MLB_AVG_RUNS_PER_GAME) * 3.6, -7.0, 7.0)
+        score += clamp((opp_ra_pg - MLB_AVG_RUNS_PER_GAME) * 2.2, -5.0, 5.0)
+        score += clamp((lineup_strength - 50) * 0.16, -5.0, 5.0)
+        score += clamp((wrc - 100) * 0.035, -3.0, 3.0)
+        score += clamp((env_score - 50) * 0.035, -3.0, 3.0)
+        score += clamp((park_factor - 1.0) * 7.0, -2.0, 2.0)
+        score += safe_float(rest_edge, 0) or 0
+    else:
+        score += clamp((wrc - 100) * 0.025, -2.0, 2.0)
+        score += clamp((env_score - 50) * 0.020, -1.5, 1.5)
+
+    # Confirmed lineup final refinement; small and capped.
+    score += safe_float(conf_delta, 0) or 0
+    score = float(clamp(score, 25, 80))
+
+    factors.update({
+        'Team ID': team_id,
+        'Data Mode': 'SEASON_PROFILE' if conf_label == 'NO_CONFIRMED_LINEUP' else 'CONFIRMED_LINEUP_REFINED',
+        'Team Implied Runs': implied_runs,
+        'Team wRC+ Split': int(round(wrc)),
+        'wRC+ Source': wrc_prof.get('source') or 'TEAM_ID_FALLBACK',
+        'Offense Env Score': int(round(env_score)),
+        'BaseRuns/G': round(baseruns_pg, 2),
+        'Runs/G': round(runs_pg, 2),
+        'Pyth Win%': round(pyth * 100, 1),
+        'Lineup Strength': int(round(clamp(lineup_strength + conf_delta * 3.0, 20, 90))),
+        'Pitching RA/G': round(own_ra_pg, 2),
+        'Opp Pitching RA/G': round(opp_ra_pg, 2),
+        'Bullpen': factors.get('Bullpen', 'SEASON_RUN_PREVENTION'),
+        'Rest': rest_label,
+        'Rest Edge': round(safe_float(rest_edge, 0) or 0, 2),
+        'Park': venue,
+        'Park Factor': park_factor,
+        'Park Label': park_label,
+        'Confirmed Lineup': conf_label,
+        'Confirmed Hitters': conf_count,
+        'Confirmed Lineup Delta': conf_delta,
+        'PreLineup Fix': True,
+    })
+    return score, factors
+
+_prev_prefeed_ml_factor_summary = globals().get('ml_factor_summary', lambda factors: '')
+
+def ml_factor_summary(factors):
+    if not isinstance(factors, dict):
+        return _prev_prefeed_ml_factor_summary(factors)
+    base = _prev_prefeed_ml_factor_summary(factors)
+    mode = factors.get('Data Mode', '')
+    return (
+        f"{base} • "
+        f"Mode {mode} • "
+        f"ImpR {factors.get('Team Implied Runs','—')} • "
+        f"wRC+ {factors.get('Team wRC+ Split','—')} • "
+        f"BSR {factors.get('BaseRuns/G','—')}"
+    )
+
 tab_kproj, tab_fantasy, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "FANTASY SCORE",
