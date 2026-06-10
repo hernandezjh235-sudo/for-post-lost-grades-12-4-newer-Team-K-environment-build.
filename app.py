@@ -6267,6 +6267,245 @@ def get_underdog_k_data(player_name):
         message=f"Live Underdog line matched: {float(active):.1f} via {best_row.get('Matched Name')} ({best_row.get('Parser Mode')}); rejected debug rows hidden to prevent wrong-sport noise"
     )
 
+
+# =========================
+# UNDerdog-only LOW DATA K FALLBACK
+# =========================
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_all_underdog_pitcher_k_market_rows_for_fallback():
+    """Return every visible MLB Pitcher Strikeouts row from Underdog that the app can find.
+
+    This does NOT project anything. It is used only to append unmatched UD pitchers
+    as PASS / LOW DATA rows so the board mirrors the live Underdog slate.
+    """
+    rows = []
+
+    def _attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+                out[k] = v
+        return out
+
+    def _walk(x, out):
+        if isinstance(x, dict):
+            out.append(x)
+            for v in x.values():
+                _walk(v, out)
+        elif isinstance(x, list):
+            for item in x:
+                _walk(item, out)
+
+    def _text(obj):
+        a = _attrs(obj)
+        keys = [
+            "title", "display_title", "name", "player_name", "full_name", "display_name",
+            "short_name", "abbreviation", "abbr_name", "first_name", "last_name",
+            "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
+            "market_name", "sport", "league", "sport_name", "league_name", "description",
+            "over_under_title", "scoring_type", "projection_type"
+        ]
+        vals = []
+        for k in keys:
+            v = a.get(k)
+            if isinstance(v, dict):
+                for kk in keys:
+                    if v.get(kk) not in [None, ""]:
+                        vals.append(str(v.get(kk)))
+            elif v not in [None, ""]:
+                vals.append(str(v))
+        # Add a small JSON tail so market words can still be discovered when nested.
+        try:
+            vals.append(json.dumps(obj, default=str)[:900])
+        except Exception:
+            pass
+        return " | ".join(vals)
+
+    def _candidate_name(obj, blob):
+        a = _attrs(obj)
+        # Prefer explicit player/name fields.
+        for k in ["player_name", "full_name", "display_name", "name", "title", "short_name", "abbreviation", "abbr_name"]:
+            v = a.get(k)
+            if isinstance(v, dict):
+                v = v.get("full_name") or v.get("display_name") or v.get("name") or v.get("title") or v.get("short_name")
+            if isinstance(v, str) and normalize_name(v):
+                s = v.strip()
+                # Clean common market suffixes if title contains the market.
+                s = re.sub(r"\s+(pitcher\s+strikeouts?|strikeouts?)\s*(o/u|over/under)?\s*$", "", s, flags=re.I).strip(" |:-")
+                if 2 <= len(s) <= 50 and not is_bad_k_market_text(s.lower()):
+                    return s
+        # Fallback: parse title-like phrases in blob.
+        m = re.search(r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){0,3})\s+(?:Pitcher\s+)?Strikeouts?\s*(?:O/U|Over/Under)?", blob)
+        if m:
+            return m.group(1).strip(" |:-")
+        m = re.search(r"([A-Z]\.?\s*[A-Z][A-Za-z.'\-]+)\s+(?:Pitcher\s+)?Strikeouts?", blob)
+        if m:
+            return m.group(1).replace(". ", ". ").strip(" |:-")
+        return ""
+
+    def _line(obj, blob):
+        a = _attrs(obj)
+        for k in ["stat_value", "line_score", "over_under_line", "target_value"]:
+            v = safe_float(a.get(k), None)
+            if is_valid_k_line(v, allow_integer=False) is not None:
+                return float(v)
+        vals = extract_half_lines_from_text(blob)
+        if vals:
+            return float(vals[0])
+        return None
+
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            continue
+        objs = []
+        _walk(data, objs)
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            blob = _text(obj)
+            low = blob.lower()
+            if is_bad_sport_text(low):
+                continue
+            if not any(x in low for x in ["pitcher strikeout", "pitcher strikeouts", "pitcher_k", "pitcher k", "strikeouts"]):
+                continue
+            if is_bad_k_market_text(low):
+                continue
+            # Require at least one MLB/baseball clue when possible to avoid wrong sports.
+            if not any(x in low for x in ["mlb", "baseball", "pitcher"]):
+                continue
+            line = _line(obj, blob)
+            if line is None:
+                continue
+            player = _candidate_name(obj, blob)
+            if not player or len(normalize_name(player).split()) < 1:
+                continue
+            rows.append({
+                "pitcher": player,
+                "line": float(line),
+                "source": "Underdog",
+                "evidence": blob[:240]
+            })
+
+    # Deduplicate by normalized name + line.
+    dedup = {}
+    for r in rows:
+        key = (normalize_name(r.get("pitcher")), safe_float(r.get("line")))
+        if key[0] and key not in dedup:
+            dedup[key] = r
+    return list(dedup.values())
+
+
+def append_ud_only_low_data_k_rows(board, dates=None):
+    """Append PASS-only low-data rows for UD pitchers not represented on the K board.
+
+    Safe properties:
+    - Does not modify any existing row.
+    - Does not create a projection.
+    - Does not create an OVER/UNDER pick.
+    - Only adds rows with Decision PASS — LOW DATA.
+    """
+    board = list(board or [])
+    ud_rows = fetch_all_underdog_pitcher_k_market_rows_for_fallback()
+    if not ud_rows:
+        return board
+
+    existing_names = [str(p.get("pitcher") or "") for p in board]
+
+    def _is_existing(name):
+        if not name:
+            return True
+        for ex in existing_names:
+            if not ex:
+                continue
+            try:
+                if name_score(name, ex) >= 0.82 or name_score(ex, name) >= 0.82:
+                    return True
+            except Exception:
+                if normalize_name(name) == normalize_name(ex):
+                    return True
+        return False
+
+    added = 0
+    date_val = (dates[0] if dates else today_local()) if isinstance(dates, list) else (dates or today_local())
+    for r in ud_rows:
+        nm = str(r.get("pitcher") or "").strip()
+        line = safe_float(r.get("line"), None)
+        if not nm or line is None or _is_existing(nm):
+            continue
+        board.append({
+            "pick_id": f"UD_LOW_DATA_{date_val}_{normalize_name(nm).replace(' ', '_')}_{line}",
+            "created_at": now_iso(),
+            "date": date_val,
+            "game_pk": None,
+            "game_time": None,
+            "status": "UD_ONLY_LOW_DATA",
+            "venue": None,
+            "pitcher_id": None,
+            "pitcher": nm,
+            "hand": "—",
+            "team": "—",
+            "opponent": "—",
+            "matchup": "UD ONLY",
+            "home_team": None,
+            "away_team": None,
+            "pitcher_confirmed": False,
+            "lineup_locked": False,
+            "lineup_note": "Underdog row found but no reliable MLB projection match.",
+            "projection_source": "LOW_DATA_UD_ONLY",
+            "lineup_status": "LOW DATA",
+            "projection": None,
+            "pre_calibration_projection": None,
+            "p50": None,
+            "p10": None,
+            "p90": None,
+            "pitcher_k": None,
+            "opp_k": None,
+            "expected_bf": None,
+            "projected_ip": None,
+            "line": float(line),
+            "line_source": "Underdog",
+            "underdog_line": float(line),
+            "underdog_status": "FOUND_LOW_DATA",
+            "underdog_message": "Underdog pitcher-K row appended as LOW DATA / PASS fallback.",
+            "price_is_real": False,
+            "pick_side": "PASS",
+            "fair_probability": None,
+            "over_probability": None,
+            "under_probability": None,
+            "confidence": None,
+            "data_score": 0,
+            "risk_label": "LOW DATA / UNMATCHED",
+            "risk_notes": ["Underdog-only fallback; no reliable MLB stat match"],
+            "signal": "PASS — LOW DATA",
+            "signal_type": "pass",
+            "bet_action": "🚫 PASS",
+            "action_tier": "PASS",
+            "official_play_filter": "PASS_LOW_DATA",
+            "decision_integrity_score": 0,
+            "decision_integrity_label": "LOW DATA",
+            "low_data_ud_only": True,
+            "low_data_reason": "Underdog pitcher exists but model could not safely match/project him.",
+            "prop_rows": [{"Source": "Underdog", "Player": nm, "Market": "Pitcher Strikeouts", "Line": float(line), "Evidence": r.get("evidence", "")[:200]}],
+            "lineup_rows": [],
+            "pitch_type_rows": [],
+            "batter_pitch_profile_rows": [],
+            "source_status": {"underdog": "FOUND_LOW_DATA"},
+        })
+        existing_names.append(nm)
+        added += 1
+    if added:
+        try:
+            log_source_request("underdog_low_data_fallback", "APPENDED", f"Added {added} PASS-only UD rows")
+        except Exception:
+            pass
+    return board
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_sportsgameodds_k_data(player_name):
     if not SPORTSGAMEODDS_API_KEY:
@@ -8901,6 +9140,7 @@ if refresh_btn:
             log_source_request("make_projection", "ERROR", f"{row.get('pitcher')}: {e}")
         progress.progress((i + 1) / max(1, len(all_rows)))
 
+    projections = append_ud_only_low_data_k_rows(projections, dates=dates)
     st.session_state.loaded_picks = projections
     st.session_state.last_refresh_time = now_iso()
     st.success(f"Refreshed {len(projections)} pitchers. Nothing officially saved yet.")
@@ -9881,6 +10121,21 @@ def kproj_decision(p):
     """
     line, line_source = kproj_line_for_display(p)
     proj = kproj_upside_projection(p)
+
+    # PASS-only safety fallback for Underdog pitchers that exist in the live UD feed
+    # but cannot be reliably matched to an MLB pitcher/stat profile. This preserves
+    # board completeness without creating fake projections or forced OVER/UNDER calls.
+    if p.get("low_data_ud_only"):
+        return {
+            "line": line, "line_source": line_source or "Underdog", "projection": None,
+            "side": "PASS", "lean_side": "PASS", "lean_gap": None,
+            "confidence": None, "decision": "PASS — LOW DATA", "over_needed": required_ks_for_over(line) if line is not None else None,
+            "under_max": max_ks_for_under(line) if line is not None else None, "line_edge": None,
+            "edge_display": "—", "edge_class": "yellow-badge",
+            "hit_rate": None, "tier": "LOW DATA", "role_score": None, "starter_score": None,
+            "ip_floor": None, "edge_gap": None,
+            "note": p.get("low_data_reason") or "Underdog-only pitcher row; no reliable MLB projection match"
+        }
 
     if line is None:
         return {
