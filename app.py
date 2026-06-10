@@ -13232,3 +13232,183 @@ with tab6:
             st.error("All logs cleared.")
 
 st.caption("Workflow: Refresh live board -> inspect lines -> save official before-game snapshot -> after games, grade and learn.")
+
+# =========================
+# ML FINAL REFINEMENT PATCH
+# Adds only Moneyline improvements:
+# 1) stronger but capped ML weighting
+# 2) probable-pitcher validation / cleanup
+# 3) ML confidence calibration labels
+# K Upside + Fantasy projections are untouched.
+# =========================
+
+def _ml_num_from_factors(factors, key, default=0.0):
+    try:
+        return safe_float((factors or {}).get(key), default) or default
+    except Exception:
+        return default
+
+
+def _ml_factor_edge_points(afactors, hfactors):
+    """Translate real ML factor differences into win-probability separation.
+    Designed to avoid 50/50 boards while staying capped to prevent wild ML outputs.
+    """
+    a_bsr = _ml_num_from_factors(afactors, 'BaseRuns/G', MLB_AVG_RUNS_PER_GAME)
+    h_bsr = _ml_num_from_factors(hfactors, 'BaseRuns/G', MLB_AVG_RUNS_PER_GAME)
+    a_wrc = _ml_num_from_factors(afactors, 'Team wRC+ Split', 100)
+    h_wrc = _ml_num_from_factors(hfactors, 'Team wRC+ Split', 100)
+    a_lu = _ml_num_from_factors(afactors, 'Lineup Strength', 50)
+    h_lu = _ml_num_from_factors(hfactors, 'Lineup Strength', 50)
+    a_pyth = _ml_num_from_factors(afactors, 'Pyth Win%', 50)
+    h_pyth = _ml_num_from_factors(hfactors, 'Pyth Win%', 50)
+    a_imp = _ml_num_from_factors(afactors, 'Team Implied Runs', MLB_AVG_RUNS_PER_GAME)
+    h_imp = _ml_num_from_factors(hfactors, 'Team Implied Runs', MLB_AVG_RUNS_PER_GAME)
+    a_rest = _ml_num_from_factors(afactors, 'Rest Edge', 0)
+    h_rest = _ml_num_from_factors(hfactors, 'Rest Edge', 0)
+    a_conf = _ml_num_from_factors(afactors, 'Confirmed Lineup Delta', 0)
+    h_conf = _ml_num_from_factors(hfactors, 'Confirmed Lineup Delta', 0)
+
+    edge = 0.0
+    edge += (a_bsr - h_bsr) * 3.2
+    edge += (a_imp - h_imp) * 2.5
+    edge += (a_wrc - h_wrc) * 0.075
+    edge += (a_lu - h_lu) * 0.16
+    edge += (a_pyth - h_pyth) * 0.075
+    edge += (a_rest - h_rest) * 0.30
+    edge += (a_conf - h_conf) * 0.85
+    return float(clamp(edge, -16.0, 16.0))
+
+
+def _ml_data_quality_label(afactors, hfactors, ap, hp):
+    issues = []
+    ap_name = str((ap or {}).get('pitcher') or '').strip()
+    hp_name = str((hp or {}).get('pitcher') or '').strip()
+    if not ap_name or ap_name == '—':
+        issues.append('AWAY_SP_MISSING')
+    if not hp_name or hp_name == '—':
+        issues.append('HOME_SP_MISSING')
+    if ap_name and hp_name and ap_name == hp_name:
+        issues.append('DUPLICATE_SP_REVIEW')
+    if _ml_num_from_factors(afactors, 'Team ID', None) is None:
+        issues.append('AWAY_TEAM_ID_MISSING')
+    if _ml_num_from_factors(hfactors, 'Team ID', None) is None:
+        issues.append('HOME_TEAM_ID_MISSING')
+    if not issues:
+        return 'OK', ''
+    return 'REVIEW', ', '.join(issues)
+
+
+def _ml_calibrated_confidence(edge, afactors, hfactors, data_label='OK'):
+    edge = abs(safe_float(edge, 0) or 0)
+    # ML confidence should be conservative because moneyline variance is high.
+    conf = 50.0 + min(24.0, edge * 3.2)
+    mode_a = str((afactors or {}).get('Data Mode') or '')
+    mode_h = str((hfactors or {}).get('Data Mode') or '')
+    if 'CONFIRMED' in mode_a or 'CONFIRMED' in mode_h:
+        conf += 2.0
+    if data_label != 'OK':
+        conf -= 5.0
+    return round(float(clamp(conf, 50.0, 78.0)), 1)
+
+
+def _ml_pick_pitchers_clean(ps, away_abbr, home_abbr):
+    """Pick one pitcher row per side and flag probable-pitcher problems.
+    This keeps ML from silently showing the same SP on both teams.
+    """
+    ps = [p for p in (ps or []) if isinstance(p, dict)]
+    away_abbr = str(away_abbr or '').upper()
+    home_abbr = str(home_abbr or '').upper()
+    ap = next((p for p in ps if str(p.get('team') or '').upper() == away_abbr), None)
+    hp = next((p for p in ps if str(p.get('team') or '').upper() == home_abbr), None)
+    if ap is None and ps:
+        ap = ps[0]
+    if hp is None:
+        hp = next((p for p in ps if p is not ap), None) or (ps[1] if len(ps) > 1 else {})
+    ap = ap or {}
+    hp = hp or {}
+    return ap, hp
+
+
+# Preserve current board builder for fallback/reference, then override ML only.
+_prev_ml_build_board_weight_patch = globals().get('ml_build_board', None)
+
+def ml_build_board(board):
+    odds = ml_fetch_oddsapi_h2h()
+    games = {}
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        a, h = ml_sides(p.get('matchup'))
+        team = str(p.get('team') or '').upper()
+        if not a or not h or not team:
+            continue
+        rec = games.setdefault(f'{a} @ {h}', {'away': a, 'home': h, 'pitchers': []})
+        rec['pitchers'].append(p)
+
+    rows = []
+    for matchup, g in games.items():
+        a, h = g['away'], g['home']
+        ps = g.get('pitchers') or []
+        ap, hp = _ml_pick_pitchers_clean(ps, a, h)
+
+        ascore, afactors = ml_moneyline_factors(a, ap, hp)
+        hscore, hfactors = ml_moneyline_factors(h, hp, ap)
+
+        factor_edge = _ml_factor_edge_points(afactors, hfactors)
+        # Blend factor edge with existing score separation. Existing score is still respected,
+        # but the factor edge prevents season-profile boards from staying glued to 50/50.
+        raw_score_edge = clamp((safe_float(ascore, 50) or 50) - (safe_float(hscore, 50) or 50), -12, 12)
+        blended_edge = clamp((factor_edge * 0.72) + (raw_score_edge * 0.28), -16, 16)
+        amodel = round(float(clamp(50.0 + blended_edge, 25, 75)), 1)
+        hmodel = round(100.0 - amodel, 1)
+
+        og = next((x for x in odds if x.get('away_abbr') == a and x.get('home_abbr') == h), None)
+        amkt = og.get('away_market') if og else None
+        hmkt = og.get('home_market') if og else None
+        aedge = None if amkt is None else round(amodel - amkt, 1)
+        hedge = None if hmkt is None else round(hmodel - hmkt, 1)
+        data_label, data_note = _ml_data_quality_label(afactors, hfactors, ap, hp)
+
+        if aedge is None or hedge is None:
+            pick = a if amodel >= hmodel else h
+            edge = round(abs(amodel - hmodel), 1)
+            status = 'MODEL ONLY' if data_label == 'OK' else 'MODEL ONLY — SP REVIEW'
+            grade = f'MODEL LEAN — {pick}'
+        else:
+            pick, edge = (a, aedge) if aedge >= hedge else (h, hedge)
+            if edge >= 6 and data_label == 'OK':
+                status, grade = 'PLAYABLE', f'🔥 ML EDGE — {pick}'
+            elif edge >= 3:
+                status, grade = 'LEAN' if data_label == 'OK' else 'LEAN — SP REVIEW', f'✅ ML LEAN — {pick}'
+            else:
+                status, grade = 'PASS' if data_label == 'OK' else 'PASS — SP REVIEW', f'🚫 PASS ML — {pick}'
+
+        ml_conf = _ml_calibrated_confidence(edge, afactors, hfactors, data_label)
+        rows.append({
+            'Matchup': matchup, 'Pick': pick, 'ML Grade': grade, 'Status': status, 'ML Edge %': edge,
+            'ML Confidence %': ml_conf, 'ML Data Quality': data_label, 'ML Data Note': data_note,
+            'Away Model %': amodel, 'Home Model %': hmodel,
+            'Away Market %': amkt, 'Home Market %': hmkt,
+            'Away Price': og.get('away_price') if og else None, 'Home Price': og.get('home_price') if og else None,
+            'Away SP': ap.get('pitcher', '—') if isinstance(ap, dict) else '—',
+            'Home SP': hp.get('pitcher', '—') if isinstance(hp, dict) else '—',
+            'Away BaseRuns/G': afactors.get('BaseRuns/G'),
+            'Home BaseRuns/G': hfactors.get('BaseRuns/G'),
+            'Away Pyth Win%': afactors.get('Pyth Win%'),
+            'Home Pyth Win%': hfactors.get('Pyth Win%'),
+            'Away Lineup Strength': afactors.get('Lineup Strength'),
+            'Home Lineup Strength': hfactors.get('Lineup Strength'),
+            'Away Bullpen': afactors.get('Bullpen'),
+            'Home Bullpen': hfactors.get('Bullpen'),
+            'Away Rest': afactors.get('Rest'),
+            'Home Rest': hfactors.get('Rest'),
+            'Park': afactors.get('Park'),
+            'Park Factor': afactors.get('Park Factor'),
+            'Away ML Factors': ml_factor_summary(afactors),
+            'Home ML Factors': ml_factor_summary(hfactors),
+            'Source': 'OddsAPI + ML 2.0 + weighted calibration' if og else 'ML 2.0 model only + weighted calibration'
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values('ML Edge %', ascending=False)
+    return df
