@@ -14019,3 +14019,415 @@ def fetch_underdog_fantasy_score_rows():
     except Exception:
         pass
     return rows
+
+
+
+# ============================================================
+# FANTASY SCORE UNDERDOG PARSER — OPTION-SUBHEADER FALLBACK
+# Fixes cases where Underdog stores:
+#   line in over_under_lines.stat_value
+#   market/player text in options.selection_header/subheader
+# Example: selection_subheader = "Higher 42.5 Fantasy Points"
+# This override affects ONLY Fantasy Score row loading.
+# K Upside, Moneyline, and projection formulas are untouched.
+# ============================================================
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_fantasy_score_rows():
+    import re
+    debug = {"urls": 0, "objects": 0, "candidates": 0, "mlb_valid": 0, "sample_markets": []}
+    rows, seen = [], set()
+
+    def _attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ("attributes", "relationships", "included", "data") and k not in out:
+                out[k] = v
+        return out
+
+    def _oid(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or _attrs(obj).get("id")
+        return str(v) if v not in (None, "") else None
+
+    def _collect(data):
+        out = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return out
+
+    def _clean_ud_player(raw):
+        s = str(raw or "").strip()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"\s+(Fantasy Points|Fantasy Score|Higher|Lower).*$", "", s, flags=re.I).strip()
+        return _fs_clean_player_name(s) if "_fs_clean_player_name" in globals() else s
+
+    def _looks_like_bad_sport(blob):
+        # These fantasy rows exist in the same Underdog feed; do not let them into MLB board.
+        return bool(re.search(r"\b(NBA|WNBA|NFL|NHL|Soccer|Tennis|UFC|Golf|PGA|Tourney|Finishing Position|"
+                              r"Shots|Goals|Assists|Saves|Blocks|Rebounds|Points \+|Steals)\b", str(blob or ""), re.I))
+
+    def _is_nonfantasy_mlb_market(blob):
+        # Exclude strikeouts and other props unless there is explicit Fantasy wording in the option text.
+        b = str(blob or "")
+        if re.search(r"Fantasy\s+(Points|Score)|fantasy_points", b, re.I):
+            return False
+        return bool(re.search(r"Pitcher Strikeouts|Strikeouts O/U|Pitching Outs|Hits Allowed|Earned Runs|"
+                              r"Home Runs|Batter Hits|Hits \+ Runs \+ RBIs|H\+R\+R|RBIs?|Runs Batted|"
+                              r"Total Bases|Singles|Doubles|Stolen Bases|Batter Walks|Batter Strikeouts", b, re.I))
+
+    def _mlb_id_or_keep(player, line, blob):
+        # Try official MLB search first. Abbreviated names like "C. Sale" may fail;
+        # keep them anyway if they are clear MLB fantasy rows and NOT bad sport rows.
+        pid = _mlb_search_player_id_by_name(player) if "_mlb_search_player_id_by_name" in globals() else None
+        if pid:
+            return pid, True
+        if _looks_like_bad_sport(blob):
+            return None, False
+        # MLB pitcher fantasy lines usually 20+ and the app can match these names to K board later by last name.
+        if line is not None and 1 <= float(line) <= 65:
+            return None, True
+        return None, False
+
+    def _infer_market_from_line_and_text(line, player, blob):
+        low = str(blob or "").lower()
+        # explicit pitcher/batter wording wins
+        if any(x in low for x in ["pitcher fantasy", "pitching fantasy"]):
+            return "PITCHER_FS"
+        if any(x in low for x in ["batter fantasy", "hitter fantasy"]):
+            return "BATTER_FS"
+        # Underdog generic Fantasy Points: pitchers are usually 20+; batters much lower.
+        if line is not None and float(line) >= 20:
+            return "PITCHER_FS"
+        return "BATTER_FS"
+
+    def _line_from_obj(obj):
+        a = _attrs(obj)
+        for k in ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value", "line", "overUnderLine"]:
+            v = safe_float(a.get(k), None)
+            if v is not None and 0.1 <= v <= 80:
+                return float(v)
+        return None
+
+    for url in UNDERDOG_URLS:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+
+        objects = _collect(data)
+        debug["objects"] += len(objects)
+
+        line_by_id = {}
+        options_by_line = {}
+        for obj in objects:
+            a = _attrs(obj)
+            oid = _oid(obj)
+            parent = str(obj.get("_parent_key") or "").lower()
+            typ = str(obj.get("type") or "").lower()
+
+            line = _line_from_obj(obj)
+            if line is not None and oid and ("over_under_line" in parent or "overunderline" in typ or "line" in parent):
+                line_by_id[oid] = (obj, line)
+
+            ou_line_id = a.get("over_under_line_id")
+            sub = str(a.get("selection_subheader") or "")
+            hdr = str(a.get("selection_header") or "")
+            if ou_line_id and re.search(r"Fantasy\s+(Points|Score)|fantasy_points", sub + " " + hdr, re.I):
+                options_by_line.setdefault(str(ou_line_id), []).append(obj)
+
+        # Primary fix: line object + option object.
+        for line_id, (line_obj, line) in line_by_id.items():
+            opts = options_by_line.get(line_id) or []
+            if not opts:
+                continue
+            for opt in opts:
+                a = _attrs(opt)
+                hdr = a.get("selection_header") or a.get("player_name") or a.get("name") or ""
+                sub = a.get("selection_subheader") or ""
+                blob = f"{hdr} | {sub} | {str(_attrs(line_obj))[:300]}"
+                if _looks_like_bad_sport(blob) or _is_nonfantasy_mlb_market(blob):
+                    continue
+                player = _clean_ud_player(hdr)
+                if not player:
+                    continue
+                # If subheader contains a different line, prefer structured line object but sanity check it.
+                sub_line = None
+                m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+Fantasy", str(sub), re.I)
+                if m:
+                    sub_line = safe_float(m.group(1), None)
+                final_line = float(sub_line if sub_line is not None else line)
+                if not (0.5 <= final_line <= 80):
+                    continue
+
+                market = _infer_market_from_line_and_text(final_line, player, blob)
+                pid, ok_mlb = _mlb_id_or_keep(player, final_line, blob)
+                debug["candidates"] += 1
+                if not ok_mlb:
+                    continue
+                debug["mlb_valid"] += 1
+
+                key = (market, normalize_name(player), float(final_line))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if "fantasy" in blob.lower() and len(debug["sample_markets"]) < 15:
+                    debug["sample_markets"].append(blob[:700])
+                rows.append({
+                    "Source": "Underdog",
+                    "Player": player,
+                    "Player ID": pid,
+                    "Market": market,
+                    "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Score"),
+                    "Line": float(final_line),
+                    "Evidence": blob[:320],
+                })
+
+        # Fallback: old relationship parser may catch rows if options map did not.
+        if rows:
+            break
+
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+    return rows
+
+
+
+# ============================================================
+# FANTASY SCORE UNDERDOG PARSER — MLB ONLY FINAL FIX
+# Purpose:
+# - Underdog stores Fantasy Points lines in options.selection_subheader.
+# - The global feed includes NBA/WNBA/etc. fantasy rows too.
+# - This override keeps ONLY MLB players by validating against MLB player lookup
+#   or already-known MLB board names.
+# - K Upside, Moneyline, and projection formulas are untouched.
+# ============================================================
+
+def _fs_known_mlb_name_set():
+    names = set()
+    try:
+        for key in ["k_board_df", "pitcher_board_df", "final_board_df", "df", "board_df"]:
+            obj = st.session_state.get(key)
+            if hasattr(obj, "columns"):
+                for col in ["Pitcher", "Player", "Name"]:
+                    if col in obj.columns:
+                        for v in obj[col].dropna().astype(str).tolist():
+                            if v.strip():
+                                names.add(normalize_name(v))
+    except Exception:
+        pass
+    return names
+
+def _fs_is_likely_mlb_player_name(name):
+    n = str(name or "").strip()
+    if not n:
+        return False
+    low = n.lower()
+    bad_terms = [
+        "wembanyama", "lebron", "jokic", "doncic", "durant", "curry",
+        "caitlin", "aja wilson", "tourney", "finishing position",
+        "shots", "saves", "rebounds", "assists", "blocks", "steals",
+        "ufc", "tennis", "golf", "pga"
+    ]
+    if any(t in low for t in bad_terms):
+        return False
+
+    if normalize_name(n) in _fs_known_mlb_name_set():
+        return True
+
+    try:
+        pid = _mlb_search_player_id_by_name(n)
+        if pid:
+            return True
+    except Exception:
+        pass
+    return False
+
+def _fs_infer_pitcher_from_known_or_mlb(name):
+    n = str(name or "").strip()
+    nn = normalize_name(n)
+    try:
+        for key in ["k_board_df", "pitcher_board_df", "final_board_df", "df", "board_df"]:
+            obj = st.session_state.get(key)
+            if hasattr(obj, "columns"):
+                for col in ["Pitcher", "Player", "Name"]:
+                    if col in obj.columns:
+                        if any(normalize_name(x) == nn for x in obj[col].dropna().astype(str).tolist()):
+                            return True
+    except Exception:
+        pass
+    try:
+        pid = _mlb_search_player_id_by_name(n)
+        if pid:
+            bio = safe_get_json(f"https://statsapi.mlb.com/api/v1/people/{pid}", timeout=8) or {}
+            people = bio.get("people") or []
+            if people:
+                pos = ((people[0].get("primaryPosition") or {}).get("abbreviation") or "").upper()
+                if pos == "P":
+                    return True
+    except Exception:
+        pass
+    return False
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_fantasy_score_rows():
+    import re
+    debug = {"urls": 0, "objects": 0, "candidates": 0, "mlb_valid": 0, "sample_markets": []}
+    rows, seen = [], set()
+
+    def attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ("attributes", "relationships", "included", "data") and k not in out:
+                out[k] = v
+        return out
+
+    def oid(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or attrs(obj).get("id")
+        return str(v) if v not in (None, "") else None
+
+    def collect(data):
+        out = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return out
+
+    def line_from_obj(obj):
+        a = attrs(obj)
+        for k in ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value", "line", "overUnderLine"]:
+            try:
+                v = safe_float(a.get(k), None)
+            except Exception:
+                v = None
+            if v is not None and 0.1 <= float(v) <= 100:
+                return float(v)
+        return None
+
+    def clean_player(raw):
+        s = str(raw or "").strip()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"\s+(Fantasy Points|Fantasy Score|Higher|Lower).*$", "", s, flags=re.I).strip()
+        try:
+            return _fs_clean_player_name(s)
+        except Exception:
+            return s
+
+    for url in UNDERDOG_URLS:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+
+        objects = collect(data)
+        debug["objects"] += len(objects)
+
+        line_by_id = {}
+        for obj in objects:
+            parent = str(obj.get("_parent_key") or "").lower()
+            typ = str(obj.get("type") or "").lower()
+            obj_id = oid(obj)
+            line = line_from_obj(obj)
+            if line is not None and obj_id and ("over_under_line" in parent or "overunderline" in typ or "line" in parent):
+                line_by_id[obj_id] = line
+
+        for obj in objects:
+            a = attrs(obj)
+            sub = str(a.get("selection_subheader") or "")
+            hdr = str(a.get("selection_header") or a.get("player_name") or a.get("name") or "")
+            if not re.search(r"Fantasy\s+(Points|Score)|fantasy_points", sub + " " + hdr, re.I):
+                continue
+            if str(a.get("status") or "").lower() not in ("", "active"):
+                continue
+
+            line_id = str(a.get("over_under_line_id") or "")
+            line = line_by_id.get(line_id)
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+Fantasy", sub, re.I)
+            if m:
+                try:
+                    line = float(m.group(1))
+                except Exception:
+                    pass
+            if line is None or not (0.5 <= float(line) <= 100):
+                continue
+
+            player = clean_player(hdr)
+            debug["candidates"] += 1
+
+            if not _fs_is_likely_mlb_player_name(player):
+                if len(debug["sample_markets"]) < 20:
+                    debug["sample_markets"].append(f"REJECT_NON_MLB | {player} | {sub}")
+                continue
+
+            is_pitcher = _fs_infer_pitcher_from_known_or_mlb(player)
+            market = "PITCHER_FS" if is_pitcher else "BATTER_FS"
+
+            key = (normalize_name(player), market, float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+            debug["mlb_valid"] += 1
+            if len(debug["sample_markets"]) < 20:
+                debug["sample_markets"].append(f"ACCEPT_MLB | {player} | {sub} | market={market}")
+
+            try:
+                pid = _mlb_search_player_id_by_name(player)
+            except Exception:
+                pid = None
+
+            rows.append({
+                "Source": "Underdog",
+                "Player": player,
+                "Player ID": pid,
+                "Market": market,
+                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Score"),
+                "Line": float(line),
+                "Evidence": f"{player} | {sub}",
+            })
+
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+    return rows
