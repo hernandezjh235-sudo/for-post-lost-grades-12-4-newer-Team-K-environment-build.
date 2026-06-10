@@ -8129,6 +8129,154 @@ def save_many_once(new_picks):
     save_json(PICK_LOG, picks[-10000:])
     return added
 
+
+# =========================
+# VOLUME MISS LEARNING 2.0
+# =========================
+VOLUME_MISS_LEARNING_FILE = os.path.join(STORAGE_DIR, "k_volume_miss_learning.json")
+
+
+def _vl_float(row, *keys, default=None):
+    for key in keys:
+        if isinstance(row, dict) and key in row:
+            v = safe_float(row.get(key), None)
+            if v is not None:
+                return v
+    return default
+
+
+def classify_volume_miss_learning(pick):
+    """Post-game K volume/leash learning.
+
+    This is grading/learning logic. It does not rewrite K skill metrics.
+    It identifies whether a K miss was more likely caused by BF/IP/pitch-count
+    volume failure, leash miss, pitch-count cap, or rookie workload risk.
+    """
+    projected_bf = _vl_float(pick, "expected_bf", "Exp BF", "projected_bf")
+    actual_bf = _vl_float(pick, "actual_bf", "Actual BF")
+    projected_ip = _vl_float(pick, "projected_ip", "Projected IP", "IP Projection")
+    actual_ip = _vl_float(pick, "actual_ip", "Actual IP")
+    projected_pitches = _vl_float(pick, "projected_pitches", "Projected Pitches", "pitch_count_projection")
+    actual_pitches = _vl_float(pick, "actual_pitches", "Actual Pitches", "pitch_count")
+    side = str(pick.get("pick_side") or pick.get("Decision") or "").upper()
+    result = str(pick.get("graded_result") or "").upper()
+    proj = _vl_float(pick, "projection", "K PROJ")
+    actual = _vl_float(pick, "actual", "Actual")
+
+    bf_miss = None if projected_bf is None or actual_bf is None else round(actual_bf - projected_bf, 2)
+    ip_miss = None if projected_ip is None or actual_ip is None else round(actual_ip - projected_ip, 2)
+    pitch_miss = None if projected_pitches is None or actual_pitches is None else round(actual_pitches - projected_pitches, 1)
+    k_error = None if proj is None or actual is None else round(actual - proj, 2)
+
+    reasons = []
+    if bf_miss is not None and bf_miss <= -4:
+        reasons.append("EXPECTED_BF_MISS")
+    if ip_miss is not None and ip_miss <= -1.0:
+        reasons.append("LEASH_IP_MISS")
+    if pitch_miss is not None and pitch_miss <= -15:
+        reasons.append("PITCH_COUNT_MISS")
+
+    rookie_fields = " ".join([str(pick.get(k) or "") for k in ["rookie_workload_risk", "Rookie Workload Risk", "batter_stability_label", "role_label", "starter_status", "confidence_note"]]).upper()
+    if any(x in rookie_fields for x in ["ROOKIE", "CALLUP", "CALL-UP", "LIMIT", "WORKLOAD", "YOUNG"]):
+        if result == "LOSS" and (side == "OVER" or (k_error is not None and k_error < -1.25)):
+            reasons.append("ROOKIE_WORKLOAD_MISS")
+
+    if result == "WIN":
+        label = "WIN_NO_VOLUME_MISS"
+    elif reasons:
+        label = "+".join(sorted(set(reasons)))
+    elif k_error is not None and abs(k_error) >= 1.5:
+        label = "K_SKILL_OR_CONTEXT_MISS"
+    elif result == "LOSS":
+        label = "SMALL_EDGE_VARIANCE"
+    else:
+        label = "UNCLASSIFIED"
+
+    severity = 0
+    if bf_miss is not None:
+        severity += max(0, min(35, abs(min(bf_miss, 0)) * 4.5))
+    if ip_miss is not None:
+        severity += max(0, min(35, abs(min(ip_miss, 0)) * 14))
+    if pitch_miss is not None:
+        severity += max(0, min(20, abs(min(pitch_miss, 0)) * 0.9))
+    if "ROOKIE_WORKLOAD_MISS" in reasons:
+        severity += 10
+    severity = round(clamp(severity, 0, 100), 1)
+
+    return {
+        "volume_miss_label": label,
+        "volume_miss_severity": severity,
+        "bf_miss": bf_miss,
+        "ip_miss": ip_miss,
+        "pitch_count_miss": pitch_miss,
+        "k_error": k_error,
+        "volume_learning_detail": "; ".join(reasons) if reasons else label,
+    }
+
+
+def update_volume_miss_learning_after_grade(pick):
+    info = classify_volume_miss_learning(pick)
+    data = load_json(VOLUME_MISS_LEARNING_FILE, {})
+    key = info.get("volume_miss_label") or "UNCLASSIFIED"
+    bucket = data.get(key, {"count": 0, "losses": 0, "avg_bf_miss": 0.0, "avg_ip_miss": 0.0, "avg_pitch_count_miss": 0.0, "avg_severity": 0.0})
+    n = int(bucket.get("count", 0)) + 1
+    is_loss = str(pick.get("graded_result") or "").upper() == "LOSS"
+    def upd_avg(old, val):
+        old = safe_float(old, 0.0) or 0.0
+        val = safe_float(val, 0.0) or 0.0
+        return round(old + (val - old) / n, 3)
+    bucket["count"] = n
+    bucket["losses"] = int(bucket.get("losses", 0)) + (1 if is_loss else 0)
+    bucket["avg_bf_miss"] = upd_avg(bucket.get("avg_bf_miss"), info.get("bf_miss"))
+    bucket["avg_ip_miss"] = upd_avg(bucket.get("avg_ip_miss"), info.get("ip_miss"))
+    bucket["avg_pitch_count_miss"] = upd_avg(bucket.get("avg_pitch_count_miss"), info.get("pitch_count_miss"))
+    bucket["avg_severity"] = upd_avg(bucket.get("avg_severity"), info.get("volume_miss_severity"))
+    bucket["last_seen"] = now_iso()
+    data[key] = bucket
+    save_json(VOLUME_MISS_LEARNING_FILE, data)
+    return info
+
+
+def build_volume_miss_learning_dashboard(results):
+    rows = []
+    for p in results or []:
+        if str(p.get("graded_result") or "") not in ["WIN", "LOSS"]:
+            continue
+        info = {
+            "Volume Label": p.get("volume_miss_label") or p.get("volume_miss_reason"),
+            "BF Miss": safe_float(p.get("bf_miss"), None),
+            "IP Miss": safe_float(p.get("ip_miss"), None),
+            "Pitch Count Miss": safe_float(p.get("pitch_count_miss"), None),
+            "Severity": safe_float(p.get("volume_miss_severity"), 0) or 0,
+            "Loss": 1 if p.get("graded_result") == "LOSS" else 0,
+        }
+        if not info["Volume Label"]:
+            try:
+                tmp = classify_volume_miss_learning(p)
+                info["Volume Label"] = tmp.get("volume_miss_label")
+                info["BF Miss"] = tmp.get("bf_miss")
+                info["IP Miss"] = tmp.get("ip_miss")
+                info["Pitch Count Miss"] = tmp.get("pitch_count_miss")
+                info["Severity"] = tmp.get("volume_miss_severity")
+            except Exception:
+                info["Volume Label"] = "UNCLASSIFIED"
+        rows.append(info)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    out = df.groupby("Volume Label", as_index=False).agg(
+        Plays=("Loss", "count"),
+        Losses=("Loss", "sum"),
+        Avg_BF_Miss=("BF Miss", "mean"),
+        Avg_IP_Miss=("IP Miss", "mean"),
+        Avg_Pitch_Count_Miss=("Pitch Count Miss", "mean"),
+        Avg_Severity=("Severity", "mean"),
+    )
+    out["Loss Rate %"] = ((out["Losses"] / out["Plays"].replace(0, 1)) * 100).round(1)
+    for c in ["Avg_BF_Miss", "Avg_IP_Miss", "Avg_Pitch_Count_Miss", "Avg_Severity"]:
+        out[c] = out[c].round(2)
+    return out.sort_values(["Losses", "Avg_Severity"], ascending=False)
+
 # =========================
 # GRADING
 # =========================
@@ -8199,6 +8347,12 @@ def grade_finished_games():
         except Exception as _e:
             p["miss_reason"] = p.get("miss_reason") or "UNCLASSIFIED"
             p["miss_reason_detail"] = str(_e)[:120]
+        try:
+            _volume_info = update_volume_miss_learning_after_grade(p)
+            p.update(_volume_info)
+        except Exception as _e:
+            p["volume_miss_label"] = p.get("volume_miss_label") or "UNCLASSIFIED"
+            p["volume_learning_detail"] = str(_e)[:120]
         if p.get("pick_id") not in result_ids:
             results.append(dict(p))
             result_ids.add(p.get("pick_id"))
@@ -12815,6 +12969,22 @@ with tab5:
             st.dataframe(miss_analytics, use_container_width=True, hide_index=True)
         else:
             st.info("Miss-reason analytics will populate after grading.")
+        st.markdown('<div class="section-title-pro">Volume / Leash Miss Learning</div>', unsafe_allow_html=True)
+        vol_dash = build_volume_miss_learning_dashboard(results)
+        if not vol_dash.empty:
+            st.dataframe(vol_dash, use_container_width=True, hide_index=True)
+        else:
+            st.info("Volume miss learning starts after graded K props with BF/IP/pitch-count data.")
+        vol_data = load_json(VOLUME_MISS_LEARNING_FILE, {})
+        if vol_data:
+            vol_rows = []
+            for label, vals in vol_data.items():
+                rr = {"Volume Miss Label": label}
+                if isinstance(vals, dict):
+                    rr.update(vals)
+                vol_rows.append(rr)
+            st.dataframe(pd.DataFrame(vol_rows).sort_values("count", ascending=False), use_container_width=True, hide_index=True)
+
         st.markdown('<div class="section-title-pro">K Miss Reason Learning</div>', unsafe_allow_html=True)
         miss_data = load_json(MISS_REASON_FILE, {})
         if miss_data:
@@ -12843,6 +13013,8 @@ with tab6:
     st.code(CLV_FILE)
     st.write("Long Backtest File:")
     st.code(LONG_BACKTEST_FILE)
+    st.write("Volume Miss Learning File:")
+    st.code(VOLUME_MISS_LEARNING_FILE)
     st.subheader("Advanced Model Status")
     xgb_train_df = build_xgb_training_frame()
     st.write(f"XGBoost training samples available: {len(xgb_train_df)} / {XGB_MIN_GRADED_SAMPLES} needed")
