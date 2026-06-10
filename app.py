@@ -17005,3 +17005,108 @@ def build_fantasy_score_board():
 # If old inline code asks for debug samples, keep them empty.
 def _fantasy_ud_debug_samples(*args, **kwargs):
     return []
+
+
+
+# ============================================================
+# FULL PAGE FIX — FANTASY POINTS PAGE BODY
+# Version: SELF_PROJECTED_FS_FULL_PAGE_FIX_2026_06_10
+#
+# Fantasy page now renders ONLY:
+#   ⚾ Pitcher FS
+#   🏆 Batter FS
+#
+# No Underdog fantasy parser.
+# No UD debug.
+# No market samples.
+# K Upside, Moneyline, H+R+R untouched.
+# ============================================================
+
+SELF_PROJECTED_FS_FULL_PAGE_FIX_VERSION = "SELF_PROJECTED_FS_FULL_PAGE_FIX_2026_06_10"
+
+def render_fantasy_points_page():
+    st.subheader("Self-Projected MLB Fantasy Points")
+    st.caption(
+        f"Version: {SELF_PROJECTED_FS_FULL_PAGE_FIX_VERSION}. "
+        "Projection-only. No Underdog Fantasy line pulling."
+    )
+
+    tab_pitcher_fs, tab_batter_fs = st.tabs(["⚾ Pitcher FS", "🏆 Batter FS"])
+
+    with tab_pitcher_fs:
+        try:
+            pitcher_fs = build_self_projected_pitcher_fs_board()
+        except Exception as e:
+            pitcher_fs = pd.DataFrame()
+            st.warning(f"Pitcher FS could not build yet: {e}")
+
+        if pitcher_fs is None or len(pitcher_fs) == 0:
+            st.warning("No Pitcher FS rows yet. Refresh K PROJ / UPSIDE first, then return here.")
+        else:
+            if "FS Projection" in pitcher_fs.columns:
+                pitcher_fs = pitcher_fs.sort_values("FS Projection", ascending=False)
+            st.dataframe(pitcher_fs, use_container_width=True, hide_index=True)
+
+    with tab_batter_fs:
+        try:
+            batter_fs = build_self_projected_batter_fs_board()
+        except Exception as e:
+            batter_fs = pd.DataFrame()
+            st.warning(f"Batter FS could not build yet: {e}")
+
+        if batter_fs is None or len(batter_fs) == 0:
+            st.warning("No Batter FS rows yet. Load H+R+R/batter data or confirmed lineups first.")
+        else:
+            if "FS Projection" in batter_fs.columns:
+                batter_fs = batter_fs.sort_values("FS Projection", ascending=False)
+            st.dataframe(batter_fs, use_container_width=True, hide_index=True)
+
+    return None
+
+# Alias every likely page/tab renderer to the page body.
+def render_fantasy_score_tab():
+    return render_fantasy_points_page()
+
+def render_fantasy_points_tab():
+    return render_fantasy_points_page()
+
+def render_fantasy_tab():
+    return render_fantasy_points_page()
+
+def render_ud_fantasy_points_tab():
+    return render_fantasy_points_page()
+
+def render_underdog_fantasy_points_tab():
+    return render_fantasy_points_page()
+
+def render_manual_fantasy_points_tab():
+    return render_fantasy_points_page()
+
+def render_self_projected_fantasy_tabs():
+    return render_fantasy_points_page()
+
+def _render_self_projected_fs_no_ud_block():
+    return render_fantasy_points_page()
+
+def _render_self_projected_fs_clean_route():
+    return render_fantasy_points_page()
+
+def _render_self_projected_fs_forced():
+    return render_fantasy_points_page()
+
+def _render_fantasy_score_table_and_cards(*args, **kwargs):
+    return render_fantasy_points_page()
+
+# Old UD data path disabled.
+def fetch_underdog_fantasy_score_rows():
+    try:
+        st.session_state["fantasy_ud_debug"] = {}
+    except Exception:
+        pass
+    return []
+
+def build_fantasy_score_board():
+    try:
+        return build_self_projected_batter_fs_board()
+    except Exception:
+        return pd.DataFrame()
