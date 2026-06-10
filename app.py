@@ -13645,6 +13645,8 @@ def fetch_underdog_fantasy_score_rows():
 
 
 # ============================================================
+
+# ============================================================
 # FANTASY POINTS MARKET ALIAS FIX
 # Underdog labels this market as "Fantasy Points".
 # Reads:
@@ -13838,4 +13840,442 @@ def fetch_underdog_fantasy_score_rows():
         st.session_state["fantasy_ud_debug"] = debug
     except Exception:
         pass
+    return rows
+
+
+
+# ============================================================
+# FANTASY POINTS — MLB RELATIONSHIP FINAL FIX
+# ------------------------------------------------------------
+# The global Underdog feed includes NBA Fantasy Points.
+# This loader does NOT accept generic Fantasy Points rows blindly.
+#
+# It builds MLB-only appearance/player maps from Underdog "appearances"
+# and links:
+#   option.over_under_line_id
+#       -> over_under_line.over_under_id
+#       -> over_under.appearance_id / relationships.appearance
+#       -> appearance.player_id
+#       -> player name
+#
+# If relationship keys are unavailable, it can still use selection_header
+# but only after MLB Stats lookup validates the player.
+#
+# K Upside, ML, and projection formulas are untouched.
+# ============================================================
+
+FANTASY_POINTS_ALIASES = ("fantasy points", "fantasy score", "fantasy_points")
+
+def _fp_norm(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _fp_attrs(o):
+    if not isinstance(o, dict):
+        return {}
+    out = {}
+    if isinstance(o.get("attributes"), dict):
+        out.update(o["attributes"])
+    for k, v in o.items():
+        if k not in ("attributes", "relationships", "included", "data") and k not in out:
+            out[k] = v
+    return out
+
+def _fp_obj_id(o):
+    if not isinstance(o, dict):
+        return None
+    a = _fp_attrs(o)
+    v = o.get("id") or a.get("id")
+    return str(v) if v not in (None, "") else None
+
+def _fp_collect_objects(data):
+    out = []
+    def walk(x, parent=""):
+        if isinstance(x, dict):
+            y = dict(x)
+            if parent and "_parent_key" not in y:
+                y["_parent_key"] = parent
+            out.append(y)
+            for k, v in x.items():
+                if isinstance(v, (dict, list)):
+                    walk(v, k)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item, parent)
+    walk(data)
+    return out
+
+def _fp_rel_id(o, *names):
+    if not isinstance(o, dict):
+        return None
+    rel = o.get("relationships") or {}
+    for name in names:
+        node = rel.get(name)
+        if isinstance(node, dict):
+            data = node.get("data")
+            if isinstance(data, dict) and data.get("id"):
+                return str(data.get("id"))
+            if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get("id"):
+                return str(data[0].get("id"))
+    a = _fp_attrs(o)
+    for name in names:
+        for key in (name, f"{name}_id", f"{name}Id"):
+            if a.get(key):
+                return str(a.get(key))
+    return None
+
+def _fp_clean_name(s):
+    import re
+    s = str(s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+(Fantasy Points|Fantasy Score|Higher|Lower).*$", "", s, flags=re.I).strip()
+    try:
+        return _fs_clean_player_name(s)
+    except Exception:
+        return s
+
+def _fp_has_fantasy_text(*parts):
+    blob = " ".join(str(p or "") for p in parts).lower()
+    return any(a in blob for a in FANTASY_POINTS_ALIASES)
+
+def _fp_bad_non_mlb_text(x):
+    bad = [
+        "wembanyama","lebron","jokic","doncic","durant","curry","giannis","tatum","booker",
+        "caitlin","aja wilson","ionescu","stewart",
+        "mcdavid","mackinnon","bedard","ovechkin",
+        "tourney","finishing position","shots","rebounds","assists","blocks","steals","saves",
+        "pga","ufc","tennis","soccer","golf"
+    ]
+    low = str(x or "").lower()
+    return any(b in low for b in bad)
+
+def _fp_line_from_subheader(sub):
+    import re
+    m = re.search(r"(Higher|Lower)\s+([0-9]+(?:\.[0-9]+)?)\s+(Fantasy Points|Fantasy Score)", str(sub or ""), re.I)
+    if m:
+        return float(m.group(2))
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+(Fantasy Points|Fantasy Score)", str(sub or ""), re.I)
+    if m:
+        return float(m.group(1))
+    return None
+
+def _fp_mlb_lookup(name):
+    try:
+        pid = _mlb_search_player_id_by_name(name)
+    except Exception:
+        pid = None
+    pos = None
+    full_name = name
+    if pid:
+        try:
+            bio = safe_get_json(f"https://statsapi.mlb.com/api/v1/people/{pid}", timeout=8) or {}
+            people = bio.get("people") or []
+            if people:
+                full_name = people[0].get("fullName") or name
+                pos = ((people[0].get("primaryPosition") or {}).get("abbreviation") or "").upper()
+        except Exception:
+            pass
+    return pid, pos, full_name
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_fantasy_score_rows():
+    rows, seen = [], set()
+    debug = {"urls": 0, "objects": 0, "candidates": 0, "mlb_valid": 0, "sample_markets": []}
+
+    for url in UNDERDOG_URLS:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+
+        objs = _fp_collect_objects(data)
+        debug["objects"] += len(objs)
+
+        players_by_id = {}
+        appearances_by_id = {}
+        over_unders_by_id = {}
+        lines_by_id = {}
+        options = []
+
+        # Build maps from all objects.
+        for o in objs:
+            a = _fp_attrs(o)
+            oid = _fp_obj_id(o)
+            parent = str(o.get("_parent_key") or "").lower()
+            typ = str(o.get("type") or a.get("type") or "").lower()
+
+            # Player objects.
+            if oid and ("players" in parent or typ == "player"):
+                name = a.get("first_name") and a.get("last_name") and f"{a.get('first_name')} {a.get('last_name')}"
+                name = name or a.get("name") or a.get("display_name") or a.get("full_name") or a.get("title")
+                if name:
+                    players_by_id[oid] = _fp_clean_name(name)
+
+            # Appearance objects.
+            if oid and ("appearances" in parent or typ == "appearance" or a.get("player_id")):
+                appearances_by_id[oid] = {
+                    "player_id": str(a.get("player_id") or _fp_rel_id(o, "player") or ""),
+                    "team_id": str(a.get("team_id") or _fp_rel_id(o, "team") or ""),
+                    "match_id": str(a.get("match_id") or _fp_rel_id(o, "match") or ""),
+                    "match_type": str(a.get("match_type") or ""),
+                }
+
+            # OverUnder parent object.
+            if oid and ("over_unders" in parent or typ in ("overunder", "over_under")):
+                over_unders_by_id[oid] = {
+                    "appearance_id": str(a.get("appearance_id") or _fp_rel_id(o, "appearance") or ""),
+                    "stat_type": str(a.get("stat_type") or a.get("title") or a.get("display_title") or a.get("name") or ""),
+                }
+
+            # Line objects.
+            if oid and ("over_under_lines" in parent or typ in ("overunderline", "over_under_line")):
+                lines_by_id[oid] = {
+                    "over_under_id": str(a.get("over_under_id") or _fp_rel_id(o, "over_under", "overUnder") or ""),
+                    "line": safe_float(a.get("stat_value") or a.get("line") or a.get("target_value"), None),
+                }
+
+            # Options.
+            sub = str(a.get("selection_subheader") or "")
+            hdr = str(a.get("selection_header") or "")
+            if _fp_has_fantasy_text(sub, hdr, a.get("stat_type"), a.get("title"), a.get("display_title")):
+                options.append(o)
+
+        for opt in options:
+            a = _fp_attrs(opt)
+            sub = str(a.get("selection_subheader") or "")
+            hdr = str(a.get("selection_header") or "").strip()
+            status = str(a.get("status") or "").lower()
+            if status and status != "active":
+                continue
+
+            debug["candidates"] += 1
+            line_id = str(a.get("over_under_line_id") or _fp_rel_id(opt, "over_under_line", "overUnderLine") or "")
+            line_info = lines_by_id.get(line_id, {})
+            over_under_id = line_info.get("over_under_id") or ""
+            ou_info = over_unders_by_id.get(over_under_id, {})
+            appearance_id = ou_info.get("appearance_id") or ""
+
+            player_name = ""
+            pid_ud = ""
+            if appearance_id and appearance_id in appearances_by_id:
+                pid_ud = appearances_by_id[appearance_id].get("player_id") or ""
+                player_name = players_by_id.get(pid_ud, "")
+
+            # Fallback to option header if relationship did not resolve.
+            player_name = player_name or hdr
+            player_name = _fp_clean_name(player_name)
+            line = _fp_line_from_subheader(sub) or line_info.get("line")
+
+            if not player_name or line is None:
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_NO_NAME_OR_LINE | hdr={hdr} | sub={sub} | line_id={line_id}")
+                continue
+
+            if _fp_bad_non_mlb_text(f"{player_name} {sub}"):
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_NON_MLB_TEXT | {player_name} | {sub}")
+                continue
+
+            # Strong MLB validation.
+            mlb_pid, pos, official_name = _fp_mlb_lookup(player_name)
+            if not mlb_pid:
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_NO_MLB_LOOKUP | {player_name} | {sub}")
+                continue
+
+            # Generic fantasy points only; exclude if the over_under stat text says another market.
+            stat_text = (ou_info.get("stat_type") or "")
+            if stat_text and not _fp_has_fantasy_text(stat_text, sub):
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_STAT_NOT_FANTASY | {player_name} | stat={stat_text} | {sub}")
+                continue
+
+            market = "PITCHER_FS" if (pos == "P" or float(line) >= 20) else "BATTER_FS"
+            key = (_fp_norm(official_name or player_name), market, float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            debug["mlb_valid"] += 1
+            if len(debug["sample_markets"]) < 40:
+                debug["sample_markets"].append(f"ACCEPT_MLB | {official_name or player_name} | {sub} | {market}")
+
+            rows.append({
+                "Source": "Underdog",
+                "Player": official_name or player_name,
+                "Player ID": mlb_pid,
+                "Market": market,
+                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Points"),
+                "Line": float(line),
+                "Evidence": f"{player_name} | {sub}",
+            })
+
+    if not rows and len(debug["sample_markets"]) < 40:
+        debug["sample_markets"].append("NO_MLB_FANTASY_POINTS_ROWS_FOUND_AFTER_RELATIONSHIP_SCAN")
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+    return rows
+
+
+
+# ============================================================
+# VERIFY VERSION — FANTASY POINTS RELATIONSHIP LOADER NO-CACHE
+# Version marker: FANTASY_RELATIONSHIP_NOCACHE_V2_2026_06_10
+# Purpose:
+# - Confirms the deployed app is using THIS loader.
+# - Removes Streamlit cache from the final Fantasy Points loader.
+# - K Upside, Moneyline, and projection formulas remain untouched.
+# ============================================================
+
+FANTASY_RELATIONSHIP_LOADER_VERSION = "FANTASY_RELATIONSHIP_NOCACHE_V2_2026_06_10"
+
+def fetch_underdog_fantasy_score_rows():
+    rows, seen = [], set()
+    debug = {
+        "loader_version": FANTASY_RELATIONSHIP_LOADER_VERSION,
+        "urls": 0,
+        "objects": 0,
+        "candidates": 0,
+        "mlb_valid": 0,
+        "sample_markets": []
+    }
+
+    for url in UNDERDOG_URLS:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+
+        objs = _fp_collect_objects(data)
+        debug["objects"] += len(objs)
+
+        players_by_id = {}
+        appearances_by_id = {}
+        over_unders_by_id = {}
+        lines_by_id = {}
+        options = []
+
+        for o in objs:
+            a = _fp_attrs(o)
+            oid = _fp_obj_id(o)
+            parent = str(o.get("_parent_key") or "").lower()
+            typ = str(o.get("type") or a.get("type") or "").lower()
+
+            if oid and ("players" in parent or typ == "player"):
+                name = None
+                if a.get("first_name") and a.get("last_name"):
+                    name = f"{a.get('first_name')} {a.get('last_name')}"
+                name = name or a.get("name") or a.get("display_name") or a.get("full_name") or a.get("title")
+                if name:
+                    players_by_id[oid] = _fp_clean_name(name)
+
+            if oid and ("appearances" in parent or typ == "appearance" or a.get("player_id")):
+                appearances_by_id[oid] = {
+                    "player_id": str(a.get("player_id") or _fp_rel_id(o, "player") or ""),
+                    "team_id": str(a.get("team_id") or _fp_rel_id(o, "team") or ""),
+                    "match_id": str(a.get("match_id") or _fp_rel_id(o, "match") or ""),
+                    "match_type": str(a.get("match_type") or ""),
+                }
+
+            if oid and ("over_unders" in parent or typ in ("overunder", "over_under")):
+                over_unders_by_id[oid] = {
+                    "appearance_id": str(a.get("appearance_id") or _fp_rel_id(o, "appearance") or ""),
+                    "stat_type": str(a.get("stat_type") or a.get("title") or a.get("display_title") or a.get("name") or ""),
+                }
+
+            if oid and ("over_under_lines" in parent or typ in ("overunderline", "over_under_line")):
+                lines_by_id[oid] = {
+                    "over_under_id": str(a.get("over_under_id") or _fp_rel_id(o, "over_under", "overUnder") or ""),
+                    "line": safe_float(a.get("stat_value") or a.get("line") or a.get("target_value"), None),
+                }
+
+            sub = str(a.get("selection_subheader") or "")
+            hdr = str(a.get("selection_header") or "")
+            if _fp_has_fantasy_text(sub, hdr, a.get("stat_type"), a.get("title"), a.get("display_title")):
+                options.append(o)
+
+        for opt in options:
+            a = _fp_attrs(opt)
+            sub = str(a.get("selection_subheader") or "")
+            hdr = str(a.get("selection_header") or "").strip()
+            status = str(a.get("status") or "").lower()
+            if status and status != "active":
+                continue
+
+            debug["candidates"] += 1
+            line_id = str(a.get("over_under_line_id") or _fp_rel_id(opt, "over_under_line", "overUnderLine") or "")
+            line_info = lines_by_id.get(line_id, {})
+            over_under_id = line_info.get("over_under_id") or ""
+            ou_info = over_unders_by_id.get(over_under_id, {})
+            appearance_id = ou_info.get("appearance_id") or ""
+
+            player_name = ""
+            if appearance_id and appearance_id in appearances_by_id:
+                pid_ud = appearances_by_id[appearance_id].get("player_id") or ""
+                player_name = players_by_id.get(pid_ud, "")
+
+            player_name = _fp_clean_name(player_name or hdr)
+            line = _fp_line_from_subheader(sub) or line_info.get("line")
+
+            if not player_name or line is None:
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_NO_NAME_OR_LINE | hdr={hdr} | sub={sub} | line_id={line_id}")
+                continue
+
+            if _fp_bad_non_mlb_text(f"{player_name} {sub}"):
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_NON_MLB_TEXT | {player_name} | {sub}")
+                continue
+
+            mlb_pid, pos, official_name = _fp_mlb_lookup(player_name)
+            if not mlb_pid:
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_NO_MLB_LOOKUP | {player_name} | {sub}")
+                continue
+
+            stat_text = (ou_info.get("stat_type") or "")
+            if stat_text and not _fp_has_fantasy_text(stat_text, sub):
+                if len(debug["sample_markets"]) < 40:
+                    debug["sample_markets"].append(f"REJECT_STAT_NOT_FANTASY | {player_name} | stat={stat_text} | {sub}")
+                continue
+
+            market = "PITCHER_FS" if (pos == "P" or float(line) >= 20) else "BATTER_FS"
+            key = (_fp_norm(official_name or player_name), market, float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            debug["mlb_valid"] += 1
+            if len(debug["sample_markets"]) < 40:
+                debug["sample_markets"].append(f"ACCEPT_MLB | {official_name or player_name} | {sub} | {market}")
+
+            rows.append({
+                "Source": "Underdog",
+                "Player": official_name or player_name,
+                "Player ID": mlb_pid,
+                "Market": market,
+                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Points"),
+                "Line": float(line),
+                "Evidence": f"{player_name} | {sub}",
+            })
+
+    if not rows and len(debug["sample_markets"]) < 40:
+        debug["sample_markets"].append("NO_MLB_FANTASY_POINTS_ROWS_FOUND_AFTER_RELATIONSHIP_SCAN")
+
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+
     return rows
