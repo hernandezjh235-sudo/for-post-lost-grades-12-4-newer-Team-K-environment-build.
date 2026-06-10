@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -22,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE + FANTASY SCORE + ML"
+APP_VERSION = "v11.17 K PROJ UPSIDE + FANTASY POINTS + ML"
 
 try:
     import pytz
@@ -462,7 +461,7 @@ def is_bad_k_market_text(text):
     """Reject non-pitcher-K or alternate/novelty markets that can carry misleading values."""
     t = str(text or "").lower()
     bad_terms = [
-        "batter", "hitter", "team strikeouts", "fantasy points", "fantasy score",
+        "batter", "hitter", "team strikeouts", "fantasy points", "fantasy points",
         "runs+rbi", "hits+runs+rbi", "total bases", "stolen base", "walks allowed",
         "earned runs", "outs recorded", "pitching outs", "hits allowed", "runs allowed",
         "single", "double", "home run", "rbi", "runs scored", "combo", "rival",
@@ -12185,17 +12184,17 @@ def render_batter_prop_tab(market):
 
 
 # =========================
-# UNDERDOG FANTASY SCORE TAB — BATTERS + PITCHERS ONLY
+# UNDERDOG FANTASY POINTS TAB — BATTERS + PITCHERS ONLY
 # Replaces H+R+R/RBI/Hits prop tabs. Keeps all Moneyball/opportunity logic
-# for batter fantasy score and leaves K Upside + Moneyline engines untouched.
+# for batter fantasy points and leaves K Upside + Moneyline engines untouched.
 # Lines are pulled from Underdog only; no synthetic lines are created.
 # =========================
 FANTASY_SCORE_MARKETS = {
     "BATTER_FS": {
-        "label": "Batter Fantasy Score",
+        "label": "Batter Fantasy Points",
         "terms": [
-            "batter fantasy score", "batter fantasy points", "hitter fantasy score", "hitter fantasy points",
-            "fantasy score", "fantasy points", "mlb fantasy score", "mlb fantasy points"
+            "batter fantasy points", "batter fantasy points", "hitter fantasy points", "hitter fantasy points",
+            "fantasy points", "fantasy points", "mlb fantasy points", "mlb fantasy points"
         ],
         "required_context": ["batter", "hitter"],
         "bad_terms": [
@@ -12208,10 +12207,10 @@ FANTASY_SCORE_MARKETS = {
         "max_line": 35.5,
     },
     "PITCHER_FS": {
-        "label": "Pitcher Fantasy Score",
+        "label": "Pitcher Fantasy Points",
         "terms": [
-            "pitcher fantasy score", "pitcher fantasy points", "pitching fantasy score", "pitching fantasy points",
-            "fantasy score", "fantasy points", "mlb fantasy score", "mlb fantasy points"
+            "pitcher fantasy points", "pitcher fantasy points", "pitching fantasy points", "pitching fantasy points",
+            "fantasy points", "fantasy points", "mlb fantasy points", "mlb fantasy points"
         ],
         "required_context": ["pitcher", "pitching"],
         "bad_terms": [
@@ -12290,7 +12289,7 @@ def _fs_market_from_text(text):
         return "PITCHER_FS"
     if any(x in low for x in ["batter fantasy", "hitter fantasy"]):
         return "BATTER_FS"
-    # Generic "Fantasy Score" rows are common. Keep only if paired with MLB/baseball context.
+    # Generic "Fantasy Points" rows are common. Keep only if paired with MLB/baseball context.
     if any(x in low for x in ["mlb", "baseball"]):
         # If no pitcher wording, default generic player fantasy to batter fantasy; pitcher rows usually say pitcher.
         return "BATTER_FS"
@@ -12299,7 +12298,7 @@ def _fs_market_from_text(text):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_fantasy_score_rows():
-    """Fetch Underdog MLB Batter/Pitcher Fantasy Score rows only.
+    """Fetch Underdog MLB Batter/Pitcher Fantasy Points rows only.
 
     This is intentionally independent from K and Moneyline modules. It never creates lines.
     """
@@ -12447,7 +12446,7 @@ def build_batter_prop_board(market):
 
 
 # =========================
-# FANTASY SCORE 2.0 — TRUE-PROJECTION REFINEMENT
+# FANTASY POINTS 2.0 — TRUE-PROJECTION REFINEMENT
 # Adds only fantasy-score logic. K Upside projection path is untouched.
 # - Pitcher Fantasy reads K projection as an input only.
 # - Batter Fantasy keeps Moneyball logic and adds power/speed/PA/run environment.
@@ -12556,7 +12555,7 @@ def _fs_batter_power_speed_context(prof, pa, team_runs, lineup_slot):
     }
 
 
-# Save reference to original fantasy projection, then override only Fantasy Score projection.
+# Save reference to original fantasy projection, then override only Fantasy Points projection.
 _prev_fantasy_score_project_row = globals().get('project_fantasy_score_row', lambda row, board_rows=None: row)
 
 def project_fantasy_score_row(row, board_rows=None):
@@ -12590,7 +12589,7 @@ def project_fantasy_score_row(row, board_rows=None):
             "Projected Ks": round(k_proj, 2), "Projected IP": round(ip, 2), "Expected BF": round(bf, 1),
             "Projected ER": round(er_proj, 2), "Projected Hits Allowed": round(hits_allowed, 2), "Projected Walks": round(walks_allowed, 2),
             "WHIP Risk": round(whip_proxy, 2), "Win Probability": round(win_prob * 100, 1), "QS Probability": round(qs_prob * 100, 1),
-            "Pitcher Fantasy Score": proj, "Moneyball Score": None, "Projected PA": None,
+            "Pitcher Fantasy Points": proj, "Moneyball Score": None, "Projected PA": None,
             "Attribution": f"K {k_proj:.2f} | IP {ip:.2f} | ER {er_proj:.2f} | H {hits_allowed:.1f} | BB {walks_allowed:.1f} | Win {win_prob*100:.0f}% | QS {qs_prob*100:.0f}%",
         }
 
@@ -12668,7 +12667,7 @@ def _render_fantasy_score_table_and_cards(df, title):
         st.markdown(f"""
         <div class="pro-card" style="padding:18px;margin-bottom:12px;">
           <div style="font-size:24px;font-weight:900;">{html.escape(str(r.get('Player','')))}</div>
-          <div class="small-muted">{html.escape(str(r.get('Market Label','Fantasy Score')))} · Underdog line {r.get('Line')}</div>
+          <div class="small-muted">{html.escape(str(r.get('Market Label','Fantasy Points')))} · Underdog line {r.get('Line')}</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
             <div><div class="small-muted">Projection</div><div class="big-number green">{r.get('Projection','—')}</div><div class="small-muted">Edge {r.get('Edge','—')}</div></div>
             <div><div class="small-muted">Decision</div><div style="font-size:30px;font-weight:900;color:{color};">{dec}</div><div class="small-muted">Conf {r.get('Confidence %','—')}%</div></div>
@@ -12685,11 +12684,11 @@ def _render_fantasy_score_table_and_cards(df, title):
 
 # Override renderer to separate Pitcher Fantasy and Batter Fantasy inside the Fantasy tab.
 def render_fantasy_score_tab(board_rows=None):
-    st.markdown('<div class="section-title-pro">Fantasy Score — Underdog Only</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title-pro">Fantasy Points — Underdog Only</div>', unsafe_allow_html=True)
     st.caption("Separate engines: Pitcher Fantasy reads K projection as an input only; Batter Fantasy uses Moneyball/run-creation logic. K Upside and Moneyline are untouched.")
     df = build_fantasy_score_board(board_rows=board_rows)
     if df.empty:
-        st.warning("No active Underdog MLB Fantasy Score rows found. This tab will stay empty rather than creating fake lines.")
+        st.warning("No active Underdog MLB Fantasy Points rows found. This tab will stay empty rather than creating fake lines.")
         dbg = st.session_state.get("fantasy_ud_debug") if hasattr(st, "session_state") else None
         if isinstance(dbg, dict):
             st.caption(f"UD debug: urls={dbg.get('urls')} objects={dbg.get('objects')} candidates={dbg.get('candidates')} mlb_valid={dbg.get('mlb_valid')}")
@@ -12703,9 +12702,9 @@ def render_fantasy_score_tab(board_rows=None):
     batter_df = df[df.get("Market", pd.Series(dtype=str)).astype(str) == "BATTER_FS"].copy() if "Market" in df.columns else pd.DataFrame()
     t_pitch, t_bat, t_all = st.tabs(["Pitcher Fantasy", "Batter Fantasy", "All Fantasy Rows"])
     with t_pitch:
-        _render_fantasy_score_table_and_cards(pitcher_df, "Pitcher Fantasy Score")
+        _render_fantasy_score_table_and_cards(pitcher_df, "Pitcher Fantasy Points")
     with t_bat:
-        _render_fantasy_score_table_and_cards(batter_df, "Batter Fantasy Score")
+        _render_fantasy_score_table_and_cards(batter_df, "Batter Fantasy Points")
     with t_all:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("UD Fantasy Rows", len(df))
@@ -12874,7 +12873,7 @@ def ml_factor_summary(factors):
 
 tab_kproj, tab_fantasy, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
-    "FANTASY SCORE",
+    "FANTASY POINTS",
     "MONEYLINE EDGE",
     "CALIBRATION AUDIT",
     "TOP PLAYS",
@@ -13417,7 +13416,7 @@ def ml_build_board(board):
 
 
 # ============================================================
-# CLEAN FANTASY SCORE REBUILD — MLB POOL FIRST
+# CLEAN FANTASY POINTS REBUILD — MLB POOL FIRST
 # ------------------------------------------------------------
 # Why:
 #   Underdog's global Fantasy Points feed can include NBA/WNBA/etc.
@@ -13429,7 +13428,7 @@ def ml_build_board(board):
 #   - Does not touch K projection
 #   - Does not touch Moneyline
 #   - Does not touch fantasy projection formulas
-#   - Only replaces Fantasy Score line loading
+#   - Only replaces Fantasy Points line loading
 # ============================================================
 
 def _fs_norm_name_key(x):
@@ -13443,7 +13442,7 @@ def _fs_clean_name_final(x):
     import re
     s = str(x or "").strip()
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s+(Fantasy Points|Fantasy Score|Higher|Lower).*$", "", s, flags=re.I).strip()
+    s = re.sub(r"\s+(Fantasy Points|Fantasy Points|Higher|Lower).*$", "", s, flags=re.I).strip()
     try:
         return _fs_clean_player_name(s)
     except Exception:
@@ -13586,7 +13585,7 @@ def fetch_underdog_fantasy_score_rows():
             status = str(a.get("status") or "").lower()
             if status and status != "active":
                 continue
-            if not header or "Fantasy Points" not in sub and "Fantasy Score" not in sub:
+            if not header or "Fantasy Points" not in sub and "Fantasy Points" not in sub:
                 continue
 
             debug["candidates"] += 1
@@ -13628,7 +13627,7 @@ def fetch_underdog_fantasy_score_rows():
                 "Player": player,
                 "Player ID": pid,
                 "Market": market,
-                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Score"),
+                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Points"),
                 "Line": float(line),
                 "Evidence": f"{player} | {sub}",
             })
@@ -13636,6 +13635,204 @@ def fetch_underdog_fantasy_score_rows():
     # Helpful when no MLB rows exist in current feed.
     if not rows and len(debug["sample_markets"]) < 30:
         debug["sample_markets"].append("NO_MLB_FANTASY_ROWS_FOUND_IN_CURRENT_UNDERDOG_FEED")
+
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+    return rows
+
+
+
+# ============================================================
+# FANTASY POINTS MARKET ALIAS FIX
+# Underdog labels this market as "Fantasy Points".
+# Reads:
+#   selection_header = player name
+#   selection_subheader = Higher/Lower XX Fantasy Points
+# K Upside, ML, and projection formulas are untouched.
+# ============================================================
+
+FANTASY_POINTS_ALIASES = ("fantasy points", "fantasy score", "fantasy_points")
+
+def _fp_norm_name_key(x):
+    try:
+        return normalize_name(x)
+    except Exception:
+        import re
+        return re.sub(r"[^a-z0-9]+", "", str(x or "").lower())
+
+def _fp_clean_player_name(x):
+    import re
+    s = str(x or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+(Fantasy Points|Fantasy Score|Higher|Lower).*$", "", s, flags=re.I).strip()
+    try:
+        return _fs_clean_player_name(s)
+    except Exception:
+        return s
+
+def _fp_text_has_fantasy_points(*parts):
+    blob = " ".join(str(p or "") for p in parts).lower()
+    return any(a in blob for a in FANTASY_POINTS_ALIASES)
+
+def _fp_reject_non_mlb_name_or_text(x):
+    bad = [
+        "wembanyama","lebron","jokic","doncic","durant","curry","giannis","tatum","booker",
+        "caitlin","aja wilson","ionescu","stewart",
+        "mcdavid","mackinnon","bedard","ovechkin",
+        "tourney","finishing position","shots","rebounds","assists","blocks","steals","saves",
+        "pga","ufc","tennis","soccer","golf"
+    ]
+    low = str(x or "").lower()
+    return any(b in low for b in bad)
+
+def _fp_current_pitcher_pool():
+    names = set()
+    try:
+        for key in list(st.session_state.keys()):
+            obj = st.session_state.get(key)
+            if hasattr(obj, "columns"):
+                for col in ["Pitcher", "Away SP", "Home SP"]:
+                    if col in obj.columns:
+                        for v in obj[col].dropna().astype(str).tolist():
+                            v = str(v).strip()
+                            if v and v != "—":
+                                names.add(_fp_norm_name_key(v))
+    except Exception:
+        pass
+    return names
+
+def _fp_mlb_lookup_position(name):
+    try:
+        pid = _mlb_search_player_id_by_name(name)
+    except Exception:
+        pid = None
+    pos = None
+    if pid:
+        try:
+            bio = safe_get_json(f"https://statsapi.mlb.com/api/v1/people/{pid}", timeout=8) or {}
+            people = bio.get("people") or []
+            if people:
+                pos = ((people[0].get("primaryPosition") or {}).get("abbreviation") or "").upper()
+        except Exception:
+            pos = None
+    return pid, pos
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_fantasy_score_rows():
+    import re
+    rows, seen = [], set()
+    debug = {"urls": 0, "objects": 0, "candidates": 0, "mlb_valid": 0, "sample_markets": []}
+    pitcher_pool = _fp_current_pitcher_pool()
+
+    def attrs(o):
+        if not isinstance(o, dict):
+            return {}
+        out = {}
+        if isinstance(o.get("attributes"), dict):
+            out.update(o["attributes"])
+        for k, v in o.items():
+            if k not in ("attributes", "relationships", "included", "data") and k not in out:
+                out[k] = v
+        return out
+
+    def collect(data):
+        out = []
+        def walk(x, parent=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent and "_parent_key" not in y:
+                    y["_parent_key"] = parent
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent)
+        walk(data)
+        return out
+
+    def get_line_from_text(sub):
+        m = re.search(r"(Higher|Lower)\s+([0-9]+(?:\.[0-9]+)?)\s+(Fantasy Points|Fantasy Score)", str(sub or ""), re.I)
+        if m:
+            return float(m.group(2))
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+(Fantasy Points|Fantasy Score)", str(sub or ""), re.I)
+        if m:
+            return float(m.group(1))
+        return None
+
+    for url in UNDERDOG_URLS:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+
+        objects = collect(data)
+        debug["objects"] += len(objects)
+
+        for obj in objects:
+            a = attrs(obj)
+            header = str(a.get("selection_header") or a.get("player_name") or a.get("name") or "").strip()
+            sub = str(a.get("selection_subheader") or "").strip()
+            status = str(a.get("status") or "").lower()
+
+            if status and status != "active":
+                continue
+            if not _fp_text_has_fantasy_points(header, sub, a.get("stat_type"), a.get("title"), a.get("display_title")):
+                continue
+            if not header or not sub:
+                continue
+
+            debug["candidates"] += 1
+            player = _fp_clean_player_name(header)
+            line = get_line_from_text(sub)
+            if line is None or not (0.5 <= float(line) <= 100):
+                if len(debug["sample_markets"]) < 35:
+                    debug["sample_markets"].append(f"NO_LINE | {player} | {sub}")
+                continue
+
+            if _fp_reject_non_mlb_name_or_text(f"{player} {sub}"):
+                if len(debug["sample_markets"]) < 35:
+                    debug["sample_markets"].append(f"REJECT_NON_MLB | {player} | {sub}")
+                continue
+
+            pid, pos = _fp_mlb_lookup_position(player)
+            is_known_pitcher = _fp_norm_name_key(player) in pitcher_pool
+
+            if not pid and not is_known_pitcher:
+                if len(debug["sample_markets"]) < 35:
+                    debug["sample_markets"].append(f"REJECT_NO_MLB_MATCH | {player} | {sub}")
+                continue
+
+            is_pitcher = (pos == "P") or is_known_pitcher or float(line) >= 20
+            market = "PITCHER_FS" if is_pitcher else "BATTER_FS"
+
+            key = (_fp_norm_name_key(player), market, float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+            debug["mlb_valid"] += 1
+
+            if len(debug["sample_markets"]) < 35:
+                debug["sample_markets"].append(f"ACCEPT_MLB | {player} | {sub} | {market}")
+
+            rows.append({
+                "Source": "Underdog",
+                "Player": player,
+                "Player ID": pid,
+                "Market": market,
+                "Market Label": FANTASY_SCORE_MARKETS.get(market, {}).get("label", "Fantasy Points"),
+                "Line": float(line),
+                "Evidence": f"{player} | {sub}",
+            })
+
+    if not rows and len(debug["sample_markets"]) < 35:
+        debug["sample_markets"].append("NO_MLB_FANTASY_POINTS_ROWS_FOUND")
 
     try:
         st.session_state["fantasy_ud_debug"] = debug
