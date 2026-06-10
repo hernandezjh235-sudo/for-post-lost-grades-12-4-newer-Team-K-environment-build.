@@ -13729,3 +13729,293 @@ def fetch_underdog_fantasy_score_rows():
         pass
     return rows
 
+
+
+# ============================================================
+# FANTASY SCORE UNDERDOG PARSER — BROAD RELATIONSHIP OVERRIDE
+# Purpose: fix candidates=0 when Underdog posts generic "Fantasy Points"
+# where the market/player/line live in related objects instead of one object.
+# This overrides only fetch_underdog_fantasy_score_rows().
+# K Upside, Moneyline, and fantasy projection formulas are untouched.
+# ============================================================
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_underdog_fantasy_score_rows():
+    import json, re
+
+    debug = {"urls": 0, "objects": 0, "candidates": 0, "mlb_valid": 0, "sample_markets": []}
+    rows, seen = [], set()
+
+    LINE_KEYS = [
+        "stat_value", "line_score", "over_under_line", "target_value", "display_stat_value",
+        "line", "overUnderLine", "option_line"
+    ]
+    BAD_TEXT = re.compile(
+        r"\b(NBA|WNBA|NFL|NHL|Soccer|Tennis|UFC|Golf|PGA|Tourney|Finishing Position|"
+        r"Shots|Goals|Assists|Saves|Blocks|Tackles|Strokes)\b",
+        re.I,
+    )
+    NON_FANTASY_MLB = re.compile(
+        r"Pitcher Strikeouts|Strikeouts O/U|Pitching Outs|Hits Allowed|Earned Runs|"
+        r"Home Runs|Batter Hits|Hits \+ Runs \+ RBIs|H\+R\+R|RBIs?|Runs Batted|"
+        r"Total Bases|Singles|Doubles|Stolen Bases|Batter Walks|Batter Strikeouts",
+        re.I,
+    )
+
+    def attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+                out[k] = v
+        return out
+
+    def typ(obj, fallback=""):
+        if not isinstance(obj, dict):
+            return str(fallback or "").lower().replace("-", "_")
+        return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_")
+
+    def oid(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or attrs(obj).get("id")
+        return str(v) if v not in [None, ""] else None
+
+    def collect(data):
+        out = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return out
+
+    def build_maps(objects):
+        by_id = {}
+        by_type_id = {}
+        for o in objects:
+            i = oid(o)
+            if not i:
+                continue
+            by_id.setdefault(i, []).append(o)
+            t = typ(o)
+            aliases = {t, t.rstrip("s"), t + "s", t.replace("_", "-")}
+            for a in aliases:
+                by_type_id[(a, i)] = o
+        return by_id, by_type_id
+
+    def rel_refs(obj):
+        refs = []
+        if not isinstance(obj, dict):
+            return refs
+        rels = obj.get("relationships") or {}
+        if not isinstance(rels, dict):
+            return refs
+        for rel_name, node in rels.items():
+            data = node.get("data") if isinstance(node, dict) else node
+            if isinstance(data, dict):
+                rid = data.get("id")
+                rtype = str(data.get("type") or rel_name).lower().replace("-", "_")
+                if rid not in [None, ""]:
+                    refs.append((rel_name, rtype, str(rid)))
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("id") not in [None, ""]:
+                        refs.append((rel_name, str(item.get("type") or rel_name).lower().replace("-", "_"), str(item.get("id"))))
+        return refs
+
+    def get_related(obj, names, by_id, by_type_id):
+        names_norm = {str(n).lower().replace("-", "_") for n in names}
+        for rel_name, rtype, rid in rel_refs(obj):
+            rn = str(rel_name).lower().replace("-", "_")
+            if rn in names_norm or rtype in names_norm or any(n in rn for n in names_norm):
+                found = by_type_id.get((rtype, rid)) or by_type_id.get((rtype.rstrip("s"), rid))
+                if found:
+                    return found
+                lst = by_id.get(rid) or []
+                if lst:
+                    return lst[0]
+        return None
+
+    def text_from(*objs):
+        parts = []
+        keys = [
+            "title", "display_title", "name", "display_name", "full_name", "first_name", "last_name",
+            "short_name", "abbr_name", "abbreviation", "player_name", "description", "stat", "stat_type",
+            "appearance_stat", "display_stat", "market", "market_name", "label", "sport", "league",
+            "sport_name", "league_name", "position", "position_name", "position_abbreviation", "type",
+            "scoring_type", "projection_type"
+        ]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            # include object type because Underdog sometimes encodes the market in type/key names
+            parts.append(str(obj.get("type") or obj.get("_parent_key") or ""))
+            for k in keys:
+                v = a.get(k)
+                if isinstance(v, dict):
+                    for kk, vv in v.items():
+                        if isinstance(vv, (str, int, float)):
+                            parts.append(f"{kk} {vv}")
+                elif isinstance(v, (str, int, float)) and str(v).strip():
+                    parts.append(f"{k} {v}")
+        return " | ".join([p for p in parts if p])
+
+    def structured_line(*objs):
+        vals = []
+        for obj in objs:
+            a = attrs(obj)
+            for k in LINE_KEYS:
+                v = safe_float(a.get(k), None)
+                if v is not None and 0.5 <= v <= 80 and abs(v * 2 - round(v * 2)) < 1e-9:
+                    vals.append(float(v))
+        if not vals:
+            return None
+        # Fantasy points are usually larger than K lines. Prefer the highest plausible structured line.
+        return sorted(vals, reverse=True)[0]
+
+    def player_name_from(*objs):
+        candidates = []
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            first = str(a.get("first_name") or "").strip()
+            last = str(a.get("last_name") or "").strip()
+            if first and last:
+                candidates.append(f"{first} {last}")
+            for k in ["display_name", "full_name", "name", "player_name", "title", "short_name", "abbr_name", "abbreviation"]:
+                v = a.get(k)
+                if isinstance(v, str) and 2 <= len(v) <= 70:
+                    candidates.append(v)
+        cleaned = []
+        for c in candidates:
+            c2 = _fs_clean_player_name(c)
+            # Drop market labels and team-like strings.
+            if len(c2.split()) >= 2 and not re.search(r"Fantasy|Points|Score|O/U|Over/Under|@| vs |\d", c2, re.I):
+                cleaned.append(c2)
+        if not cleaned:
+            return ""
+        # Prefer full names over abbreviated initials.
+        return sorted(cleaned, key=lambda s: (len(s.replace('.', '').split()[0]) > 1, len(s)), reverse=True)[0]
+
+    def pos_text(*objs):
+        vals = []
+        for obj in objs:
+            a = attrs(obj)
+            for k in ["position", "position_name", "position_abbreviation", "primary_position", "slot_position"]:
+                v = a.get(k)
+                if isinstance(v, dict):
+                    vals.extend(str(x) for x in v.values() if isinstance(x, (str, int, float)))
+                elif v not in [None, ""]:
+                    vals.append(str(v))
+        return " ".join(vals).lower()
+
+    def infer_market(line, pid, ptxt, blob):
+        low = str(blob or "").lower()
+        ptxt = str(ptxt or "").lower()
+        if BAD_TEXT.search(blob or ""):
+            return None
+        # Strong market proof: fantasy wording anywhere in related market/appearance/player text.
+        has_fantasy = any(x in low for x in ["fantasy", "fantasy_points", "fantasy points", "fantasy score"])
+        if not has_fantasy:
+            return None
+        # Avoid neighboring MLB prop markets even if a hidden generic fantasy word exists elsewhere.
+        if NON_FANTASY_MLB.search(blob or "") and not re.search(r"Fantasy\s+(Points|Score)|fantasy_points", blob or "", re.I):
+            return None
+        if any(x in low for x in ["pitcher fantasy", "pitching fantasy"]):
+            return "PITCHER_FS"
+        if any(x in low for x in ["batter fantasy", "hitter fantasy"]):
+            return "BATTER_FS"
+        if any(x in ptxt for x in ["pitcher", "sp", "rp", "lhp", "rhp", " p "]):
+            return "PITCHER_FS"
+        # If the line is in pitcher-fantasy range, route to pitcher logic; batter FS is usually much lower.
+        if line is not None and line >= 20:
+            return "PITCHER_FS"
+        return "BATTER_FS"
+
+    for url in UNDERDOG_URLS:
+        try:
+            data = safe_get_json(url, timeout=18)
+            debug["urls"] += 1
+        except Exception:
+            data = None
+        if not data:
+            continue
+        objects = collect(data)
+        debug["objects"] += len(objects)
+        by_id, by_type_id = build_maps(objects)
+
+        # Candidate line objects: real line field + relationships, just like K parser.
+        candidates = []
+        for obj in objects:
+            a = attrs(obj)
+            t = typ(obj, obj.get("_parent_key", ""))
+            has_line = any(safe_float(a.get(k), None) is not None for k in LINE_KEYS)
+            if has_line and ("over_under_line" in t or "line" in t or isinstance(obj.get("relationships"), dict)):
+                candidates.append(obj)
+
+        for line_obj in candidates:
+            ou_obj = get_related(line_obj, ["over_under", "over_unders", "over", "market"], by_id, by_type_id)
+            app_obj = get_related(line_obj, ["appearance", "appearances"], by_id, by_type_id)
+            if app_obj is None and ou_obj is not None:
+                app_obj = get_related(ou_obj, ["appearance", "appearances"], by_id, by_type_id)
+            player_obj = get_related(line_obj, ["player", "players"], by_id, by_type_id)
+            if player_obj is None and app_obj is not None:
+                player_obj = get_related(app_obj, ["player", "players"], by_id, by_type_id)
+            if player_obj is None and ou_obj is not None:
+                player_obj = get_related(ou_obj, ["player", "players"], by_id, by_type_id)
+
+            line = structured_line(line_obj, ou_obj)
+            if line is None:
+                continue
+            blob = text_from(line_obj, ou_obj, app_obj, player_obj)
+            if "fantasy" in blob.lower() and len(debug["sample_markets"]) < 12:
+                debug["sample_markets"].append(blob[:700])
+            player = player_name_from(player_obj, app_obj, line_obj, ou_obj)
+            if not player:
+                continue
+            pid = _mlb_search_player_id_by_name(player)
+            ptxt = pos_text(player_obj, app_obj, line_obj, ou_obj)
+            market = infer_market(line, pid, ptxt, blob)
+            if not market:
+                continue
+            debug["candidates"] += 1
+            if not pid:
+                # Keep parser strict: do not create fake rows without an MLB id.
+                continue
+            debug["mlb_valid"] += 1
+            key = (market, normalize_name(player), float(line))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "Source": "Underdog",
+                "Player": player,
+                "Player ID": pid,
+                "Market": market,
+                "Market Label": FANTASY_SCORE_MARKETS[market]["label"],
+                "Line": float(line),
+                "Evidence": blob[:320],
+            })
+
+        if rows:
+            break
+
+    try:
+        st.session_state["fantasy_ud_debug"] = debug
+    except Exception:
+        pass
+    return rows
