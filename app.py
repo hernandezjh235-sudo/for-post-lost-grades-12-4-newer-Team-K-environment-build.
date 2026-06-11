@@ -10380,6 +10380,26 @@ def render_kproj_tab(board):
     for p in priority[:20]:
         render_kproj_pitcher_card(p)
 
+
+# =========================
+# FANTASY POINTS SAFE RENDERER — RUN FIX
+# Keeps app from crashing where main code calls:
+# render_fantasy_score_tab(board)
+# K Upside / ML / H+R+R untouched.
+# =========================
+
+def render_fantasy_score_tab(board=None):
+    st.subheader("Fantasy Points")
+    st.info("Fantasy Points temporarily removed for clean rebuild.")
+    return None
+
+def render_fantasy_points_tab(board=None):
+    return render_fantasy_score_tab(board)
+
+def render_fantasy_tab(board=None):
+    return render_fantasy_score_tab(board)
+
+
 # =========================
 # MONEYLINE EDGE TAB — ISOLATED MODULE
 # Separate ML tab only. Does NOT change K projections, Underdog props,
