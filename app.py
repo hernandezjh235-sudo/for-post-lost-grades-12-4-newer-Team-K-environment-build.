@@ -13725,6 +13725,695 @@ def render_batter_fs_tab():
     st.dataframe(df, use_container_width=True, hide_index=True)
     _render_fs_cards(df, kind="batter")
 
+
+# =========================
+# FINAL FS + MONEYLINE 9.5 PUSH
+# Version: FS_ML_95_PUSH_2026_06_10
+#
+# Clean final override layer:
+# - Pitcher FS: real-ish ML-derived Win%, better QS%, opponent wRC/run context
+# - Batter FS: protects against false reads, stronger matchup-context labels
+# - Moneyline: projected score engine + stricter play filters
+#
+# Does not change K projection math.
+# =========================
+FS_ML_95_PUSH_VERSION = "FS_ML_95_PUSH_2026_06_10"
+
+def _ml95_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _ml95_clamp(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _ml95_split_matchup(matchup):
+    try:
+        a, h = ml_sides(matchup)
+        return a, h
+    except Exception:
+        try:
+            s = str(matchup or "")
+            if "@" in s:
+                a, h = [x.strip() for x in s.split("@", 1)]
+                return a, h
+        except Exception:
+            pass
+    return "", ""
+
+def _ml95_team_from_pitcher_row(p):
+    return str((p or {}).get("team") or (p or {}).get("Team") or "").upper().strip()
+
+def _ml95_pitcher_quality_adj(p):
+    # Positive means opposing offense benefits. Negative means pitcher suppresses runs.
+    k_proj = _ml95_num((p or {}).get("K PROJ") or (p or {}).get("Median") or (p or {}).get("projection"), None)
+    if k_proj is None:
+        try:
+            k_proj = _ml95_num(kproj_upside_projection(p), 4.5)
+        except Exception:
+            k_proj = 4.5
+    ip = _ml95_num((p or {}).get("IP Projection") or (p or {}).get("ip_floor") or (p or {}).get("IP Floor"), 5.2)
+    er = _ml95_num((p or {}).get("ER Projection") or (p or {}).get("ER Proj"), 2.4)
+    opp_k = _ml95_num((p or {}).get("opp_k") or (p or {}).get("Opp K%"), 0.22)
+    if opp_k > 1:
+        opp_k /= 100.0
+    # High Ks and low ER suppress opponent runs.
+    adj = 0.00
+    adj += _ml95_clamp((er - 2.3) * 0.22, -0.35, 0.45, 0)
+    adj -= _ml95_clamp((k_proj - 4.8) * 0.07, -0.30, 0.40, 0)
+    adj -= _ml95_clamp((ip - 5.2) * 0.10, -0.20, 0.25, 0)
+    adj -= _ml95_clamp((opp_k - 0.22) * 1.25, -0.18, 0.18, 0)
+    return round(adj, 3)
+
+def _ml95_expected_runs(team_abbr, team_pitcher_row, opp_pitcher_row):
+    team_abbr = str(team_abbr or "").upper().strip()
+    row = team_pitcher_row if isinstance(team_pitcher_row, dict) else {}
+    opp = opp_pitcher_row if isinstance(opp_pitcher_row, dict) else {}
+
+    try:
+        score, factors = ml_moneyline_factors(team_abbr, row, opp)
+    except Exception:
+        score, factors = 50.0, {}
+
+    factors = dict(factors or {})
+    base = _ml95_num(factors.get("Team Implied Runs"), None)
+    if base is None or base <= 0:
+        base = _ml95_num(factors.get("Runs/G"), 4.45)
+    base = _ml95_clamp(base, 2.7, 6.8, 4.45)
+
+    wrc = _ml95_num(factors.get("Team wRC+ Split"), 100)
+    lineup = _ml95_num(factors.get("Lineup Strength"), 50)
+    baseruns = _ml95_num(factors.get("BaseRuns/G"), base)
+    park = _ml95_num(factors.get("Park Factor"), 1.0)
+    rest_edge = _ml95_num(factors.get("Rest Edge"), 0)
+
+    # Opposing pitcher quality: stronger opposing SP lowers expected runs.
+    opp_sp_adj = _ml95_pitcher_quality_adj(opp)
+
+    runs = base
+    runs += _ml95_clamp((wrc - 100) * 0.010, -0.35, 0.45, 0)
+    runs += _ml95_clamp((lineup - 50) * 0.012, -0.35, 0.45, 0)
+    runs += _ml95_clamp((baseruns - 4.45) * 0.25, -0.30, 0.35, 0)
+    runs += _ml95_clamp((park - 1.0) * 0.65, -0.35, 0.45, 0)
+    runs += _ml95_clamp(rest_edge * 0.06, -0.12, 0.12, 0)
+    runs += opp_sp_adj
+
+    # Keep predicted scores realistic.
+    runs = _ml95_clamp(runs, 2.2, 7.2, 4.45)
+
+    factors.update({
+        "Projected Runs": round(runs, 2),
+        "Projected Score Runs": round(runs, 2),
+        "Opp SP Run Adj": opp_sp_adj,
+        "ML95 Version": FS_ML_95_PUSH_VERSION,
+    })
+    return runs, score, factors
+
+def _ml95_win_prob_from_runs(team_runs, opp_runs):
+    # Baseball run-diff logistic. 0.62-ish around +1.0 run.
+    import math
+    diff = _ml95_num(team_runs, 4.45) - _ml95_num(opp_runs, 4.45)
+    p = 1.0 / (1.0 + math.exp(-0.72 * diff))
+    return _ml95_clamp(p * 100.0, 25.0, 75.0, 50.0)
+
+# Final Moneyline board override with projected score and stricter filters.
+_prev_ml_build_board_95 = ml_build_board
+
+def ml_build_board(board):
+    odds = []
+    try:
+        odds = ml_fetch_oddsapi_h2h()
+    except Exception:
+        odds = []
+
+    games = {}
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        a, h = _ml95_split_matchup(p.get("matchup") or p.get("Matchup"))
+        team = _ml95_team_from_pitcher_row(p)
+        if not a or not h or not team:
+            continue
+        rec = games.setdefault(f"{a} @ {h}", {"away": a, "home": h, "pitchers": []})
+        rec["pitchers"].append(p)
+
+    rows = []
+    for matchup, g in games.items():
+        a, h = g["away"], g["home"]
+        ps = g["pitchers"]
+        ap = next((p for p in ps if _ml95_team_from_pitcher_row(p) == a.upper()), None) or (ps[0] if ps else {})
+        hp = next((p for p in ps if _ml95_team_from_pitcher_row(p) == h.upper()), None) or (ps[1] if len(ps) > 1 else {})
+
+        aruns, ascore, af = _ml95_expected_runs(a, ap, hp)
+        hruns, hscore, hf = _ml95_expected_runs(h, hp, ap)
+
+        amodel = _ml95_win_prob_from_runs(aruns, hruns)
+        hmodel = 100.0 - amodel
+
+        # Blend with existing factor score, but projected score is the lead signal.
+        try:
+            factor_total = max(_ml95_num(ascore, 50) + _ml95_num(hscore, 50), 1e-9)
+            afactor_model = _ml95_num(ascore, 50) / factor_total * 100
+            amodel = (amodel * 0.72) + (afactor_model * 0.28)
+            hmodel = 100.0 - amodel
+        except Exception:
+            pass
+
+        og = next((x for x in odds if x.get("away_abbr") == a and x.get("home_abbr") == h), None)
+        amkt = og.get("away_market") if og else None
+        hmkt = og.get("home_market") if og else None
+
+        aedge = None if amkt is None else round(amodel - amkt, 1)
+        hedge = None if hmkt is None else round(hmodel - hmkt, 1)
+
+        score_pick = a if aruns >= hruns else h
+        score_edge = abs(aruns - hruns)
+        model_pick = a if amodel >= hmodel else h
+        model_gap = abs(amodel - hmodel)
+
+        # Market-aware pick when available, otherwise model pick.
+        if aedge is None or hedge is None:
+            pick = model_pick
+            edge = round(model_gap, 1)
+            status = "MODEL ONLY"
+            grade = f"MODEL LEAN — {pick}"
+        else:
+            pick, edge = (a, aedge) if aedge >= hedge else (h, hedge)
+            # Stricter filter: require projected-score agreement for playable.
+            agrees_score = (pick == score_pick)
+            if edge >= 6 and score_edge >= 0.35 and agrees_score:
+                status, grade = "PLAYABLE", f"🔥 ML EDGE — {pick}"
+            elif edge >= 4 and score_edge >= 0.20 and agrees_score:
+                status, grade = "LEAN", f"✅ ML LEAN — {pick}"
+            else:
+                status, grade = "PASS", f"🚫 PASS ML — {pick}"
+
+        # If model-only, do not overstate confidence.
+        if (aedge is None or hedge is None) and (model_gap < 7 or score_edge < 0.35):
+            status = "MODEL ONLY"
+            grade = f"MODEL LEAN — {pick}"
+
+        rows.append({
+            "Matchup": matchup,
+            "Pick": pick,
+            "ML Grade": grade,
+            "Status": status,
+            "ML Edge %": round(edge, 1),
+            "Projected Score": f"{a} {aruns:.1f} - {h} {hruns:.1f}",
+            "Away Projected Runs": round(aruns, 2),
+            "Home Projected Runs": round(hruns, 2),
+            "Score Edge": round(score_edge, 2),
+            "Score Pick": score_pick,
+            "Away Model %": round(amodel, 1),
+            "Home Model %": round(hmodel, 1),
+            "Away Market %": amkt,
+            "Home Market %": hmkt,
+            "Away Price": og.get("away_price") if og else None,
+            "Home Price": og.get("home_price") if og else None,
+            "Away SP": ap.get("pitcher", ap.get("Pitcher", "—")) if isinstance(ap, dict) else "—",
+            "Home SP": hp.get("pitcher", hp.get("Pitcher", "—")) if isinstance(hp, dict) else "—",
+            "Away BaseRuns/G": af.get("BaseRuns/G"),
+            "Home BaseRuns/G": hf.get("BaseRuns/G"),
+            "Away Team wRC+": af.get("Team wRC+ Split"),
+            "Home Team wRC+": hf.get("Team wRC+ Split"),
+            "Away Lineup Strength": af.get("Lineup Strength"),
+            "Home Lineup Strength": hf.get("Lineup Strength"),
+            "Away Park": af.get("Park Label") or af.get("Park"),
+            "Home Park": hf.get("Park Label") or hf.get("Park"),
+            "Away Data Mode": af.get("Data Mode"),
+            "Home Data Mode": hf.get("Data Mode"),
+            "ML Version": FS_ML_95_PUSH_VERSION,
+            "Source": "Projected Score + Odds" if og else "Projected Score Model",
+        })
+
+    return pd.DataFrame(rows)
+
+# Pitcher FS 9.5 push: use ML projected score for win%, better QS curve, real opp run context.
+_prev_build_pitcher_fs_board_95 = build_pitcher_fs_board
+
+def _fs95_pitcher_row(p, all_rows=None):
+    base = _pitcher_fs_from_k_context(p) if "_pitcher_fs_from_k_context" in globals() else None
+    if not isinstance(base, dict):
+        try:
+            base = _pitcher_fs_from_board_row(p)
+        except Exception:
+            base = {}
+    name = str(base.get("Pitcher") or p.get("pitcher") or p.get("Pitcher") or "").strip()
+    matchup = str(base.get("Matchup") or p.get("matchup") or p.get("Matchup") or "").strip()
+    team = _ml95_team_from_pitcher_row(p)
+    a, h = _ml95_split_matchup(matchup)
+    opp_team = h if team == a else a if team == h else ""
+
+    opp_row = None
+    for q in all_rows or []:
+        if not isinstance(q, dict):
+            continue
+        if str(q.get("matchup") or q.get("Matchup") or "") == str(p.get("matchup") or p.get("Matchup") or "") and _ml95_team_from_pitcher_row(q) != team:
+            opp_row = q
+            break
+
+    # Projected score/win if possible
+    try:
+        team_runs, _, tf = _ml95_expected_runs(team, p, opp_row or {})
+        opp_runs, _, of = _ml95_expected_runs(opp_team, opp_row or {}, p)
+        win_pct = _ml95_win_prob_from_runs(team_runs, opp_runs)
+        opp_wrc = _ml95_num(of.get("Team wRC+ Split"), _ml95_num(base.get("Opp wRC+"), 100))
+    except Exception:
+        team_runs, opp_runs = 4.45, _ml95_num(base.get("Opp Implied Runs"), 4.25)
+        win_pct = _ml95_num(base.get("Win %"), 50.5)
+        opp_wrc = _ml95_num(base.get("Opp wRC+"), 100)
+
+    k_proj = _ml95_num(base.get("K Projection"), _ml95_num(base.get("K PROJ"), 4.5))
+    ip_proj = _ml95_num(base.get("IP Projection"), 5.2)
+    er_proj = _ml95_clamp((opp_runs * (ip_proj / 9.0) * 0.82), 0.2, 5.8, _ml95_num(base.get("ER Projection"), 2.4))
+
+    # QS curve: rises hard around 5.8-6.2 IP, still capped.
+    qs_pct = _ml95_clamp(((ip_proj - 5.25) * 32.0) + max(0, 55 - opp_wrc) * 0.10, 3.0, 68.0, 16.0)
+
+    opp_k = _ml95_num(base.get("Opp K%"), 22.0)
+    matchup_adj = _ml95_clamp(((opp_k - 22.0) * 0.04) - ((opp_wrc - 100.0) * 0.012), -0.85, 0.85, 0)
+
+    fs = (k_proj * 3.0) + (ip_proj * 3.0) - (er_proj * 3.0) + ((win_pct / 100.0) * 5.0) + ((qs_pct / 100.0) * 5.0) + matchup_adj
+    fs = _ml95_clamp(fs, 4.0, 48.0, _ml95_num(base.get("FS Projection"), 18))
+
+    floor = _ml95_clamp(fs - 4.75, 0.0, fs, fs * 0.72)
+    ceiling = _ml95_clamp(fs + 4.75 + k_proj * 0.25, fs + 1.0, 55.0, fs + 6.0)
+
+    base.update({
+        "Pitcher": name,
+        "Matchup": matchup,
+        "FS Projection": round(fs, 2),
+        "Floor": round(floor, 2),
+        "Median": round(fs, 2),
+        "Ceiling": round(ceiling, 2),
+        "Confidence %": _fs_conf(fs, floor, ceiling),
+        "K Projection": round(k_proj, 2),
+        "IP Projection": round(ip_proj, 2),
+        "ER Projection": round(er_proj, 2),
+        "Win %": round(win_pct, 1),
+        "QS %": round(qs_pct, 1),
+        "Opp wRC+": round(opp_wrc, 1),
+        "Team Projected Runs": round(team_runs, 2),
+        "Opp Projected Runs": round(opp_runs, 2),
+        "Matchup Adj": round(matchup_adj, 2),
+        "FS Version": FS_ML_95_PUSH_VERSION,
+    })
+    return base
+
+def build_pitcher_fs_board(board=None):
+    rows_raw = _fs_pitcher_rows_from_active_board(board) if "_fs_pitcher_rows_from_active_board" in globals() else (board or [])
+    out = []
+    for p in rows_raw:
+        try:
+            row = _fs95_pitcher_row(p, rows_raw)
+            if row.get("Pitcher"):
+                out.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(out)
+
+# Batter FS 9.5 push: prevent false reads and surface context quality.
+_prev_batter_fs_from_context_95 = _batter_fs_from_context
+
+def _batter_fs_from_context(ctx):
+    row = _prev_batter_fs_from_context_95(ctx)
+    try:
+        hand = str(row.get("Pitcher Hand") or ctx.get("Pitcher Hand") or "UNK").upper()
+        split = str(row.get("Split Source") or ctx.get("Split Source") or "SEASON")
+        lineup_weight = str(row.get("Lineup Weight") or "PROJECTED_WEIGHT")
+        fs = _ml95_num(row.get("FS Projection"), 0)
+
+        # Conservative deductions for missing core context so board does not overtrust false reads.
+        context_penalty = 0.0
+        context_flags = []
+        if hand == "UNK" or hand == "":
+            context_penalty -= 0.20
+            context_flags.append("NO_HAND")
+        if split == "SEASON":
+            context_penalty -= 0.10
+            context_flags.append("NO_SPLIT")
+        if "PROJECTED" in lineup_weight:
+            context_penalty -= 0.05
+            context_flags.append("PROJECTED_LINEUP")
+
+        fs2 = _ml95_clamp(fs + context_penalty, 1.0, 22.0, fs)
+        row["FS Projection"] = round(fs2, 2)
+        row["Median"] = round(fs2, 2)
+        row["Floor"] = round(_ml95_clamp(_ml95_num(row.get("Floor"), fs2*0.45) + min(0, context_penalty) * 1.2, 0, fs2, fs2*0.45), 2)
+        row["Ceiling"] = round(_ml95_clamp(_ml95_num(row.get("Ceiling"), fs2+4) + max(0, context_penalty) * 1.2, fs2+1, 30, fs2+4), 2)
+        row["Context Quality"] = "GOOD" if not context_flags else " / ".join(context_flags)
+        row["FS Accuracy Version"] = FS_ML_95_PUSH_VERSION
+    except Exception:
+        pass
+    return row
+
+# Moneyline render override to show projected score prominently.
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge")
+    st.caption("Projected-score ML engine. Stricter plays require score edge + model/market agreement.")
+    df = ml_build_board(board)
+    if df.empty:
+        st.info("No ML board yet. Refresh the K board first.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Games", len(df))
+    c2.metric("Playable", int((df["Status"]=="PLAYABLE").sum()))
+    c3.metric("Leans", int((df["Status"]=="LEAN").sum()))
+    c4.metric("Avg Score Edge", round(_ml95_num(df["Score Edge"].mean(), 0), 2) if "Score Edge" in df else "—")
+    st.markdown('<div class="section-title-pro">Moneyline Projected Score Board</div>', unsafe_allow_html=True)
+    try:
+        render_moneyline_pro_board(df.head(15))
+    except Exception:
+        pass
+    show_cols = [c for c in [
+        "Matchup","Pick","ML Grade","Status","ML Edge %","Projected Score","Score Edge","Score Pick",
+        "Away Model %","Home Model %","Away Market %","Home Market %",
+        "Away SP","Home SP","Away Projected Runs","Home Projected Runs","ML Version"
+    ] if c in df.columns]
+    st.dataframe(df[show_cols] if show_cols else df, use_container_width=True, hide_index=True)
+
+
+# =========================
+# TRUE OUTCOME FS + ML FINAL LAYER
+# Version: TRUE_OUTCOME_FS_ML_2026_06_10
+#
+# IMPORTANT:
+# - K Upside / K projection math is untouched.
+# - This layer only improves Pitcher FS, Batter FS, and Moneyline.
+# =========================
+TRUE_OUTCOME_FS_ML_VERSION = "TRUE_OUTCOME_FS_ML_2026_06_10"
+
+def _to_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _to_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _to_team_runs(team, team_row, opp_row):
+    try:
+        runs, _, factors = _ml95_expected_runs(team, team_row, opp_row)
+        return _to_cap(runs, 2.2, 7.2, 4.45), factors
+    except Exception:
+        try:
+            score, factors = ml_moneyline_factors(team, team_row, opp_row)
+            runs = _to_num(factors.get("Projected Runs") or factors.get("Team Implied Runs") or factors.get("Runs/G"), 4.45)
+            return _to_cap(runs, 2.2, 7.2, 4.45), factors
+        except Exception:
+            return 4.45, {}
+
+def _to_matchup_rows(board, p):
+    matchup = str((p or {}).get("matchup") or (p or {}).get("Matchup") or "")
+    team = str((p or {}).get("team") or (p or {}).get("Team") or "").upper()
+    opp = None
+    for q in board or []:
+        if not isinstance(q, dict):
+            continue
+        if str(q.get("matchup") or q.get("Matchup") or "") == matchup and str(q.get("team") or q.get("Team") or "").upper() != team:
+            opp = q
+            break
+    return team, opp
+
+def _to_projected_win_pct(team_runs, opp_runs, bullpen_score=50):
+    try:
+        import math
+        diff = float(team_runs) - float(opp_runs)
+        p = 1 / (1 + math.exp(-0.72 * diff))
+        # bullpen stability protects leads; keep small
+        p += _to_cap((bullpen_score - 50) / 1000, -0.035, 0.035, 0)
+        return _to_cap(p * 100, 25, 75, 50)
+    except Exception:
+        return 50.0
+
+def _to_qs_pct(ip_proj, opp_runs, opp_wrc, park_factor=1.0):
+    # QS = 6+ IP and <=3 ER; use smooth proxy.
+    base = (ip_proj - 5.25) * 34
+    run_tax = (opp_runs - 4.45) * -4.5
+    wrc_tax = (opp_wrc - 100) * -0.08
+    park_tax = (park_factor - 1.0) * -10
+    return _to_cap(base + run_tax + wrc_tax + park_tax, 3, 72, 18)
+
+# Final Pitcher FS true-outcome override
+def build_pitcher_fs_board(board=None):
+    rows_raw = _fs_pitcher_rows_from_active_board(board) if "_fs_pitcher_rows_from_active_board" in globals() else (board or [])
+    rows = []
+    for p in rows_raw:
+        try:
+            team, opp_row = _to_matchup_rows(rows_raw, p)
+            matchup = str(p.get("matchup") or p.get("Matchup") or "")
+            a, h = _ml95_split_matchup(matchup) if "_ml95_split_matchup" in globals() else ("", "")
+            opp_team = h if team == a else a if team == h else ""
+
+            base = _pitcher_fs_from_k_context(p) if "_pitcher_fs_from_k_context" in globals() else _pitcher_fs_from_board_row(p)
+
+            team_runs, tf = _to_team_runs(team, p, opp_row or {})
+            opp_runs, of = _to_team_runs(opp_team, opp_row or {}, p)
+
+            bullpen_score = _to_num(tf.get("Bullpen Score") or tf.get("Lineup Strength"), 50)
+            park_factor = _to_num(tf.get("Park Factor"), 1.0)
+            opp_wrc = _to_num(of.get("Team wRC+ Split") or base.get("Opp wRC+"), 100)
+
+            k_proj = _to_num(base.get("K Projection"), 4.5)
+            ip_proj = _to_cap(base.get("IP Projection"), 3.0, 7.2, 5.3)
+            er_proj = _to_cap((opp_runs * (ip_proj / 9.0) * 0.82) + _to_cap((park_factor - 1.0) * 0.30, -0.25, 0.35, 0), 0.2, 5.8, 2.5)
+
+            win_pct = _to_projected_win_pct(team_runs, opp_runs, bullpen_score)
+            qs_pct = _to_qs_pct(ip_proj, opp_runs, opp_wrc, park_factor)
+
+            matchup_adj = _to_cap(((100 - opp_wrc) * 0.010) + ((team_runs - opp_runs) * 0.04), -0.80, 0.80, 0)
+
+            fs = (k_proj * 3.0) + (ip_proj * 3.0) - (er_proj * 3.0) + ((win_pct / 100) * 5) + ((qs_pct / 100) * 5) + matchup_adj
+            fs = _to_cap(fs, 4.0, 48.0, _to_num(base.get("FS Projection"), 18))
+            floor = _to_cap(fs - 4.75, 0, fs, fs * 0.72)
+            ceiling = _to_cap(fs + 4.75 + k_proj * 0.25, fs + 1, 55, fs + 6)
+
+            base.update({
+                "FS Projection": round(fs, 2),
+                "Floor": round(floor, 2),
+                "Median": round(fs, 2),
+                "Ceiling": round(ceiling, 2),
+                "Confidence %": _fs_conf(fs, floor, ceiling),
+                "ER Projection": round(er_proj, 2),
+                "Win %": round(win_pct, 1),
+                "QS %": round(qs_pct, 1),
+                "Opp wRC+": round(opp_wrc, 1),
+                "Team Projected Runs": round(team_runs, 2),
+                "Opp Projected Runs": round(opp_runs, 2),
+                "Bullpen Stability": round(bullpen_score, 1),
+                "Park Factor": round(park_factor, 3),
+                "True Outcome Version": TRUE_OUTCOME_FS_ML_VERSION,
+            })
+            rows.append(base)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+# Batter FS true-outcome helper: team runs, RBI/run opportunity, platoon, park, no false reads.
+_prev_to_batter_fs_from_context = _batter_fs_from_context
+
+def _batter_fs_from_context(ctx):
+    row = _prev_to_batter_fs_from_context(ctx)
+    try:
+        team = str(ctx.get("Team") or row.get("Team") or "").upper()
+        opp = str(ctx.get("Opponent") or row.get("Opponent") or "").upper()
+
+        # Get team run context from moneyline engine if possible.
+        team_runs = _to_num(ctx.get("Team Implied Runs"), None)
+        if team_runs is None:
+            team_runs = 4.45
+            try:
+                # Use neutral rows if no direct team rows are available.
+                team_runs, _ = _to_team_runs(team, {}, {})
+            except Exception:
+                pass
+        team_runs = _to_cap(team_runs, 2.4, 7.2, 4.45)
+
+        fs = _to_num(row.get("FS Projection"), 7.0)
+        pa = _to_cap(row.get("PA"), 3.3, 5.1, 4.1)
+        slot = int(_to_cap(row.get("Lineup Slot"), 1, 9, 4))
+
+        obp = _to_cap(ctx.get("OBP"), 0.180, 0.500, 0.320)
+        iso = _to_cap(ctx.get("ISO"), 0.030, 0.380, 0.150)
+        hand = str(row.get("Pitcher Hand") or ctx.get("Pitcher Hand") or "UNK").upper()
+        split = str(row.get("Split Source") or ctx.get("Split Source") or "SEASON")
+        park_score = _to_num(row.get("Park/Weather Score") or ctx.get("Park/Weather Score"), 50)
+
+        # Correlated Run/RBI opportunity
+        run_opp = (team_runs - 4.45) * 0.16 + (obp - 0.320) * 2.0
+        rbi_opp = (team_runs - 4.45) * 0.15 + (iso - 0.150) * 1.4
+
+        if slot in [1, 2]:
+            run_opp += 0.12
+            rbi_opp -= 0.04
+        elif slot in [3, 4, 5]:
+            run_opp += 0.04
+            rbi_opp += 0.12
+        elif slot >= 8:
+            run_opp -= 0.08
+            rbi_opp -= 0.10
+
+        platoon_adj = 0.0
+        context_flags = []
+        if hand in ["L", "R"] and split != "SEASON":
+            platoon_adj += 0.08
+        else:
+            platoon_adj -= 0.12
+            context_flags.append("WEAK_SPLIT_CONTEXT")
+
+        park_adj = _to_cap((park_score - 50) / 180, -0.12, 0.16, 0)
+
+        total_adj = _to_cap(run_opp + rbi_opp + platoon_adj + park_adj, -0.65, 0.75, 0)
+        fs2 = _to_cap(fs + total_adj, 1.0, 22.0, fs)
+
+        row["FS Projection"] = round(fs2, 2)
+        row["Median"] = round(fs2, 2)
+        row["Floor"] = round(_to_cap(_to_num(row.get("Floor"), fs2 * 0.45) + min(0, total_adj) * 1.2, 0, fs2, fs2 * 0.45), 2)
+        row["Ceiling"] = round(_to_cap(_to_num(row.get("Ceiling"), fs2 + 4) + max(0, total_adj) * 1.2, fs2 + 1, 30, fs2 + 4), 2)
+        row["Team Run Env"] = round(team_runs, 2)
+        row["Run Opp Adj"] = round(run_opp, 2)
+        row["RBI Opp Adj"] = round(rbi_opp, 2)
+        row["Platoon Adj"] = round(platoon_adj, 2)
+        row["Park Adj"] = round(park_adj, 2)
+        row["True Outcome Adj"] = round(total_adj, 2)
+        row["Context Quality"] = "GOOD" if not context_flags else " / ".join(context_flags)
+        row["True Outcome Version"] = TRUE_OUTCOME_FS_ML_VERSION
+    except Exception:
+        pass
+    return row
+
+# Moneyline final true-score engine with stronger SP/bullpen/offense/volatility.
+_prev_to_ml_build_board = ml_build_board
+
+def _to_game_volatility(aruns, hruns, af, hf):
+    total = aruns + hruns
+    diff = abs(aruns - hruns)
+    park_a = _to_num(af.get("Park Factor"), 1.0)
+    park_h = _to_num(hf.get("Park Factor"), 1.0)
+    v = 50 + max(0, total - 8.8) * 6 - diff * 5 + abs(park_a - 1.0) * 20 + abs(park_h - 1.0) * 20
+    label = "HIGH" if v >= 62 else "LOW" if v <= 43 else "MEDIUM"
+    return round(_to_cap(v, 20, 90, 50), 1), label
+
+def ml_build_board(board):
+    base_df = None
+    try:
+        base_df = _prev_to_ml_build_board(board)
+    except Exception:
+        base_df = pd.DataFrame()
+
+    odds = []
+    try:
+        odds = ml_fetch_oddsapi_h2h()
+    except Exception:
+        odds = []
+
+    games = {}
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        a, h = _ml95_split_matchup(p.get("matchup") or p.get("Matchup")) if "_ml95_split_matchup" in globals() else ("", "")
+        team = str(p.get("team") or p.get("Team") or "").upper()
+        if not a or not h or not team:
+            continue
+        rec = games.setdefault(f"{a} @ {h}", {"away": a, "home": h, "pitchers": []})
+        rec["pitchers"].append(p)
+
+    rows = []
+    for matchup, g in games.items():
+        a, h = g["away"], g["home"]
+        ps = g["pitchers"]
+        ap = next((p for p in ps if str(p.get("team") or p.get("Team") or "").upper() == a.upper()), None) or (ps[0] if ps else {})
+        hp = next((p for p in ps if str(p.get("team") or p.get("Team") or "").upper() == h.upper()), None) or (ps[1] if len(ps) > 1 else {})
+
+        aruns, ascore, af = _ml95_expected_runs(a, ap, hp) if "_ml95_expected_runs" in globals() else (_to_team_runs(a, ap, hp)[0], 50, {})
+        hruns, hscore, hf = _ml95_expected_runs(h, hp, ap) if "_ml95_expected_runs" in globals() else (_to_team_runs(h, hp, ap)[0], 50, {})
+
+        # Starting pitcher and bullpen exposure tweaks
+        asp_adj = _ml95_pitcher_quality_adj(ap) if "_ml95_pitcher_quality_adj" in globals() else 0
+        hsp_adj = _ml95_pitcher_quality_adj(hp) if "_ml95_pitcher_quality_adj" in globals() else 0
+        aruns = _to_cap(aruns + hsp_adj * 0.45, 2.2, 7.2, aruns)
+        hruns = _to_cap(hruns + asp_adj * 0.45, 2.2, 7.2, hruns)
+
+        amodel = _to_projected_win_pct(aruns, hruns, _to_num(af.get("Bullpen Score") or af.get("Lineup Strength"), 50))
+        hmodel = 100 - amodel
+
+        og = next((x for x in odds if x.get("away_abbr") == a and x.get("home_abbr") == h), None)
+        amkt = og.get("away_market") if og else None
+        hmkt = og.get("home_market") if og else None
+        aedge = None if amkt is None else round(amodel - amkt, 1)
+        hedge = None if hmkt is None else round(hmodel - hmkt, 1)
+
+        score_pick = a if aruns >= hruns else h
+        model_pick = a if amodel >= hmodel else h
+        score_edge = abs(aruns - hruns)
+        model_gap = abs(amodel - hmodel)
+        vol_score, vol_label = _to_game_volatility(aruns, hruns, af, hf)
+
+        if aedge is None or hedge is None:
+            pick = model_pick
+            edge = round(model_gap, 1)
+            status = "MODEL ONLY"
+            grade = f"MODEL LEAN — {pick}"
+        else:
+            pick, edge = (a, aedge) if aedge >= hedge else (h, hedge)
+            agrees = pick == score_pick
+            if edge >= 6 and score_edge >= 0.40 and agrees and vol_label != "HIGH":
+                status, grade = "PLAYABLE", f"🔥 ML EDGE — {pick}"
+            elif edge >= 4 and score_edge >= 0.25 and agrees:
+                status, grade = "LEAN", f"✅ ML LEAN — {pick}"
+            else:
+                status, grade = "PASS", f"🚫 PASS ML — {pick}"
+
+        rows.append({
+            "Matchup": matchup,
+            "Pick": pick,
+            "ML Grade": grade,
+            "Status": status,
+            "ML Edge %": round(edge, 1),
+            "Projected Score": f"{a} {aruns:.1f} - {h} {hruns:.1f}",
+            "Away Projected Runs": round(aruns, 2),
+            "Home Projected Runs": round(hruns, 2),
+            "Score Edge": round(score_edge, 2),
+            "Score Pick": score_pick,
+            "Game Volatility": vol_label,
+            "Volatility Score": vol_score,
+            "Away Model %": round(amodel, 1),
+            "Home Model %": round(hmodel, 1),
+            "Away Market %": amkt,
+            "Home Market %": hmkt,
+            "Away Price": og.get("away_price") if og else None,
+            "Home Price": og.get("home_price") if og else None,
+            "Away SP": ap.get("pitcher", ap.get("Pitcher", "—")) if isinstance(ap, dict) else "—",
+            "Home SP": hp.get("pitcher", hp.get("Pitcher", "—")) if isinstance(hp, dict) else "—",
+            "Away Team wRC+": af.get("Team wRC+ Split"),
+            "Home Team wRC+": hf.get("Team wRC+ Split"),
+            "Away Lineup Strength": af.get("Lineup Strength"),
+            "Home Lineup Strength": hf.get("Lineup Strength"),
+            "Away Data Mode": af.get("Data Mode"),
+            "Home Data Mode": hf.get("Data Mode"),
+            "True Outcome Version": TRUE_OUTCOME_FS_ML_VERSION,
+            "Source": "True Outcome Projected Score + Odds" if og else "True Outcome Projected Score",
+        })
+    return pd.DataFrame(rows)
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_calibration, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
