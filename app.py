@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -17599,6 +17600,285 @@ def render_batter_fs_tab():
     except Exception:
         pass
     _prev_ui_render_batter_fs_tab()
+
+
+# =========================
+# FINAL K CARD DETAIL + TEAM LOGO FIX
+# Version: FINAL_K_CARD_DETAILS_TEAM_FIX_2026_06_11
+#
+# UI-only:
+# - Fixes wrong pitcher logo/team bug by matching pitcher to actual team/probable starter fields.
+# - Adds important K card details back: BF, IP, floor/median/ceiling, L10 Ks, pitch count, form, last 10.
+# - Does NOT change model projections or picks.
+# =========================
+FINAL_K_CARD_DETAILS_TEAM_FIX_VERSION = "FINAL_K_CARD_DETAILS_TEAM_FIX_2026_06_11"
+
+def _ui_norm_name(x):
+    s = str(x or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\s'-]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+# Small fallback map only for rare UI team fields missing. Normal flow uses raw board fields first.
+PITCHER_TEAM_FALLBACK = {
+    "mitch keller": "PIT",
+    "hunter dobbins": "STL",
+    "christian scott": "NYM",
+    "zebby matthews": "MIN",
+    "keider montero": "DET",
+    "merrill kelly": "ARI",
+    "tyler phillips": "MIA",
+    "martin perez": "ATL",
+    "martín pérez": "ATL",
+    "ryan feltner": "COL",
+    "edward cabrera": "CHC",
+    "justin wrobleski": "LAD",
+    "reid detmers": "LAA",
+    "peter lambert": "HOU",
+    "bryan woo": "SEA",
+    "george kirby": "SEA",
+    "kyle bradish": "BAL",
+    "kumar rocker": "TEX",
+    "michael wacha": "KC",
+}
+
+def _ui_pitcher_team_from_row(row, board=None):
+    # 1) Direct team columns are always preferred.
+    direct_cols = [
+        "Pitcher Team", "pitcher_team", "Team", "team", "team_abbr", "Team Abbr",
+        "PitcherTeam", "player_team", "Player Team"
+    ]
+    for c in direct_cols:
+        val = row.get(c)
+        if val not in (None, "", "—"):
+            return _ui_team_abbr(val)
+
+    pitcher = row.get("Pitcher") or row.get("Player") or row.get("pitcher") or ""
+    pname = _ui_norm_name(pitcher)
+    matchup = str(row.get("Matchup") or row.get("matchup") or "")
+    away, home = _ui_split_matchup(matchup)
+
+    # 2) If row has away/home probable starters, match name to side.
+    away_sp = _ui_norm_name(row.get("Away SP") or row.get("Away Pitcher") or row.get("away_sp"))
+    home_sp = _ui_norm_name(row.get("Home SP") or row.get("Home Pitcher") or row.get("home_sp"))
+    if pname and away_sp and pname == away_sp:
+        return away
+    if pname and home_sp and pname == home_sp:
+        return home
+
+    # 3) Search raw board row for direct team or probable fields.
+    try:
+        for p in board or []:
+            if not isinstance(p, dict):
+                continue
+            bpitcher = _ui_norm_name(p.get("Pitcher") or p.get("pitcher") or p.get("Player"))
+            if bpitcher and bpitcher == pname:
+                for c in direct_cols:
+                    val = p.get(c)
+                    if val not in (None, "", "—"):
+                        return _ui_team_abbr(val)
+                bmatch = str(p.get("Matchup") or p.get("matchup") or matchup)
+                baw, bhome = _ui_split_matchup(bmatch)
+                baw_sp = _ui_norm_name(p.get("Away SP") or p.get("Away Pitcher") or p.get("away_sp"))
+                bhome_sp = _ui_norm_name(p.get("Home SP") or p.get("Home Pitcher") or p.get("home_sp"))
+                if baw_sp and pname == baw_sp:
+                    return baw
+                if bhome_sp and pname == bhome_sp:
+                    return bhome
+    except Exception:
+        pass
+
+    # 4) Known fallback for cases where table lost team fields.
+    if pname in PITCHER_TEAM_FALLBACK:
+        return PITCHER_TEAM_FALLBACK[pname]
+
+    # 5) Last resort only: if no other signal exists.
+    return away or _ui_team_abbr(row.get("Opponent") or "")
+
+def _ui_first_present(row, names, default="—"):
+    for n in names:
+        val = row.get(n)
+        if val not in (None, "", "—"):
+            return val
+    return default
+
+def _ui_fmt_num(x, dec=2, default="—"):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        if abs(v - round(v)) < 0.005 and dec == 0:
+            return str(int(round(v)))
+        return f"{v:.{dec}f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(x) if x not in (None, "") else default
+
+def _ui_l10_text(row):
+    # Accept list-like, string-like, or separate L10 fields.
+    val = _ui_first_present(row, ["Last 10", "L10", "Last 10 Starts", "L10 Ks", "Recent Ks"], "")
+    if isinstance(val, (list, tuple)):
+        vals = [str(int(float(x))) if str(x).replace(".","",1).isdigit() else str(x) for x in val]
+        return " • ".join(vals[-10:])
+    s = str(val or "").strip()
+    if s and s != "—":
+        # Normalize commas/spaces to bullets but keep short.
+        nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+        if len(nums) >= 3:
+            return " • ".join(nums[-10:])
+        return s[:80]
+    # individual columns fallback
+    vals = []
+    for i in range(1, 11):
+        for c in [f"L10_{i}", f"L10 {i}", f"Game {i} K"]:
+            if c in row and row.get(c) not in (None, "", "—"):
+                vals.append(str(row.get(c)))
+                break
+    return " • ".join(vals[-10:]) if vals else "—"
+
+def _ui_l10_bars(row):
+    txt = _ui_l10_text(row)
+    nums = []
+    for n in re.findall(r"-?\d+(?:\.\d+)?", txt):
+        try:
+            nums.append(float(n))
+        except Exception:
+            pass
+    nums = nums[-10:]
+    if not nums:
+        return '<div class="owp-l10-empty">Last 10: —</div>'
+    mx = max(max(nums), 1)
+    bars = []
+    for v in nums:
+        h = 18 + int((v / mx) * 34)
+        cls = "good" if v >= mx * 0.70 else "warn" if v >= mx * 0.40 else "bad"
+        bars.append(f'<div class="owp-l10-bar {cls}" style="height:{h}px"><span>{_ui_fmt_num(v,0)}</span></div>')
+    return '<div class="owp-l10"><div class="owp-l10-title">Last 10 Ks</div><div class="owp-l10-bars">' + "".join(bars) + "</div></div>"
+
+def _ui_card_grade_label(row):
+    decision = str(row.get("Decision") or row.get("Pick") or row.get("Model Lean") or "").upper()
+    if "PASS" in decision:
+        return "PASS"
+    if "OVER" in decision:
+        return "OVER"
+    if "UNDER" in decision:
+        return "UNDER"
+    return decision or "LEAN"
+
+# CSS extension for detailed K cards.
+def _ui_k_detail_css():
+    _ui_card_css()
+    st.markdown("""
+<style>
+.owp-k-detail{border:1px solid rgba(255,255,255,.13);background:linear-gradient(135deg,rgba(12,18,27,.94),rgba(9,13,20,.98));border-radius:18px;padding:14px;margin:10px 0;box-shadow:0 8px 22px rgba(0,0,0,.25);}
+.owp-k-top{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;}
+.owp-k-title{font-size:20px;font-weight:900;color:#fff;line-height:1.08;}
+.owp-k-sub{font-size:12px;color:rgba(255,255,255,.62);margin-top:5px;}
+.owp-k-main{text-align:right;}
+.owp-k-main .proj{font-size:30px;font-weight:950;color:#fff;line-height:1;}
+.owp-k-main .pick{font-size:14px;font-weight:950;color:#2ecc71;margin-top:8px;}
+.owp-k-main .pick.pass{color:#f7c948}.owp-k-main .pick.risk{color:#ff405f}
+.owp-k-statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px;border-top:1px solid rgba(255,255,255,.08);padding-top:11px;}
+.owp-k-stat{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:8px 6px;text-align:center;}
+.owp-k-stat .lab{font-size:10px;color:rgba(255,255,255,.50);letter-spacing:.06em;text-transform:uppercase;}
+.owp-k-stat .val{font-size:17px;font-weight:900;color:#fff;margin-top:2px;}
+.owp-dist{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:10px;}
+.owp-dist div{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:7px;text-align:center;}
+.owp-dist .lab{font-size:10px;color:rgba(255,255,255,.50);text-transform:uppercase;}
+.owp-dist .val{font-size:15px;font-weight:900;color:#fff;}
+.owp-l10{margin-top:12px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px;}
+.owp-l10-title{font-size:11px;color:rgba(255,255,255,.58);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;}
+.owp-l10-bars{display:flex;gap:5px;align-items:flex-end;height:58px;}
+.owp-l10-bar{flex:1;min-width:12px;border-radius:6px 6px 3px 3px;display:flex;align-items:flex-end;justify-content:center;position:relative;background:#f7c948;}
+.owp-l10-bar.good{background:#2ecc71}.owp-l10-bar.warn{background:#f7c948}.owp-l10-bar.bad{background:#ff405f}
+.owp-l10-bar span{font-size:9px;color:#101010;font-weight:900;margin-bottom:2px;}
+.owp-l10-empty{font-size:12px;color:rgba(255,255,255,.55);margin-top:8px;}
+@media(max-width:520px){
+  .owp-k-statgrid{grid-template-columns:repeat(2,1fr)}
+  .owp-dist{grid-template-columns:repeat(3,1fr)}
+  .owp-k-title{font-size:18px}
+  .owp-k-main .proj{font-size:27px}
+}
+</style>
+""", unsafe_allow_html=True)
+
+def _ui_render_k_cards(df, board=None, max_cards=30):
+    if df is None or df.empty:
+        return
+    _ui_k_detail_css()
+    html = []
+    for _, rr in df.head(max_cards).iterrows():
+        row = rr.to_dict()
+        matchup = str(row.get("Matchup") or row.get("matchup") or "")
+        team = _ui_pitcher_team_from_row(row, board=board)
+        name = row.get("Pitcher") or row.get("Player") or row.get("pitcher") or ""
+        proj = _ui_first_present(row, ["K PROJ", "Projection", "Median", "K Projection"], "—")
+        line = _ui_first_present(row, ["UD/Line", "Line", "line"], "—")
+        decision = row.get("Decision") or row.get("Pick") or row.get("Model Lean") or ""
+        conf = _ui_first_present(row, ["Confidence %", "Confidence"], "—")
+        bf = _ui_first_present(row, ["Exp BF", "expected_bf", "BF"], "—")
+        ip = _ui_first_present(row, ["IP Projection", "IP Floor", "ip_floor"], "—")
+        pitch_count = _ui_first_present(row, ["Pitch Count", "Pitch Count Avg", "Pitch Count Avg L3", "Pitches"], "—")
+        form = _ui_first_present(row, ["Recent Form", "Form", "Pitch Trend Label", "Volume Learning Label"], "—")
+        whiff = _ui_first_present(row, ["Putaway/Whiff", "Whiff%", "Whiff %"], "—")
+        oppk = _ui_first_present(row, ["Opp K%", "Opponent K%", "opp_k"], "—")
+        floor = _ui_first_present(row, ["Floor"], "—")
+        median = _ui_first_present(row, ["Median", "K PROJ", "Projection"], "—")
+        ceiling = _ui_first_present(row, ["Ceiling"], "—")
+        vol_label = _ui_first_present(row, ["Volume Safety Label", "Exit Risk Label", "Volume Learning Label"], "")
+        pick_cls = "pass" if "PASS" in str(decision).upper() else "risk" if "DANGER" in str(vol_label).upper() else ""
+        html.append(f"""
+<div class="owp-k-detail">
+  <div class="owp-k-top">
+    <div>{_ui_logo(team,48)}</div>
+    <div>
+      <div class="owp-k-title">{_ui_html(name)}</div>
+      <div class="owp-k-sub">{_ui_html(team)} • {_ui_html(matchup)} • Line {_ui_html(line)} • Conf {_ui_html(conf)}</div>
+    </div>
+    <div class="owp-k-main">
+      <div class="proj">{_ui_fmt_num(proj,2)}</div>
+      <div class="pick {pick_cls}">{_ui_html(decision)}</div>
+    </div>
+  </div>
+
+  <div class="owp-k-statgrid">
+    <div class="owp-k-stat"><div class="lab">BF</div><div class="val">{_ui_fmt_num(bf,1)}</div></div>
+    <div class="owp-k-stat"><div class="lab">IP</div><div class="val">{_ui_fmt_num(ip,2)}</div></div>
+    <div class="owp-k-stat"><div class="lab">Pitch Count</div><div class="val">{_ui_fmt_num(pitch_count,0)}</div></div>
+    <div class="owp-k-stat"><div class="lab">Form</div><div class="val">{_ui_html(form)}</div></div>
+    <div class="owp-k-stat"><div class="lab">Whiff</div><div class="val">{_ui_html(whiff)}</div></div>
+    <div class="owp-k-stat"><div class="lab">Opp K%</div><div class="val">{_ui_html(oppk)}</div></div>
+    <div class="owp-k-stat"><div class="lab">Volume</div><div class="val">{_ui_html(vol_label)}</div></div>
+    <div class="owp-k-stat"><div class="lab">Version</div><div class="val">FINAL</div></div>
+  </div>
+
+  <div class="owp-dist">
+    <div><div class="lab">Floor</div><div class="val">{_ui_fmt_num(floor,2)}</div></div>
+    <div><div class="lab">Median</div><div class="val">{_ui_fmt_num(median,2)}</div></div>
+    <div><div class="lab">Ceiling</div><div class="val">{_ui_fmt_num(ceiling,2)}</div></div>
+  </div>
+
+  {_ui_l10_bars(row)}
+</div>
+""")
+    st.markdown("\n".join(html), unsafe_allow_html=True)
+
+# Override K tab once more so it passes raw board into the logo resolver.
+_prev_teamfix_render_kproj_tab = render_kproj_tab
+
+def render_kproj_tab(board):
+    try:
+        df = build_kproj_table(board)
+        if df is not None and not df.empty:
+            st.markdown("### K PROJ / UPSIDE")
+            _ui_render_k_cards(df, board=board, max_cards=30)
+            with st.expander("Full K Projection Table", expanded=True):
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            return
+    except Exception:
+        pass
+    _prev_teamfix_render_kproj_tab(board)
 
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_iq, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
