@@ -16347,12 +16347,915 @@ def render_batter_fs_tab():
     except Exception:
         pass
 
-tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_iq, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# OFFICIAL LINEUP RECALC / REFRESH LAYER
+# Version: OFFICIAL_LINEUP_RECALC_2026_06_10
+#
+# Safe layer:
+# - Does NOT change K Upside formula.
+# - Does NOT rewrite K picks.
+# - Uses the existing refreshed board/lineup inputs.
+# - Adds visibility so Pitcher FS, Batter FS, Moneyline, and score prediction show whether they are
+#   using PROJECTED or CONFIRMED lineup context.
+# =========================
+OFFICIAL_LINEUP_RECALC_VERSION = "OFFICIAL_LINEUP_RECALC_2026_06_10"
+
+def _olr_text(x, default=""):
+    try:
+        if x is None:
+            return default
+        return str(x)
+    except Exception:
+        return default
+
+def _olr_bool_confirmed(x):
+    s = _olr_text(x).upper()
+    return any(k in s for k in ["CONFIRMED", "LOCKED", "OFFICIAL", "FINAL"])
+
+def _olr_pitcher_key_from_row(r):
+    return (
+        _olr_text(r.get("Pitcher") or r.get("pitcher") or r.get("Player")).strip().lower(),
+        _olr_text(r.get("Matchup") or r.get("matchup")).strip()
+    )
+
+def _olr_board_lineup_status(board):
+    total = 0
+    confirmed = 0
+    projected = 0
+    unknown = 0
+    by_key = {}
+    by_matchup = {}
+
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        total += 1
+        status = (
+            p.get("lineup_status") or
+            p.get("Lineup") or
+            p.get("Lineup Status") or
+            p.get("lineup_confirmed") or
+            p.get("Real Lineup Upgrade") or
+            ""
+        )
+        is_conf = _olr_bool_confirmed(status) or bool(p.get("lineup_locked")) or bool(p.get("confirmed_lineup"))
+        label = "CONFIRMED" if is_conf else "PROJECTED"
+        if is_conf:
+            confirmed += 1
+        elif status:
+            projected += 1
+        else:
+            unknown += 1
+
+        key = _olr_pitcher_key_from_row(p)
+        by_key[key] = label
+
+        matchup = _olr_text(p.get("matchup") or p.get("Matchup")).strip()
+        if matchup:
+            m = by_matchup.setdefault(matchup, {"confirmed": 0, "total": 0})
+            m["total"] += 1
+            if is_conf:
+                m["confirmed"] += 1
+
+    matchup_status = {}
+    for m, vals in by_matchup.items():
+        if vals["total"] and vals["confirmed"] == vals["total"]:
+            matchup_status[m] = "CONFIRMED"
+        elif vals["confirmed"] > 0:
+            matchup_status[m] = "PARTIAL_CONFIRMED"
+        else:
+            matchup_status[m] = "PROJECTED"
+
+    if total == 0:
+        overall = "NO_BOARD"
+    elif confirmed == total:
+        overall = "ALL_CONFIRMED"
+    elif confirmed > 0:
+        overall = "PARTIAL_CONFIRMED"
+    else:
+        overall = "PROJECTED"
+
+    return {
+        "overall": overall,
+        "total": total,
+        "confirmed": confirmed,
+        "projected": projected,
+        "unknown": unknown,
+        "by_key": by_key,
+        "by_matchup": matchup_status,
+    }
+
+def _olr_status_for_matchup(matchup, info):
+    try:
+        return info.get("by_matchup", {}).get(_olr_text(matchup).strip(), info.get("overall", "PROJECTED"))
+    except Exception:
+        return "PROJECTED"
+
+def _olr_add_recalc_cols(df, board=None, module=""):
+    try:
+        if df is None or df.empty:
+            return df
+        info = _olr_board_lineup_status(board)
+        out = df.copy()
+        if "Matchup" in out.columns:
+            out["Official Recalc Status"] = out["Matchup"].apply(lambda x: _olr_status_for_matchup(x, info))
+        else:
+            out["Official Recalc Status"] = info.get("overall", "PROJECTED")
+        out["Official Recalc Module"] = module
+        out["Official Recalc Version"] = OFFICIAL_LINEUP_RECALC_VERSION
+        out["Confirmed Lineup Rows"] = info.get("confirmed", 0)
+        out["Total Lineup Rows"] = info.get("total", 0)
+        out["Using Confirmed Lineup"] = out["Official Recalc Status"].astype(str).str.contains("CONFIRMED", case=False, na=False)
+        return out
+    except Exception:
+        return df
+
+_prev_olr_build_pitcher_fs_board = build_pitcher_fs_board
+
+def build_pitcher_fs_board(board=None):
+    df = _prev_olr_build_pitcher_fs_board(board)
+    return _olr_add_recalc_cols(df, board=board, module="Pitcher FS")
+
+_prev_olr_build_batter_fs_board = build_batter_fs_board
+
+def build_batter_fs_board(*args, **kwargs):
+    df = _prev_olr_build_batter_fs_board(*args, **kwargs)
+    try:
+        if df is not None and not df.empty:
+            out = df.copy()
+            status_col = None
+            for c in ["Lineup Status", "Lineup Weight", "Real Lineup Upgrade"]:
+                if c in out.columns:
+                    status_col = c
+                    break
+            if status_col:
+                out["Official Recalc Status"] = out[status_col].apply(lambda x: "CONFIRMED" if _olr_bool_confirmed(x) else "PROJECTED")
+            else:
+                out["Official Recalc Status"] = "PROJECTED"
+            out["Using Confirmed Lineup"] = out["Official Recalc Status"].astype(str).str.contains("CONFIRMED", case=False, na=False)
+            out["Official Recalc Module"] = "Batter FS"
+            out["Official Recalc Version"] = OFFICIAL_LINEUP_RECALC_VERSION
+            return out
+    except Exception:
+        pass
+    return df
+
+_prev_olr_ml_build_board = ml_build_board
+
+def ml_build_board(board):
+    df = _prev_olr_ml_build_board(board)
+    return _olr_add_recalc_cols(df, board=board, module="Moneyline")
+
+def render_official_recalc_banner(board):
+    try:
+        info = _olr_board_lineup_status(board)
+        overall = info.get("overall", "PROJECTED")
+        confirmed = info.get("confirmed", 0)
+        total = info.get("total", 0)
+        if overall == "ALL_CONFIRMED":
+            st.success(f"Official lineup recalc active: {confirmed}/{total} board rows confirmed. FS + ML are using refreshed official context.")
+        elif overall == "PARTIAL_CONFIRMED":
+            st.warning(f"Partial official lineup recalc: {confirmed}/{total} board rows confirmed. Some FS + ML rows still use projected context.")
+        elif overall == "PROJECTED":
+            st.info("Pre-lineup mode: FS + ML are using projected lineup context. Refresh after official lineups post.")
+        else:
+            st.info("Lineup status unavailable. Refresh live board when lineups post.")
+    except Exception:
+        pass
+
+_prev_olr_render_pitcher_fs_tab = render_pitcher_fs_tab
+
+def render_pitcher_fs_tab(board=None):
+    render_official_recalc_banner(board)
+    _prev_olr_render_pitcher_fs_tab(board)
+
+_prev_olr_render_batter_fs_tab = render_batter_fs_tab
+
+def render_batter_fs_tab():
+    st.info("Batter FS updates from PROJECTED to CONFIRMED context when the lineup feed posts actual batting order and the board is refreshed.")
+    _prev_olr_render_batter_fs_tab()
+
+_prev_olr_render_moneyline_edge_tab = render_moneyline_edge_tab
+
+def render_moneyline_edge_tab(board, dates=None):
+    render_official_recalc_banner(board)
+    _prev_olr_render_moneyline_edge_tab(board, dates)
+
+
+# =========================
+# K VOLUME LEARNING + IQ LAYER
+# Version: K_VOLUME_LEARNING_IQ_2026_06_10
+#
+# Goal:
+# - Improve volume projection context: Expected BF, leash, manager tendency, pitch efficiency.
+# - Keep K skill math intact.
+# - Learning goes into Baseball IQ / learning visibility.
+# - No direct override of K core formula.
+# =========================
+K_VOLUME_LEARNING_IQ_VERSION = "K_VOLUME_LEARNING_IQ_2026_06_10"
+
+def _kvl_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _kvl_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _kvl_pitch_efficiency_score(p):
+    ppa = _kvl_num(p.get("Pitches/PA") or p.get("Pitches Per PA") or p.get("Pitch/PA"), 3.92)
+    ppi = _kvl_num(p.get("Pitches/Inning") or p.get("Pitches Per Inning"), 16.5)
+    fstrike = _kvl_num(p.get("F-Strike%") or p.get("First Strike %"), 61.0)
+    zone = _kvl_num(p.get("Zone%") or p.get("Zone %"), 42.0)
+
+    score = 50
+    score += _kvl_cap((3.92 - ppa) * 18, -12, 12, 0)
+    score += _kvl_cap((16.5 - ppi) * 1.8, -12, 12, 0)
+    score += _kvl_cap((fstrike - 61) * 0.45, -8, 8, 0)
+    score += _kvl_cap((zone - 42) * 0.32, -7, 7, 0)
+    return round(_kvl_cap(score, 15, 90, 50), 1)
+
+def _kvl_manager_tendency_score(p):
+    # Higher score = manager/team likely allows deeper starter leash.
+    hook = _kvl_num(p.get("Team Hook Score") or p.get("Manager Hook") or p.get("Hook Score"), 50)
+    role = _kvl_num(p.get("Role Score") or p.get("role_score"), 50)
+    starter = _kvl_num(p.get("Starter Score") or p.get("starter_score"), 50)
+    pitch_avg = _kvl_num(p.get("Pitch Count Avg L3") or p.get("pitch_count_avg_l3"), 88)
+    recent_ip = _kvl_num(p.get("Last 3 IP") or p.get("L3 IP") or p.get("Recent IP"), 5.2)
+
+    score = 50
+    score += _kvl_cap((hook - 50) * 0.35, -12, 12, 0)
+    score += _kvl_cap((role - 50) * 0.15, -6, 6, 0)
+    score += _kvl_cap((starter - 50) * 0.15, -6, 6, 0)
+    score += _kvl_cap((pitch_avg - 88) * 0.55, -10, 12, 0)
+    score += _kvl_cap((recent_ip - 5.2) * 6.0, -10, 12, 0)
+    return round(_kvl_cap(score, 15, 92, 50), 1)
+
+def _kvl_expected_bf_learning_score(p):
+    exp_bf = _kvl_num(p.get("Exp BF") or p.get("expected_bf"), 22)
+    ip_floor = _kvl_num(p.get("IP Floor") or p.get("ip_floor"), 5.0)
+    leash = _kvl_num(p.get("Leash Score") or p.get("leash_score"), 50)
+    eff = _kvl_pitch_efficiency_score(p)
+    mgr = _kvl_manager_tendency_score(p)
+
+    score = 50
+    score += _kvl_cap((exp_bf - 22) * 2.0, -12, 14, 0)
+    score += _kvl_cap((ip_floor - 5.0) * 8.0, -10, 12, 0)
+    score += _kvl_cap((leash - 50) * 0.16, -8, 8, 0)
+    score += _kvl_cap((eff - 50) * 0.18, -8, 8, 0)
+    score += _kvl_cap((mgr - 50) * 0.20, -9, 9, 0)
+    return round(_kvl_cap(score, 10, 95, 50), 1)
+
+def _kvl_volume_learning_adjustment(p):
+    """
+    Informational adjustment only.
+    It estimates whether the current BF/IP volume may be too low or too high.
+    Does not rewrite K core projection.
+    """
+    bf_score = _kvl_expected_bf_learning_score(p)
+    eff = _kvl_pitch_efficiency_score(p)
+    mgr = _kvl_manager_tendency_score(p)
+    early_risk = _kvl_num(p.get("Early Exit Risk"), None)
+    if early_risk is None:
+        try:
+            early_risk = _ks97_early_exit_risk(p)[0]
+        except Exception:
+            early_risk = 45
+
+    adj_bf = 0.0
+    adj_bf += _kvl_cap((bf_score - 50) * 0.035, -1.2, 1.4, 0)
+    adj_bf += _kvl_cap((eff - 50) * 0.020, -0.7, 0.8, 0)
+    adj_bf += _kvl_cap((mgr - 50) * 0.025, -0.9, 1.0, 0)
+    adj_bf -= _kvl_cap((early_risk - 50) * 0.025, -0.7, 1.0, 0)
+    adj_bf = _kvl_cap(adj_bf, -2.0, 2.2, 0)
+
+    if adj_bf >= 1.0:
+        label = "VOLUME_UPSIDE"
+    elif adj_bf <= -1.0:
+        label = "VOLUME_RISK"
+    else:
+        label = "VOLUME_NEUTRAL"
+
+    return round(adj_bf, 2), label
+
+def _kvl_learning_note(p):
+    adj, label = _kvl_volume_learning_adjustment(p)
+    eff = _kvl_pitch_efficiency_score(p)
+    mgr = _kvl_manager_tendency_score(p)
+    bf_score = _kvl_expected_bf_learning_score(p)
+
+    notes = []
+    if label == "VOLUME_UPSIDE":
+        notes.append("Projected BF may be conservative")
+    if label == "VOLUME_RISK":
+        notes.append("Projected BF may be aggressive")
+    if eff >= 62:
+        notes.append("Efficient pitcher profile")
+    if eff <= 40:
+        notes.append("Pitch inefficiency risk")
+    if mgr >= 62:
+        notes.append("Manager/team deep leash tendency")
+    if mgr <= 40:
+        notes.append("Manager/team quick-hook tendency")
+    if bf_score >= 65:
+        notes.append("Strong BF/IP support")
+    if bf_score <= 38:
+        notes.append("Weak BF/IP support")
+    return " | ".join(notes) if notes else "Neutral volume learning"
+
+# Wrap K table to expose volume learning columns.
+_prev_kvl_build_kproj_table = build_kproj_table
+
+def build_kproj_table(board):
+    df = _prev_kvl_build_kproj_table(board)
+    try:
+        rows = []
+        for p in board or []:
+            eff = _kvl_pitch_efficiency_score(p)
+            mgr = _kvl_manager_tendency_score(p)
+            bfscore = _kvl_expected_bf_learning_score(p)
+            adjbf, vlabel = _kvl_volume_learning_adjustment(p)
+            rows.append({
+                "Volume Learning BF Score": bfscore,
+                "Pitch Efficiency Learning": eff,
+                "Manager Tendency Learning": mgr,
+                "Projected BF Learning Adj": adjbf,
+                "Volume Learning Label": vlabel,
+                "Volume Learning Note": _kvl_learning_note(p),
+                "K Volume Learning Version": K_VOLUME_LEARNING_IQ_VERSION,
+            })
+        ex = pd.DataFrame(rows)
+        if df is not None and len(ex) == len(df):
+            df = pd.concat([df.reset_index(drop=True), ex.reset_index(drop=True)], axis=1)
+    except Exception:
+        pass
+    return df
+
+# Add volume learning into Baseball IQ board if the IQ tab exists.
+_prev_kvl_baseball_iq_for_k_row = _baseball_iq_for_k_row if "_baseball_iq_for_k_row" in globals() else None
+
+def _baseball_iq_for_k_row(p):
+    base = {}
+    if _prev_kvl_baseball_iq_for_k_row:
+        try:
+            base = dict(_prev_kvl_baseball_iq_for_k_row(p))
+        except Exception:
+            base = {}
+    if not base:
+        base = {
+            "Module": "K Upside",
+            "Player": p.get("pitcher") or p.get("Pitcher") or p.get("Player"),
+            "Matchup": p.get("matchup") or p.get("Matchup"),
+            "Projection": p.get("projection") or p.get("K PROJ"),
+            "Line": p.get("line") or p.get("Line"),
+            "Model Pick": p.get("pick_side") or p.get("Decision"),
+            "Baseball IQ Score": 50,
+            "IQ Label": "NEUTRAL_IQ",
+            "Main Reasons": "Neutral baseball context",
+            "Read Only": "YES",
+        }
+
+    eff = _kvl_pitch_efficiency_score(p)
+    mgr = _kvl_manager_tendency_score(p)
+    bfscore = _kvl_expected_bf_learning_score(p)
+    adjbf, vlabel = _kvl_volume_learning_adjustment(p)
+
+    # Read-only IQ boost/tax based on volume context. Does not change model picks.
+    iq = _kvl_num(base.get("Baseball IQ Score"), 50)
+    iq += _kvl_cap((bfscore - 50) * 0.10, -5, 6, 0)
+    iq += _kvl_cap((eff - 50) * 0.08, -4, 4, 0)
+    iq += _kvl_cap((mgr - 50) * 0.08, -4, 4, 0)
+    iq = _kvl_cap(iq, 10, 95, 50)
+
+    try:
+        base["Baseball IQ Score"] = round(iq, 1)
+        base["IQ Label"] = _iq_label(iq) if "_iq_label" in globals() else base.get("IQ Label", "NEUTRAL_IQ")
+    except Exception:
+        pass
+
+    base["Volume Learning BF Score"] = bfscore
+    base["Pitch Efficiency Learning"] = eff
+    base["Manager Tendency Learning"] = mgr
+    base["Projected BF Learning Adj"] = adjbf
+    base["Volume Learning Label"] = vlabel
+    base["Volume Learning Note"] = _kvl_learning_note(p)
+    base["K Volume Learning Version"] = K_VOLUME_LEARNING_IQ_VERSION
+    return base
+
+# Standalone helper for future graded history. This is safe and non-predictive until user grades results.
+def k_volume_learning_audit_from_history(df):
+    """
+    Takes graded history rows and summarizes where volume projection misses are happening.
+    Expected columns can include:
+    - Projected BF / Exp BF
+    - Actual BF
+    - Projected IP / IP Projection
+    - Actual IP
+    - Manager / Team
+    - Pitcher
+    """
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        proj_bf_col = next((c for c in ["Projected BF","Exp BF","expected_bf"] if c in d.columns), None)
+        actual_bf_col = next((c for c in ["Actual BF","BF Actual","actual_bf"] if c in d.columns), None)
+        pitcher_col = next((c for c in ["Pitcher","pitcher","Player"] if c in d.columns), None)
+        manager_col = next((c for c in ["Manager","Team","team"] if c in d.columns), None)
+
+        if not proj_bf_col or not actual_bf_col:
+            return pd.DataFrame()
+
+        d["BF Error"] = pd.to_numeric(d[proj_bf_col], errors="coerce") - pd.to_numeric(d[actual_bf_col], errors="coerce")
+        group_col = pitcher_col or manager_col
+        if group_col:
+            out = d.groupby(group_col).agg(
+                Starts=("BF Error","count"),
+                Avg_BF_Bias=("BF Error","mean"),
+                Abs_BF_Error=("BF Error", lambda s: s.abs().mean())
+            ).reset_index()
+            return out.sort_values("Starts", ascending=False)
+        return pd.DataFrame({
+            "Rows":[len(d)],
+            "Avg_BF_Bias":[round(d["BF Error"].mean(), 3)],
+            "Abs_BF_Error":[round(d["BF Error"].abs().mean(), 3)]
+        })
+    except Exception:
+        return pd.DataFrame()
+
+
+# =========================
+# READ-ONLY LEARNING LAB
+# Version: LEARNING_LAB_READ_ONLY_2026_06_10
+#
+# Adds read-only learning/audit tools:
+# - Pitcher Bias Learning
+# - Team Bias Learning
+# - Manager Bias Learning
+# - Run Suppression Learning
+# - Batting Order Learning
+#
+# These DO NOT change projections, picks, K Upside, FS, ML, or IQ outputs.
+# =========================
+LEARNING_LAB_VERSION = "LEARNING_LAB_READ_ONLY_2026_06_10"
+
+def _ll_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _ll_col(df, names):
+    try:
+        for c in names:
+            if c in df.columns:
+                return c
+    except Exception:
+        pass
+    return None
+
+def _ll_empty_note(name):
+    return pd.DataFrame([{
+        "Learning Module": name,
+        "Status": "WAITING_FOR_GRADED_RESULTS",
+        "Meaning": "This is read-only until you grade games with actual results.",
+        "Safe": "YES — no projections or picks changed",
+        "Version": LEARNING_LAB_VERSION,
+    }])
+
+def _learning_lab_pitcher_bias(df):
+    try:
+        if df is None or df.empty:
+            return _ll_empty_note("Pitcher Bias Learning")
+        pitcher = _ll_col(df, ["Pitcher", "pitcher", "Player"])
+        proj = _ll_col(df, ["K PROJ", "Projection", "Projected K", "Median"])
+        actual = _ll_col(df, ["Actual K", "Actual Ks", "Actual", "Result K"])
+        if not pitcher or not proj or not actual:
+            return _ll_empty_note("Pitcher Bias Learning")
+        d = df.copy()
+        d["Projection Error"] = pd.to_numeric(d[proj], errors="coerce") - pd.to_numeric(d[actual], errors="coerce")
+        out = d.groupby(pitcher).agg(
+            Rows=("Projection Error", "count"),
+            Avg_K_Bias=("Projection Error", "mean"),
+            Abs_K_Error=("Projection Error", lambda s: s.abs().mean())
+        ).reset_index()
+        out["Learning Module"] = "Pitcher Bias Learning"
+        out["Suggested Use"] = "Tiny future audit only; do not auto-adjust until sample is large."
+        out["Version"] = LEARNING_LAB_VERSION
+        return out.sort_values(["Rows", "Abs_K_Error"], ascending=[False, False])
+    except Exception:
+        return _ll_empty_note("Pitcher Bias Learning")
+
+def _learning_lab_team_bias(df):
+    try:
+        if df is None or df.empty:
+            return _ll_empty_note("Team Bias Learning")
+        team = _ll_col(df, ["Team", "team", "Opponent", "opponent"])
+        proj = _ll_col(df, ["K PROJ", "Projection", "Projected K", "Median"])
+        actual = _ll_col(df, ["Actual K", "Actual Ks", "Actual", "Result K"])
+        if not team or not proj or not actual:
+            return _ll_empty_note("Team Bias Learning")
+        d = df.copy()
+        d["Projection Error"] = pd.to_numeric(d[proj], errors="coerce") - pd.to_numeric(d[actual], errors="coerce")
+        out = d.groupby(team).agg(
+            Rows=("Projection Error", "count"),
+            Avg_K_Bias=("Projection Error", "mean"),
+            Abs_K_Error=("Projection Error", lambda s: s.abs().mean())
+        ).reset_index()
+        out["Learning Module"] = "Team Bias Learning"
+        out["Suggested Use"] = "Find teams the model over/under-projects against."
+        out["Version"] = LEARNING_LAB_VERSION
+        return out.sort_values(["Rows", "Abs_K_Error"], ascending=[False, False])
+    except Exception:
+        return _ll_empty_note("Team Bias Learning")
+
+def _learning_lab_manager_bias(df):
+    try:
+        if df is None or df.empty:
+            return _ll_empty_note("Manager Bias Learning")
+        mgr = _ll_col(df, ["Manager", "Team", "team"])
+        proj_bf = _ll_col(df, ["Projected BF", "Exp BF", "expected_bf"])
+        actual_bf = _ll_col(df, ["Actual BF", "BF Actual", "actual_bf"])
+        proj_ip = _ll_col(df, ["IP Projection", "Projected IP", "IP Floor"])
+        actual_ip = _ll_col(df, ["Actual IP", "IP Actual"])
+        if not mgr:
+            return _ll_empty_note("Manager Bias Learning")
+        d = df.copy()
+        if proj_bf and actual_bf:
+            d["Volume Error"] = pd.to_numeric(d[proj_bf], errors="coerce") - pd.to_numeric(d[actual_bf], errors="coerce")
+        elif proj_ip and actual_ip:
+            d["Volume Error"] = pd.to_numeric(d[proj_ip], errors="coerce") - pd.to_numeric(d[actual_ip], errors="coerce")
+        else:
+            return _ll_empty_note("Manager Bias Learning")
+        out = d.groupby(mgr).agg(
+            Rows=("Volume Error", "count"),
+            Avg_Volume_Bias=("Volume Error", "mean"),
+            Abs_Volume_Error=("Volume Error", lambda s: s.abs().mean())
+        ).reset_index()
+        out["Learning Module"] = "Manager Bias Learning"
+        out["Suggested Use"] = "Find teams/managers that pull early or let starters go deeper."
+        out["Version"] = LEARNING_LAB_VERSION
+        return out.sort_values(["Rows", "Abs_Volume_Error"], ascending=[False, False])
+    except Exception:
+        return _ll_empty_note("Manager Bias Learning")
+
+def _learning_lab_run_suppression(df):
+    try:
+        if df is None or df.empty:
+            return _ll_empty_note("Run Suppression Learning")
+        group = _ll_col(df, ["Pitcher", "Team", "team", "Opponent"])
+        proj_er = _ll_col(df, ["ER Projection", "Projected ER", "ER Proj"])
+        actual_er = _ll_col(df, ["Actual ER", "ER Actual", "Earned Runs"])
+        if not group or not proj_er or not actual_er:
+            return _ll_empty_note("Run Suppression Learning")
+        d = df.copy()
+        d["ER Error"] = pd.to_numeric(d[proj_er], errors="coerce") - pd.to_numeric(d[actual_er], errors="coerce")
+        out = d.groupby(group).agg(
+            Rows=("ER Error", "count"),
+            Avg_ER_Bias=("ER Error", "mean"),
+            Abs_ER_Error=("ER Error", lambda s: s.abs().mean())
+        ).reset_index()
+        out["Learning Module"] = "Run Suppression Learning"
+        out["Suggested Use"] = "Audit whether Pitcher FS over/under-projects earned runs."
+        out["Version"] = LEARNING_LAB_VERSION
+        return out.sort_values(["Rows", "Abs_ER_Error"], ascending=[False, False])
+    except Exception:
+        return _ll_empty_note("Run Suppression Learning")
+
+def _learning_lab_batting_order(df):
+    try:
+        if df is None or df.empty:
+            return _ll_empty_note("Batting Order Learning")
+        player = _ll_col(df, ["Player", "Batter", "Name"])
+        expected_slot = _ll_col(df, ["Expected Slot", "Projected Slot", "Lineup Slot"])
+        actual_slot = _ll_col(df, ["Actual Slot", "Confirmed Slot"])
+        proj_fs = _ll_col(df, ["FS Projection", "Projected FS"])
+        actual_fs = _ll_col(df, ["Actual FS", "Fantasy Actual", "Actual Fantasy"])
+        if not player or not expected_slot or not actual_slot:
+            return _ll_empty_note("Batting Order Learning")
+        d = df.copy()
+        d["Slot Error"] = pd.to_numeric(d[expected_slot], errors="coerce") - pd.to_numeric(d[actual_slot], errors="coerce")
+        if proj_fs and actual_fs:
+            d["FS Error"] = pd.to_numeric(d[proj_fs], errors="coerce") - pd.to_numeric(d[actual_fs], errors="coerce")
+            out = d.groupby(player).agg(
+                Rows=("Slot Error", "count"),
+                Avg_Slot_Bias=("Slot Error", "mean"),
+                Abs_Slot_Error=("Slot Error", lambda s: s.abs().mean()),
+                Avg_FS_Bias=("FS Error", "mean")
+            ).reset_index()
+        else:
+            out = d.groupby(player).agg(
+                Rows=("Slot Error", "count"),
+                Avg_Slot_Bias=("Slot Error", "mean"),
+                Abs_Slot_Error=("Slot Error", lambda s: s.abs().mean())
+            ).reset_index()
+        out["Learning Module"] = "Batting Order Learning"
+        out["Suggested Use"] = "Find players/teams whose projected batting slot is often wrong."
+        out["Version"] = LEARNING_LAB_VERSION
+        return out.sort_values(["Rows", "Abs_Slot_Error"], ascending=[False, False])
+    except Exception:
+        return _ll_empty_note("Batting Order Learning")
+
+def _learning_lab_get_history_df():
+    # Safe best-effort: looks for existing app state/history dfs without requiring new storage.
+    try:
+        for key in ["graded_df", "graded_history", "learning_history", "after_games_df", "results_df"]:
+            if key in st.session_state:
+                val = st.session_state.get(key)
+                if isinstance(val, pd.DataFrame) and not val.empty:
+                    return val
+        # If existing helper exists, try it.
+        for fn in ["load_learning_history", "load_graded_history", "load_results_history"]:
+            if fn in globals():
+                val = globals()[fn]()
+                if isinstance(val, pd.DataFrame) and not val.empty:
+                    return val
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def render_learning_lab_tab(board=None):
+    st.markdown("### 🧪 Learning Lab")
+    st.caption("Read-only calibration center. It does not change K Upside, Pitcher FS, Batter FS, Moneyline, or Baseball IQ picks/projections.")
+
+    df = _learning_lab_get_history_df()
+
+    if df is None or df.empty:
+        st.info("No graded history loaded yet. Once you grade games with Actual K / Actual ER / Actual BF / Actual Slot, this tab will show bias learning.")
+    else:
+        st.success(f"Loaded graded history rows: {len(df)}")
+
+    tabs = st.tabs([
+        "Pitcher Bias",
+        "Team Bias",
+        "Manager Bias",
+        "Run Suppression",
+        "Batting Order",
+    ])
+
+    with tabs[0]:
+        st.dataframe(_learning_lab_pitcher_bias(df), use_container_width=True, hide_index=True)
+    with tabs[1]:
+        st.dataframe(_learning_lab_team_bias(df), use_container_width=True, hide_index=True)
+    with tabs[2]:
+        st.dataframe(_learning_lab_manager_bias(df), use_container_width=True, hide_index=True)
+    with tabs[3]:
+        st.dataframe(_learning_lab_run_suppression(df), use_container_width=True, hide_index=True)
+    with tabs[4]:
+        st.dataframe(_learning_lab_batting_order(df), use_container_width=True, hide_index=True)
+
+    st.warning("Learning Lab is audit-only. Use it for tracking patterns first; only add tiny future nudges after a large sample.")
+
+
+# =========================
+# VOLUME PROJECTION SAFETY LAYER
+# Version: VOLUME_PROJECTION_SAFETY_2026_06_10
+#
+# Purpose:
+# - Carefully improve IP/BF volume risk detection.
+# - Does NOT rebuild K% math.
+# - Does NOT change whiff/CSW/putaway/opponent K logic.
+# - Adds safety columns + tiny monitor/pass protection on risky over spots.
+# =========================
+VOLUME_PROJECTION_SAFETY_VERSION = "VOLUME_PROJECTION_SAFETY_2026_06_10"
+
+def _vps_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _vps_cap(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+def _vps_blowup_risk(p):
+    bb = _vps_num(p.get("BB%") or p.get("Walk%") or p.get("Pitcher BB%"), 8.0)
+    hard = _vps_num(p.get("HardHit%") or p.get("Hard Hit%"), 39.0)
+    barrel = _vps_num(p.get("Barrel%") or p.get("Barrel %"), 7.5)
+    fstrike = _vps_num(p.get("F-Strike%") or p.get("First Strike %"), 61.0)
+    recent_er = _vps_num(p.get("Recent ER") or p.get("L3 ER") or p.get("Last 3 ER"), 2.5)
+    opp_obp = _vps_num(p.get("Opp OBP") or p.get("Opponent OBP"), 0.320)
+
+    risk = 35
+    risk += _vps_cap((bb - 8.0) * 2.0, -8, 18, 0)
+    risk += _vps_cap((hard - 39.0) * 0.65, -8, 12, 0)
+    risk += _vps_cap((barrel - 7.5) * 1.2, -8, 12, 0)
+    risk += _vps_cap((61.0 - fstrike) * 0.65, -8, 12, 0)
+    risk += _vps_cap((recent_er - 2.5) * 3.0, -6, 12, 0)
+    risk += _vps_cap((opp_obp - 0.320) * 150, -8, 14, 0)
+    risk = _vps_cap(risk, 0, 100, 35)
+
+    if risk >= 70:
+        label = "HIGH_BLOWUP_RISK"
+    elif risk >= 52:
+        label = "MED_BLOWUP_RISK"
+    elif risk <= 28:
+        label = "LOW_BLOWUP_RISK"
+    else:
+        label = "NORMAL_BLOWUP_RISK"
+    return round(risk, 1), label
+
+def _vps_efficiency_ceiling_clamp(p):
+    exp_bf = _vps_num(p.get("Exp BF") or p.get("expected_bf"), 22)
+    avg_bf = _vps_num(p.get("Avg BF") or p.get("L10 BF") or p.get("Recent BF"), exp_bf)
+    ip_floor = _vps_num(p.get("IP Floor") or p.get("ip_floor"), 5.0)
+    recent_ip = _vps_num(p.get("Last 3 IP") or p.get("L3 IP") or p.get("Recent IP"), 5.2)
+    eff = _vps_num(p.get("Pitch Efficiency Learning"), None)
+    if eff is None:
+        try:
+            eff = _kvl_pitch_efficiency_score(p)
+        except Exception:
+            eff = 50
+
+    clamp = 0.0
+    # If projected BF is far above recent/average BF and efficiency is not strong, cap the volume.
+    if exp_bf > avg_bf + 2.5 and eff < 55:
+        clamp -= min(1.25, (exp_bf - avg_bf) * 0.25)
+    if ip_floor > recent_ip + 0.8 and eff < 55:
+        clamp -= min(0.80, (ip_floor - recent_ip) * 0.45)
+    if eff >= 65:
+        clamp += 0.35
+
+    if clamp <= -0.85:
+        label = "CLAMP_VOLUME_DOWN"
+    elif clamp >= 0.30:
+        label = "EFFICIENCY_VOLUME_UP"
+    else:
+        label = "NO_CLAMP"
+    return round(_vps_cap(clamp, -1.8, 0.6, 0), 2), label
+
+def _vps_learning_confidence(p):
+    sample = _vps_num(p.get("Learning Sample") or p.get("Starts Sample") or p.get("History Starts") or p.get("xgboost_samples"), 0)
+    if sample >= 40:
+        return 1.0, "HIGH_SAMPLE"
+    if sample >= 25:
+        return 0.75, "GOOD_SAMPLE"
+    if sample >= 12:
+        return 0.45, "MED_SAMPLE"
+    if sample >= 6:
+        return 0.25, "LOW_SAMPLE"
+    return 0.0, "NO_SAMPLE_GATE"
+
+def _vps_volume_safety_score(p):
+    blow, blow_label = _vps_blowup_risk(p)
+    clamp, clamp_label = _vps_efficiency_ceiling_clamp(p)
+    conf, conf_label = _vps_learning_confidence(p)
+
+    early = _vps_num(p.get("Early Exit Risk"), None)
+    if early is None:
+        try:
+            early = _ks97_early_exit_risk(p)[0]
+        except Exception:
+            early = 45
+
+    bf_adj = _vps_num(p.get("Projected BF Learning Adj"), 0)
+    # Confidence gate reduces trust in learning adjustments if sample is small.
+    gated_bf_adj = bf_adj * conf
+
+    safety = 50
+    safety -= _vps_cap((blow - 45) * 0.25, -8, 14, 0)
+    safety -= _vps_cap((early - 45) * 0.22, -8, 14, 0)
+    safety += _vps_cap(gated_bf_adj * 4.0, -6, 6, 0)
+    safety += _vps_cap(clamp * 5.0, -8, 3, 0)
+
+    safety = _vps_cap(safety, 5, 95, 50)
+    if safety >= 65:
+        label = "VOLUME_SAFE"
+    elif safety <= 35:
+        label = "VOLUME_DANGER"
+    elif safety <= 45:
+        label = "VOLUME_CAUTION"
+    else:
+        label = "VOLUME_NEUTRAL"
+
+    return {
+        "Blowup Risk": blow,
+        "Blowup Risk Label": blow_label,
+        "Efficiency Clamp BF": clamp,
+        "Efficiency Clamp Label": clamp_label,
+        "Learning Confidence": conf,
+        "Learning Confidence Label": conf_label,
+        "Gated BF Learning Adj": round(gated_bf_adj, 2),
+        "Volume Safety Score": round(safety, 1),
+        "Volume Safety Label": label,
+        "Volume Safety Version": VOLUME_PROJECTION_SAFETY_VERSION,
+    }
+
+# Add volume safety columns to K board.
+_prev_vps_build_kproj_table = build_kproj_table
+
+def build_kproj_table(board):
+    df = _prev_vps_build_kproj_table(board)
+    try:
+        rows = []
+        for p in board or []:
+            rows.append(_vps_volume_safety_score(p))
+        ex = pd.DataFrame(rows)
+        if df is not None and len(ex) == len(df):
+            df = pd.concat([df.reset_index(drop=True), ex.reset_index(drop=True)], axis=1)
+    except Exception:
+        pass
+    return df
+
+# Safe decision wrapper: only protects marginal risky OVER spots. Does not alter projection formula.
+_prev_vps_kproj_decision = kproj_decision
+
+def kproj_decision(p):
+    d = dict(_prev_vps_kproj_decision(p) or {})
+    try:
+        v = _vps_volume_safety_score(p)
+        side = str(d.get("lean_side") or d.get("decision") or d.get("Model Lean") or "").upper()
+        conf = _vps_num(d.get("confidence") or d.get("Confidence %"), 0)
+        if conf > 1:
+            conf = conf / 100.0
+
+        warning = "NONE"
+        if "OVER" in side and v["Volume Safety Label"] == "VOLUME_DANGER":
+            warning = "VOLUME_DANGER_OVER_PROTECTION"
+            if conf < 0.66:
+                d["decision"] = "PASS"
+                d["tier"] = "PASS_VOLUME_SAFETY"
+        elif "OVER" in side and v["Volume Safety Label"] == "VOLUME_CAUTION":
+            warning = "VOLUME_CAUTION_OVER_MONITOR"
+
+        d["volume_safety_score"] = v["Volume Safety Score"]
+        d["volume_safety_label"] = v["Volume Safety Label"]
+        d["blowup_risk"] = v["Blowup Risk"]
+        d["efficiency_clamp_bf"] = v["Efficiency Clamp BF"]
+        d["learning_confidence_label"] = v["Learning Confidence Label"]
+        d["volume_projection_warning"] = warning
+    except Exception:
+        pass
+    return d
+
+# Add into Baseball IQ K row, read-only.
+_prev_vps_baseball_iq_for_k_row = _baseball_iq_for_k_row if "_baseball_iq_for_k_row" in globals() else None
+
+def _baseball_iq_for_k_row(p):
+    base = {}
+    if _prev_vps_baseball_iq_for_k_row:
+        try:
+            base = dict(_prev_vps_baseball_iq_for_k_row(p))
+        except Exception:
+            base = {}
+    if not base:
+        base = {
+            "Module": "K Upside",
+            "Player": p.get("pitcher") or p.get("Pitcher") or p.get("Player"),
+            "Matchup": p.get("matchup") or p.get("Matchup"),
+            "Baseball IQ Score": 50,
+            "IQ Label": "NEUTRAL_IQ",
+            "Read Only": "YES",
+        }
+
+    v = _vps_volume_safety_score(p)
+    iq = _vps_num(base.get("Baseball IQ Score"), 50)
+    if v["Volume Safety Label"] == "VOLUME_SAFE":
+        iq += 4
+    elif v["Volume Safety Label"] == "VOLUME_CAUTION":
+        iq -= 3
+    elif v["Volume Safety Label"] == "VOLUME_DANGER":
+        iq -= 7
+    iq = _vps_cap(iq, 10, 95, 50)
+
+    base["Baseball IQ Score"] = round(iq, 1)
+    try:
+        base["IQ Label"] = _iq_label(iq)
+    except Exception:
+        pass
+    base.update(v)
+    return base
+
+tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_iq, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
     "BATTER FS",
     "MONEYLINE EDGE",
     "🧠 BASEBALL IQ",
+    "🧪 LEARNING LAB",
     "CALIBRATION AUDIT",
     "ALL PLAYERS",
     "REAL PROP BOARD",
@@ -16375,6 +17278,9 @@ with tab_moneyline:
 
 with tab_iq:
     render_baseball_iq_tab(board)
+
+with tab_learning_lab:
+    render_learning_lab_tab(board)
 
 with tab_calibration:
     render_calibration_audit_tab()
