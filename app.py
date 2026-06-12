@@ -19292,6 +19292,307 @@ def render_season_to_date_puller():
         st.markdown("**Season Bullpen Context**")
         st.dataframe(st.session_state.get("season_team_bullpen_df", st.session_state.get("team_14d_bullpen_df", pd.DataFrame())), use_container_width=True, hide_index=True)
 
+
+# =========================
+# SEASON-TO-DATE PULLER FIX + DIAGNOSTICS
+# Version: MLB_SEASON_TO_DATE_PULLER_FIX_2026_06_11
+#
+# Fixes:
+# - Shows API/schedule diagnostics instead of silent 0-row result
+# - Does not cache empty failed schedule pulls
+# - Adds force re-pull toggle
+# - Uses robust final-game status checks
+# - Keeps backward-compatible Learning IQ keys
+# =========================
+MLB_SEASON_TO_DATE_PULLER_FIX_VERSION = "MLB_SEASON_TO_DATE_PULLER_FIX_2026_06_11"
+
+def _std_debug(msg):
+    try:
+        st.session_state.setdefault("std_debug_log", [])
+        st.session_state["std_debug_log"].append(str(msg))
+        st.session_state["std_debug_log"] = st.session_state["std_debug_log"][-25:]
+    except Exception:
+        pass
+
+def _std_json_fixed(url, timeout=20):
+    try:
+        import requests
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        _std_debug(f"GET {url} -> status {getattr(r, 'status_code', 'NA')}")
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except Exception as e:
+                _std_debug(f"JSON parse error: {e}")
+                return {}
+        _std_debug(f"HTTP error body: {r.text[:200] if hasattr(r, 'text') else ''}")
+    except Exception as e:
+        _std_debug(f"Request error: {repr(e)}")
+    return {}
+
+def _std_is_final_game(g):
+    status = g.get("status") or {}
+    abstract = str(status.get("abstractGameState") or "").lower()
+    detailed = str(status.get("detailedState") or "").lower()
+    coded = str(status.get("codedGameState") or "").upper()
+    status_code = str(status.get("statusCode") or "").upper()
+    if abstract == "final":
+        return True
+    if "final" in detailed or "completed" in detailed:
+        return True
+    if coded in ["F", "O"] or status_code in ["F", "O"]:
+        return True
+    return False
+
+def std_schedule_games(start_date=None, end_date=None, force=False):
+    start_date = start_date or _std_default_start()
+    end_date = end_date or _std_today()
+    key = f"std_schedule_{start_date}_{end_date}"
+
+    if force:
+        try:
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("std_schedule_") or str(k).startswith("std_box_"):
+                    del st.session_state[k]
+            _std_debug("Force re-pull: cleared season schedule/boxscore cache.")
+        except Exception:
+            pass
+
+    try:
+        if not force and key in st.session_state and st.session_state[key]:
+            _std_debug(f"Using cached schedule games: {len(st.session_state[key])}")
+            return st.session_state[key]
+    except Exception:
+        pass
+
+    # gameTypes=R focuses on regular season. If no rows, fallback without gameTypes.
+    urls = [
+        f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameTypes=R&startDate={start_date}&endDate={end_date}&hydrate=team",
+        f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate={start_date}&endDate={end_date}&hydrate=team",
+    ]
+
+    games = []
+    raw_count = 0
+    state_sample = []
+
+    for url in urls:
+        data = _std_json_fixed(url)
+        try:
+            raw_count = sum(len(d.get("games", [])) for d in data.get("dates", []))
+            _std_debug(f"Schedule raw games returned: {raw_count}")
+            for day in data.get("dates", []):
+                for g in day.get("games", []):
+                    status = g.get("status") or {}
+                    state_sample.append(f"{day.get('date')} | {status.get('detailedState')} | {status.get('abstractGameState')} | {status.get('codedGameState')}")
+                    if not _std_is_final_game(g):
+                        continue
+                    teams = g.get("teams") or {}
+                    games.append({
+                        "gamePk": g.get("gamePk"),
+                        "date": day.get("date"),
+                        "away": (((teams.get("away") or {}).get("team") or {}).get("name", "")),
+                        "home": (((teams.get("home") or {}).get("team") or {}).get("name", "")),
+                    })
+            if games:
+                break
+        except Exception as e:
+            _std_debug(f"Schedule parse error: {repr(e)}")
+
+    _std_debug(f"Final completed games kept: {len(games)}")
+    if not games and state_sample:
+        _std_debug("Status sample: " + " || ".join(state_sample[:5]))
+
+    # Do NOT cache empty failed pulls.
+    if games:
+        try:
+            st.session_state[key] = games
+        except Exception:
+            pass
+    return games
+
+def std_boxscore(game_pk, force=False):
+    key = f"std_box_{game_pk}"
+    try:
+        if not force and key in st.session_state and st.session_state[key]:
+            return st.session_state[key]
+    except Exception:
+        pass
+    data = _std_json_fixed(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore")
+    if data:
+        try:
+            st.session_state[key] = data
+        except Exception:
+            pass
+    return data
+
+def std_pull_pitcher_logs(start_date=None, end_date=None, max_games=2600, force=False):
+    games = std_schedule_games(start_date, end_date, force=force)
+    games = games[-int(max_games):] if max_games else games
+    _std_debug(f"Pitcher pull scanning games: {len(games)}")
+    rows = []
+    for g in games:
+        box = std_boxscore(g.get("gamePk"), force=force)
+        for side in ["away", "home"]:
+            try:
+                team = (box.get("teams") or {}).get(side, {})
+                opp_side = "home" if side == "away" else "away"
+                for _, p in (team.get("players", {}) or {}).items():
+                    pitching = ((p.get("stats") or {}).get("pitching") or {})
+                    if not pitching:
+                        continue
+                    ip_raw = pitching.get("inningsPitched")
+                    if ip_raw in (None, "", "0", "0.0"):
+                        continue
+                    rows.append({
+                        "Date": g.get("date"),
+                        "Pitcher": (p.get("person") or {}).get("fullName", ""),
+                        "Team": _std_abbr(g.get(side, "")),
+                        "Opponent": _std_abbr(g.get(opp_side, "")),
+                        "Home/Away": "Away" if side == "away" else "Home",
+                        "IP": _std_ip_float(ip_raw),
+                        "BF": pitching.get("battersFaced"),
+                        "Pitch Count": pitching.get("pitchesThrown"),
+                        "H": pitching.get("hits"),
+                        "R": pitching.get("runs"),
+                        "ER": pitching.get("earnedRuns"),
+                        "HR": pitching.get("homeRuns"),
+                        "BB": pitching.get("baseOnBalls"),
+                        "K": pitching.get("strikeOuts"),
+                        "WHIP": None,
+                        "GamePk": g.get("gamePk"),
+                        "Season Source": MLB_SEASON_TO_DATE_PULLER_FIX_VERSION,
+                    })
+            except Exception as e:
+                _std_debug(f"Pitcher parse error game {g.get('gamePk')}: {repr(e)}")
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        for c in ["IP", "BF", "Pitch Count", "H", "R", "ER", "HR", "BB", "K"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["WHIP"] = ((df["H"].fillna(0) + df["BB"].fillna(0)) / df["IP"].replace(0, pd.NA)).round(2)
+        df = df.sort_values(["Pitcher", "Date"]).reset_index(drop=True)
+    _std_debug(f"Pitcher rows built: {len(df)}")
+    return df
+
+def std_pull_batter_logs(start_date=None, end_date=None, max_games=2600, force=False):
+    games = std_schedule_games(start_date, end_date, force=False)  # schedule already force-cleared by pitcher pull if needed
+    games = games[-int(max_games):] if max_games else games
+    _std_debug(f"Batter pull scanning games: {len(games)}")
+    rows = []
+    for g in games:
+        box = std_boxscore(g.get("gamePk"), force=False)
+        for side in ["away", "home"]:
+            try:
+                team = (box.get("teams") or {}).get(side, {})
+                opp_side = "home" if side == "away" else "away"
+                order = team.get("battingOrder", []) or []
+                order_map = {str(pid): i + 1 for i, pid in enumerate(order)}
+                for pid, p in (team.get("players", {}) or {}).items():
+                    batting = ((p.get("stats") or {}).get("batting") or {})
+                    if not batting:
+                        continue
+                    pa = batting.get("plateAppearances")
+                    ab = batting.get("atBats")
+                    if (pa in (None, "", 0)) and (ab in (None, "", 0)):
+                        continue
+                    player_id = str((p.get("person") or {}).get("id", "") or str(pid).replace("ID", ""))
+                    h = int(batting.get("hits") or 0)
+                    doubles = int(batting.get("doubles") or 0)
+                    triples = int(batting.get("triples") or 0)
+                    hr = int(batting.get("homeRuns") or 0)
+                    singles = max(0, h - doubles - triples - hr)
+                    bb = int(batting.get("baseOnBalls") or 0)
+                    r = int(batting.get("runs") or 0)
+                    rbi = int(batting.get("rbi") or 0)
+                    sb = int(batting.get("stolenBases") or 0)
+                    k = int(batting.get("strikeOuts") or 0)
+                    fs = singles*3 + doubles*6 + triples*8 + hr*10 + rbi*3 + r*3 + bb*3 + sb*4
+                    rows.append({
+                        "Date": g.get("date"),
+                        "Player": (p.get("person") or {}).get("fullName", ""),
+                        "Team": _std_abbr(g.get(side, "")),
+                        "Opponent": _std_abbr(g.get(opp_side, "")),
+                        "Home/Away": "Away" if side == "away" else "Home",
+                        "Lineup Slot": order_map.get(player_id, None),
+                        "PA": pa,
+                        "AB": ab,
+                        "H": h,
+                        "1B": singles,
+                        "2B": doubles,
+                        "3B": triples,
+                        "HR": hr,
+                        "BB": bb,
+                        "R": r,
+                        "RBI": rbi,
+                        "SB": sb,
+                        "K": k,
+                        "Fantasy Score": fs,
+                        "GamePk": g.get("gamePk"),
+                        "Season Source": MLB_SEASON_TO_DATE_PULLER_FIX_VERSION,
+                    })
+            except Exception as e:
+                _std_debug(f"Batter parse error game {g.get('gamePk')}: {repr(e)}")
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        for c in ["Lineup Slot", "PA", "AB", "H", "1B", "2B", "3B", "HR", "BB", "R", "RBI", "SB", "K", "Fantasy Score"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.sort_values(["Player", "Date"]).reset_index(drop=True)
+    _std_debug(f"Batter rows built: {len(df)}")
+    return df
+
+def render_season_to_date_puller():
+    st.markdown("### 📥 MLB Season-To-Date Puller")
+    st.caption("Pulls completed MLB games from season start through end date. Uses real boxscore logs for Learning IQ.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        start_date = st.text_input("Season Start Date", value=st.session_state.get("std_start_date", _std_default_start()), key="std_start_date_input_fixed")
+        st.session_state["std_start_date"] = start_date
+    with c2:
+        end_date = st.text_input("End Date", value=st.session_state.get("std_end_date", _std_today()), key="std_end_date_input_fixed")
+        st.session_state["std_end_date"] = end_date
+
+    c3, c4 = st.columns(2)
+    with c3:
+        max_games = st.number_input("Max games to scan", min_value=100, max_value=3000, value=2600, step=100, key="std_max_games_input_fixed")
+    with c4:
+        force = st.toggle("Force re-pull / clear cache", value=True, key="std_force_repull_fixed")
+
+    if st.button("Pull Season-To-Date Logs", key="std_pull_button_fixed"):
+        try:
+            st.session_state["std_debug_log"] = []
+        except Exception:
+            pass
+        with st.spinner("Pulling season-to-date MLB logs..."):
+            pdf = std_pull_pitcher_logs(start_date=start_date, end_date=end_date, max_games=int(max_games), force=bool(force))
+            bdf = std_pull_batter_logs(start_date=start_date, end_date=end_date, max_games=int(max_games), force=False)
+            st.session_state["pitcher_season_logs"] = pdf
+            st.session_state["batter_season_logs"] = bdf
+            st.session_state["pitcher_30_day_logs"] = pdf
+            st.session_state["batter_30_day_logs"] = bdf
+            off, bp = std_make_team_context(pdf, bdf)
+            st.session_state["season_team_offense_df"] = off
+            st.session_state["season_team_bullpen_df"] = bp
+
+        if len(pdf) == 0 and len(bdf) == 0:
+            st.error("Season pull returned 0 rows. Open the diagnostics below — this usually means MLB API request failed or no completed games were returned for the selected dates.")
+        else:
+            st.success(f"Loaded pitcher season rows: {len(pdf)} | batter season rows: {len(bdf)} | team offense: {len(off)} | bullpen: {len(bp)}")
+
+    with st.expander("Season Pull Diagnostics", expanded=False):
+        for msg in st.session_state.get("std_debug_log", []):
+            st.write(msg)
+
+    ptab, btab, ttab = st.tabs(["Pitcher Season Logs", "Batter Season Logs", "Team Context"])
+    with ptab:
+        st.dataframe(st.session_state.get("pitcher_season_logs", st.session_state.get("pitcher_30_day_logs", pd.DataFrame())), use_container_width=True, hide_index=True)
+    with btab:
+        st.dataframe(st.session_state.get("batter_season_logs", st.session_state.get("batter_30_day_logs", pd.DataFrame())), use_container_width=True, hide_index=True)
+    with ttab:
+        st.markdown("**Season Team Offense**")
+        st.dataframe(st.session_state.get("season_team_offense_df", st.session_state.get("team_30d_offense_df", pd.DataFrame())), use_container_width=True, hide_index=True)
+        st.markdown("**Season Bullpen Context**")
+        st.dataframe(st.session_state.get("season_team_bullpen_df", st.session_state.get("team_14d_bullpen_df", pd.DataFrame())), use_container_width=True, hide_index=True)
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
