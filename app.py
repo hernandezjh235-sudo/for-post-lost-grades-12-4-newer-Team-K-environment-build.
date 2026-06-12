@@ -18256,6 +18256,209 @@ if "build_batter_fs_board" in globals():
         except Exception:
             return df
 
+
+# =========================
+# MONEYLINE RUN DIFF + SCORE UI
+# Version: ML_RUN_DIFF_ENGINE_2026_06_11
+#
+# Moneyline only:
+# - Expected Team Runs
+# - Expected Run Differential
+# - Team Offense vs Handedness 30d
+# - Bullpen Run Prevention 14d
+# - Expected Score on Moneyline cards/tables
+#
+# K Upside / Pitcher FS / Batter FS untouched.
+# =========================
+ML_RUN_DIFF_ENGINE_VERSION = "ML_RUN_DIFF_ENGINE_2026_06_11"
+
+def _mlrd_num(x, default=0.0):
+    try:
+        if x in (None, "", "—"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _mlrd_cap(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _mlrd_abbr(x):
+    try:
+        if "_mlui_abbr" in globals():
+            return _mlui_abbr(x)
+    except Exception:
+        pass
+    s = str(x or "").strip().upper().replace(".", "")
+    return s[:3]
+
+def _mlrd_split(matchup):
+    try:
+        if "@" in str(matchup):
+            a, h = str(matchup).split("@", 1)
+            return _mlrd_abbr(a), _mlrd_abbr(h)
+    except Exception:
+        pass
+    return "", ""
+
+def _mlrd_hand(row, side):
+    cols = ["Away SP Hand","Away Pitcher Hand","Away Hand"] if side == "away" else ["Home SP Hand","Home Pitcher Hand","Home Hand"]
+    for c in cols:
+        if c in row and row.get(c) not in (None, "", "UNK"):
+            return str(row.get(c)).upper()[0]
+    return "R"
+
+def _mlrd_lookup(team, metric, default=None):
+    team = _mlrd_abbr(team)
+    try:
+        for key in ["team_30d_offense_df","mlb_team_30d_offense_df","team_offense_30d","team_14d_bullpen_df","mlb_team_14d_bullpen_df","team_bullpen_14d","team_context_df"]:
+            if key not in st.session_state:
+                continue
+            df = st.session_state.get(key)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            tcol = None
+            for c in df.columns:
+                if str(c).lower() in ["team","abbr","team_abbr","team abbr"]:
+                    tcol = c
+                    break
+            mcol = None
+            for c in df.columns:
+                if str(c).lower() == str(metric).lower():
+                    mcol = c
+                    break
+            if tcol and mcol:
+                sub = df[df[tcol].astype(str).str.upper().str.replace(".", "", regex=False).str[:3] == team]
+                if not sub.empty:
+                    return _mlrd_num(sub.iloc[0][mcol], default)
+    except Exception:
+        pass
+    return default
+
+def _mlrd_offense_30d(team, opp_hand):
+    names = ["vs_lhp_wrc_30d","wrc_plus_vs_l_30d","wrc_l_30d"] if str(opp_hand).upper().startswith("L") else ["vs_rhp_wrc_30d","wrc_plus_vs_r_30d","wrc_r_30d"]
+    for n in names:
+        v = _mlrd_lookup(team, n, None)
+        if v is not None:
+            return round(v, 1)
+    return 100.0
+
+def _mlrd_bullpen_14d(team):
+    era = None; whip = None; xfip = None
+    for n in ["bp_era_14d","bullpen_era_14d"]:
+        v = _mlrd_lookup(team, n, None)
+        if v is not None: era = v; break
+    for n in ["bp_whip_14d","bullpen_whip_14d"]:
+        v = _mlrd_lookup(team, n, None)
+        if v is not None: whip = v; break
+    for n in ["bp_xfip_14d","bullpen_xfip_14d"]:
+        v = _mlrd_lookup(team, n, None)
+        if v is not None: xfip = v; break
+
+    score = 100.0
+    if era is not None: score += _mlrd_cap((4.20 - era) * 9.0, -18, 18)
+    if whip is not None: score += _mlrd_cap((1.32 - whip) * 35.0, -14, 14)
+    if xfip is not None: score += _mlrd_cap((4.10 - xfip) * 7.0, -12, 12)
+    return round(max(55, min(145, score)), 1)
+
+def _mlrd_expected_runs(row, away, home):
+    ar0 = row.get("Away Expected Runs") or row.get("Away Projected Runs") or row.get("Away Runs")
+    hr0 = row.get("Home Expected Runs") or row.get("Home Projected Runs") or row.get("Home Runs")
+    if ar0 not in (None, "", "—") and hr0 not in (None, "", "—"):
+        return round(_mlrd_num(ar0), 2), round(_mlrd_num(hr0), 2)
+
+    away_hand = _mlrd_hand(row, "away")
+    home_hand = _mlrd_hand(row, "home")
+    away_off = _mlrd_offense_30d(away, home_hand)
+    home_off = _mlrd_offense_30d(home, away_hand)
+    away_bp = _mlrd_bullpen_14d(away)
+    home_bp = _mlrd_bullpen_14d(home)
+
+    ar = 4.35 + _mlrd_cap((away_off - 100) * 0.018, -0.55, 0.55) + _mlrd_cap((100 - home_bp) * 0.018, -0.45, 0.45)
+    hr = 4.35 + _mlrd_cap((home_off - 100) * 0.018, -0.55, 0.55) + _mlrd_cap((100 - away_bp) * 0.018, -0.45, 0.45) + 0.12
+
+    away_era = _mlrd_num(row.get("Away SP ERA") or row.get("Away ERA"), None)
+    home_era = _mlrd_num(row.get("Home SP ERA") or row.get("Home ERA"), None)
+    if home_era is not None: ar += _mlrd_cap((home_era - 4.20) * 0.16, -0.55, 0.55)
+    if away_era is not None: hr += _mlrd_cap((away_era - 4.20) * 0.16, -0.55, 0.55)
+
+    awp = _mlrd_num(row.get("Away Model %") or row.get("Away Win %"), 50)
+    hwp = _mlrd_num(row.get("Home Model %") or row.get("Home Win %"), 50)
+    if awp <= 1 and awp > 0: awp *= 100
+    if hwp <= 1 and hwp > 0: hwp *= 100
+    margin_hint = _mlrd_cap((hwp - awp) / 100.0 * 1.15, -1.05, 1.05)
+    hr += margin_hint / 2
+    ar -= margin_hint / 2
+
+    return round(max(2.0, min(8.5, ar)), 2), round(max(2.0, min(8.5, hr)), 2)
+
+def _mlrd_apply(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    ars=[]; hrs=[]; scores=[]; diffs=[]; rdpicks=[]; labels=[]; awo=[]; hwo=[]; awb=[]; hwb=[]
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        away, home = _mlrd_split(row.get("Matchup") or "")
+        ar, hr = _mlrd_expected_runs(row, away, home)
+        diff = round(hr-ar, 2)
+        ars.append(ar); hrs.append(hr)
+        scores.append(f"{away} {ar:.1f} - {home} {hr:.1f}")
+        diffs.append(diff)
+        rdpicks.append(home if diff > 0 else away)
+        ax = abs(diff)
+        labels.append("STRONG_RUN_DIFF" if ax >= 1.75 else "GOOD_RUN_DIFF" if ax >= 1.05 else "THIN_RUN_DIFF" if ax >= 0.55 else "NO_RUN_DIFF_EDGE")
+        away_hand = _mlrd_hand(row, "away"); home_hand = _mlrd_hand(row, "home")
+        awo.append(_mlrd_offense_30d(away, home_hand)); hwo.append(_mlrd_offense_30d(home, away_hand))
+        awb.append(_mlrd_bullpen_14d(away)); hwb.append(_mlrd_bullpen_14d(home))
+    d["Away Expected Runs"] = ars
+    d["Home Expected Runs"] = hrs
+    d["Expected Score"] = scores
+    d["Projected Score"] = scores
+    d["Expected Run Differential"] = diffs
+    d["Run Differential Pick"] = rdpicks
+    d["Run Differential Label"] = labels
+    d["Away Offense vs Hand 30d"] = awo
+    d["Home Offense vs Hand 30d"] = hwo
+    d["Away Bullpen Run Prevention 14d"] = awb
+    d["Home Bullpen Run Prevention 14d"] = hwb
+    d["Moneyline Run Diff Version"] = ML_RUN_DIFF_ENGINE_VERSION
+    return d
+
+if "ml_build_board" in globals():
+    _prev_mlrd_ml_build_board = ml_build_board
+    def ml_build_board(board):
+        df = _prev_mlrd_ml_build_board(board)
+        try:
+            return _mlrd_apply(df)
+        except Exception:
+            return df
+
+def _mlrd_score_text(row, away="", home=""):
+    for c in ["Expected Score","Projected Score","Score Projection","Predicted Score"]:
+        if c in row and row.get(c) not in (None, "", "—"):
+            return str(row.get(c))
+    ar = row.get("Away Expected Runs") or row.get("Away Projected Runs") or row.get("Away Runs")
+    hr = row.get("Home Expected Runs") or row.get("Home Projected Runs") or row.get("Home Runs")
+    if ar not in (None, "", "—") and hr not in (None, "", "—"):
+        return f"{away} {_mlrd_num(ar):.1f} - {home} {_mlrd_num(hr):.1f}" if away and home else f"{_mlrd_num(ar):.1f} - {_mlrd_num(hr):.1f}"
+    return "—"
+
+if "_mlui_score" in globals():
+    def _mlui_score(row, away, home):
+        return _mlrd_score_text(row, away, home)
+
+if "_ui_projected_score" in globals():
+    def _ui_projected_score(row):
+        away, home = _mlrd_split(row.get("Matchup") or "")
+        return _mlrd_score_text(row, away, home)
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
@@ -18288,6 +18491,18 @@ with tab_batter_fs:
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
+
+    try:
+        _mlrd_df = ml_build_board(board)
+        with st.expander("Moneyline Run Differential IQ", expanded=False):
+            _mlrd_cols = [c for c in [
+                "Matchup", "Expected Score", "Expected Run Differential", "Run Differential Pick",
+                "Run Differential Label", "Away Offense vs Hand 30d", "Home Offense vs Hand 30d",
+                "Away Bullpen Run Prevention 14d", "Home Bullpen Run Prevention 14d"
+            ] if c in _mlrd_df.columns]
+            st.dataframe(_mlrd_df[_mlrd_cols], use_container_width=True, hide_index=True)
+    except Exception:
+        pass
 
 with tab_fs_ud_watcher:
     render_fs_ud_watcher_controls()
