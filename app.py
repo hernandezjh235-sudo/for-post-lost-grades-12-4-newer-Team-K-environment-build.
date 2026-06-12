@@ -19279,7 +19279,12 @@ def render_season_to_date_puller():
             st.session_state["pitcher_30_day_logs"] = pdf
             st.session_state["batter_30_day_logs"] = bdf
             off, bp = std_make_team_context(pdf, bdf)
-        st.success(f"Loaded pitcher season rows: {len(pdf)} | batter season rows: {len(bdf)} | team offense: {len(off)} | bullpen: {len(bp)}")
+        
+            ok_save, save_info = save_season_logs_permanently(pdf, bdf, off, bp)
+            if ok_save:
+                st.success(f"Loaded pitcher season rows: {len(pdf)} | batter season rows: {len(bdf)} | team offense: {len(off)} | bullpen: {len(bp)} | permanently saved: {save_info}")
+            else:
+                st.warning(f"Loaded rows but permanent save failed: {save_info}")
 
     ptab, btab, ttab = st.tabs(["Pitcher Season Logs", "Batter Season Logs", "Team Context"])
     with ptab:
@@ -19592,6 +19597,148 @@ def render_season_to_date_puller():
         st.dataframe(st.session_state.get("season_team_offense_df", st.session_state.get("team_30d_offense_df", pd.DataFrame())), use_container_width=True, hide_index=True)
         st.markdown("**Season Bullpen Context**")
         st.dataframe(st.session_state.get("season_team_bullpen_df", st.session_state.get("team_14d_bullpen_df", pd.DataFrame())), use_container_width=True, hide_index=True)
+
+
+# =========================
+# PERMANENT SEASON LOG STORAGE
+# Version: SEASON_LOG_PERSISTENCE_2026_06_12
+#
+# Purpose:
+# - After pulling season logs once, save them permanently to disk.
+# - On app restart/refresh, auto-load saved logs.
+# - Keeps same session_state keys so Learning IQ keeps working.
+# =========================
+SEASON_LOG_PERSISTENCE_VERSION = "SEASON_LOG_PERSISTENCE_2026_06_12"
+
+def _persist_base_dir():
+    try:
+        base = Path("learning_data")
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    except Exception:
+        base = Path(".")
+        return base
+
+def _persist_paths():
+    base = _persist_base_dir()
+    return {
+        "pitcher": base / "pitcher_season_logs.csv",
+        "batter": base / "batter_season_logs.csv",
+        "offense": base / "team_season_offense.csv",
+        "bullpen": base / "team_season_bullpen.csv",
+    }
+
+def save_season_logs_permanently(pitcher_df=None, batter_df=None, offense_df=None, bullpen_df=None):
+    paths = _persist_paths()
+    saved = {}
+    try:
+        if pitcher_df is None:
+            pitcher_df = st.session_state.get("pitcher_season_logs", st.session_state.get("pitcher_30_day_logs", pd.DataFrame()))
+        if batter_df is None:
+            batter_df = st.session_state.get("batter_season_logs", st.session_state.get("batter_30_day_logs", pd.DataFrame()))
+        if offense_df is None:
+            offense_df = st.session_state.get("season_team_offense_df", st.session_state.get("team_30d_offense_df", pd.DataFrame()))
+        if bullpen_df is None:
+            bullpen_df = st.session_state.get("season_team_bullpen_df", st.session_state.get("team_14d_bullpen_df", pd.DataFrame()))
+
+        if isinstance(pitcher_df, pd.DataFrame) and not pitcher_df.empty:
+            pitcher_df.to_csv(paths["pitcher"], index=False)
+            saved["pitcher"] = len(pitcher_df)
+        if isinstance(batter_df, pd.DataFrame) and not batter_df.empty:
+            batter_df.to_csv(paths["batter"], index=False)
+            saved["batter"] = len(batter_df)
+        if isinstance(offense_df, pd.DataFrame) and not offense_df.empty:
+            offense_df.to_csv(paths["offense"], index=False)
+            saved["offense"] = len(offense_df)
+        if isinstance(bullpen_df, pd.DataFrame) and not bullpen_df.empty:
+            bullpen_df.to_csv(paths["bullpen"], index=False)
+            saved["bullpen"] = len(bullpen_df)
+
+        st.session_state["season_logs_last_save"] = saved
+        st.session_state["season_logs_persistence_version"] = SEASON_LOG_PERSISTENCE_VERSION
+        return True, saved
+    except Exception as e:
+        try:
+            st.session_state["season_logs_save_error"] = repr(e)
+        except Exception:
+            pass
+        return False, {"error": repr(e)}
+
+def load_saved_season_logs():
+    paths = _persist_paths()
+    loaded = {}
+    try:
+        if paths["pitcher"].exists():
+            pdf = pd.read_csv(paths["pitcher"])
+            st.session_state["pitcher_season_logs"] = pdf
+            st.session_state["pitcher_30_day_logs"] = pdf
+            loaded["pitcher"] = len(pdf)
+        if paths["batter"].exists():
+            bdf = pd.read_csv(paths["batter"])
+            st.session_state["batter_season_logs"] = bdf
+            st.session_state["batter_30_day_logs"] = bdf
+            loaded["batter"] = len(bdf)
+        if paths["offense"].exists():
+            off = pd.read_csv(paths["offense"])
+            st.session_state["season_team_offense_df"] = off
+            st.session_state["team_30d_offense_df"] = off
+            loaded["offense"] = len(off)
+        if paths["bullpen"].exists():
+            bp = pd.read_csv(paths["bullpen"])
+            st.session_state["season_team_bullpen_df"] = bp
+            st.session_state["team_14d_bullpen_df"] = bp
+            loaded["bullpen"] = len(bp)
+
+        st.session_state["season_logs_last_load"] = loaded
+        st.session_state["season_logs_persistence_version"] = SEASON_LOG_PERSISTENCE_VERSION
+        return bool(loaded), loaded
+    except Exception as e:
+        try:
+            st.session_state["season_logs_load_error"] = repr(e)
+        except Exception:
+            pass
+        return False, {"error": repr(e)}
+
+def autoload_season_logs_once():
+    try:
+        if st.session_state.get("season_logs_autoload_attempted"):
+            return
+        st.session_state["season_logs_autoload_attempted"] = True
+
+        has_pitcher = isinstance(st.session_state.get("pitcher_season_logs"), pd.DataFrame) and not st.session_state.get("pitcher_season_logs").empty
+        has_batter = isinstance(st.session_state.get("batter_season_logs"), pd.DataFrame) and not st.session_state.get("batter_season_logs").empty
+        if not has_pitcher and not has_batter:
+            load_saved_season_logs()
+    except Exception:
+        pass
+
+autoload_season_logs_once()
+
+def render_season_log_persistence_status():
+    st.markdown("### 💾 Season Data Storage")
+    loaded = st.session_state.get("season_logs_last_load", {})
+    saved = st.session_state.get("season_logs_last_save", {})
+    err_load = st.session_state.get("season_logs_load_error", "")
+    err_save = st.session_state.get("season_logs_save_error", "")
+
+    if loaded:
+        st.success(f"Auto-loaded saved season data: {loaded}")
+    elif saved:
+        st.success(f"Saved season data permanently: {saved}")
+    else:
+        st.info("No saved season data loaded yet. Pull Season-To-Date Logs once, then it will save permanently.")
+
+    if err_load:
+        st.warning(f"Load warning: {err_load}")
+    if err_save:
+        st.warning(f"Save warning: {err_save}")
+
+    if st.button("Save Current Season Logs Permanently", key="save_season_logs_permanent_manual"):
+        ok, info = save_season_logs_permanently()
+        if ok:
+            st.success(f"Season logs saved permanently: {info}")
+        else:
+            st.error(f"Could not save season logs: {info}")
 
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
