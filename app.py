@@ -19593,6 +19593,282 @@ def render_season_to_date_puller():
         st.markdown("**Season Bullpen Context**")
         st.dataframe(st.session_state.get("season_team_bullpen_df", st.session_state.get("team_14d_bullpen_df", pd.DataFrame())), use_container_width=True, hide_index=True)
 
+
+# =========================
+# BATTER FS UNDERDOG LINE MATCHER
+# Version: BATTER_FS_UD_LINE_MATCHER_2026_06_11
+#
+# Makes Batter Fantasy match Underdog Fantasy Points lines like K Upside:
+# player name -> Fantasy Points market -> live line -> decision.
+# K Upside is untouched.
+# =========================
+BATTER_FS_UD_LINE_MATCHER_VERSION = "BATTER_FS_UD_LINE_MATCHER_2026_06_11"
+
+def _bfs_ud_norm(x):
+    s = str(x or "").strip().lower().replace(".", "")
+    s = re.sub(r"[^a-z0-9\s'\-]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _bfs_ud_last(x):
+    p = _bfs_ud_norm(x).split()
+    return p[-1] if p else ""
+
+def _bfs_ud_num(x, default=None):
+    try:
+        if x in (None, "", "—", "WAITING_FOR_UD_LINE"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _bfs_extract_player(row):
+    for c in ["Player","player","Name","name","display_name","player_name","Batter","athlete_name","title"]:
+        if c in row and row.get(c) not in (None, ""):
+            return str(row.get(c))
+    return ""
+
+def _bfs_extract_market(row):
+    for c in ["stat_type","Stat Type","prop_type","Prop Type","Market","market","Line Type","line_type","over_under_title","appearance_stat","appearance_stat_display","statType"]:
+        if c in row and row.get(c) not in (None, ""):
+            return str(row.get(c))
+    return ""
+
+def _bfs_extract_line(row):
+    for c in ["Line","line","UD/Line","stat_value","statValue","Value","value","over_under_line","target_value","line_score"]:
+        if c in row:
+            v = _bfs_ud_num(row.get(c), None)
+            if v is not None:
+                return v
+    return None
+
+def _bfs_is_fantasy_market(txt):
+    s = str(txt or "").lower().replace("_", " ")
+    if "fantasy" in s and ("point" in s or "score" in s or "pts" in s):
+        return True
+    if s.strip() in ["fantasy points", "fantasy score"]:
+        return True
+    return False
+
+def _bfs_raw_ud_df():
+    frames = []
+    try:
+        for key in ["underdog_lines_df","ud_lines_df","ud_board_df","underdog_board_df","underdog_props_df","props_df","vendor_lines_df","lines_df","ud_raw_df","underdog_raw_df"]:
+            if key in st.session_state:
+                v = st.session_state.get(key)
+                if isinstance(v, pd.DataFrame) and not v.empty:
+                    frames.append(v.copy())
+                elif isinstance(v, list) and len(v):
+                    frames.append(pd.DataFrame(v))
+    except Exception:
+        pass
+    try:
+        for fn in ["load_underdog_lines","fetch_underdog_lines","get_underdog_lines","fetch_ud_lines","load_ud_lines","get_ud_board","get_underdog_board"]:
+            if fn in globals():
+                for args in [(), ("MLB",)]:
+                    try:
+                        v = globals()[fn](*args)
+                        if isinstance(v, pd.DataFrame) and not v.empty:
+                            frames.append(v.copy())
+                        elif isinstance(v, list) and len(v):
+                            frames.append(pd.DataFrame(v))
+                    except TypeError:
+                        continue
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    try:
+        return pd.concat(frames, ignore_index=True, sort=False).drop_duplicates()
+    except Exception:
+        return frames[0]
+
+def _bfs_build_fs_index():
+    raw = _bfs_raw_ud_df()
+    idx, by_last = {}, {}
+    dbg = {"raw_rows": 0, "fantasy_rows": 0, "indexed_players": 0, "columns": []}
+    if raw is None or raw.empty:
+        return idx, by_last, raw, dbg
+
+    dbg["raw_rows"] = len(raw)
+    dbg["columns"] = list(raw.columns)[:60]
+
+    for _, rr in raw.iterrows():
+        row = rr.to_dict()
+        player = _bfs_extract_player(row)
+        market = _bfs_extract_market(row)
+        line = _bfs_extract_line(row)
+        if not player:
+            continue
+        if not _bfs_is_fantasy_market(market):
+            continue
+        dbg["fantasy_rows"] += 1
+        if line is None:
+            continue
+        data = {
+            "Player": player,
+            "Line": line,
+            "Market": market,
+            "Status": "UD_LINE_AVAILABLE",
+            "Version": BATTER_FS_UD_LINE_MATCHER_VERSION,
+        }
+        norm = _bfs_ud_norm(player)
+        last = _bfs_ud_last(player)
+        idx[norm] = data
+        if last:
+            by_last.setdefault(last, []).append(data)
+
+    dbg["indexed_players"] = len(idx)
+    return idx, by_last, raw, dbg
+
+def _bfs_find_line(player):
+    idx, by_last, raw, dbg = _bfs_build_fs_index()
+    norm = _bfs_ud_norm(player)
+    last = _bfs_ud_last(player)
+
+    if norm in idx:
+        return idx[norm], dbg
+
+    if last and last in by_last and len(by_last[last]) == 1:
+        return by_last[last][0], dbg
+
+    for k, data in idx.items():
+        if norm and (norm in k or k in norm):
+            return data, dbg
+
+    # If player is on UD somewhere but FS not matched.
+    try:
+        if raw is not None and not raw.empty and last:
+            for _, rr in raw.iterrows():
+                p = _bfs_extract_player(rr.to_dict())
+                if _bfs_ud_last(p) == last:
+                    return {
+                        "Player": player,
+                        "Line": None,
+                        "Market": "Player found on UD; Fantasy Points line not matched",
+                        "Status": "WAITING_FOR_UD_LINE",
+                        "Version": BATTER_FS_UD_LINE_MATCHER_VERSION,
+                    }, dbg
+    except Exception:
+        pass
+
+    return {
+        "Player": player,
+        "Line": None,
+        "Market": "",
+        "Status": "NOT_ON_UD_FS_BOARD",
+        "Version": BATTER_FS_UD_LINE_MATCHER_VERSION,
+    }, dbg
+
+def _bfs_player_col(df):
+    for c in ["Player", "Batter", "Name"]:
+        if c in df.columns:
+            return c
+    return None
+
+def _bfs_proj_col(df):
+    for c in ["FS Projection", "Fantasy Projection", "Batter FS", "Projection", "Proj", "Fantasy Score Projection"]:
+        if c in df.columns:
+            return c
+    return None
+
+def _bfs_apply_ud_lines(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    pcol = _bfs_player_col(d)
+    if not pcol:
+        return d
+
+    lines, statuses, markets, matched = [], [], [], []
+    last_dbg = {}
+    for name in d[pcol].astype(str):
+        hit, dbg = _bfs_find_line(name)
+        last_dbg = dbg
+        lines.append(hit.get("Line"))
+        statuses.append(hit.get("Status"))
+        markets.append(hit.get("Market"))
+        matched.append(hit.get("Player"))
+
+    d["UD Live Line"] = lines
+    d["UD/Line"] = [x if x is not None else "WAITING_FOR_UD_LINE" for x in lines]
+    d["UD Watch Status"] = statuses
+    d["UD Matched Name"] = matched
+    d["UD Market"] = markets
+    d["Batter FS UD Match Version"] = BATTER_FS_UD_LINE_MATCHER_VERSION
+
+    proj_col = _bfs_proj_col(d)
+    if proj_col:
+        def decide(row):
+            line = _bfs_ud_num(row.get("UD Live Line"), None)
+            proj = _bfs_ud_num(row.get(proj_col), None)
+            if line is None:
+                return "⏳ WAITING_FOR_UD_LINE" if row.get("UD Watch Status") == "WAITING_FOR_UD_LINE" else "NOT_ON_UD_FS_BOARD"
+            if proj is None:
+                return "NO_PROJECTION"
+            gap = proj - line
+            if gap >= 1.0:
+                return "🔥 OVER"
+            if gap >= 0.35:
+                return "⚠️ OVER LEAN"
+            if gap <= -1.0:
+                return "🔥 UNDER"
+            if gap <= -0.35:
+                return "⚠️ UNDER LEAN"
+            return "🚫 PASS — THIN UD EDGE"
+        d["FS Decision"] = d.apply(decide, axis=1)
+        d["FS Edge"] = d.apply(
+            lambda r: round(_bfs_ud_num(r.get(proj_col), 0) - _bfs_ud_num(r.get("UD Live Line"), _bfs_ud_num(r.get(proj_col), 0)), 2)
+            if _bfs_ud_num(r.get("UD Live Line"), None) is not None else "",
+            axis=1
+        )
+
+    try:
+        st.session_state["batter_fs_ud_match_debug"] = last_dbg
+    except Exception:
+        pass
+
+    if bool(st.session_state.get("batter_fs_ud_only_mode", True)):
+        d = d[d["UD Watch Status"].isin(["UD_LINE_AVAILABLE", "WAITING_FOR_UD_LINE"])].copy()
+
+    return d
+
+if "build_batter_fs_board" in globals():
+    _prev_bfs_ud_build_batter_fs_board = build_batter_fs_board
+    def build_batter_fs_board():
+        df = _prev_bfs_ud_build_batter_fs_board()
+        try:
+            return _bfs_apply_ud_lines(df)
+        except Exception:
+            return df
+
+def render_batter_fs_ud_line_controls():
+    st.markdown("### 🟡 Batter FS Underdog Line Match")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.session_state["batter_fs_ud_only_mode"] = st.toggle(
+            "Batter FS UD Board Only",
+            value=st.session_state.get("batter_fs_ud_only_mode", True),
+            help="Only Batter FS. K Upside is untouched.",
+            key="batter_fs_ud_only_mode_unique"
+        )
+    with c2:
+        idx, by_last, raw, dbg = _bfs_build_fs_index()
+        if raw is None or raw.empty:
+            st.warning("No Underdog raw board found yet.")
+        elif dbg.get("indexed_players", 0) == 0:
+            st.warning(f"UD board found ({dbg.get('raw_rows', 0)} rows), but 0 Fantasy Points lines indexed.")
+        else:
+            st.success(f"UD Fantasy Points indexed: {dbg.get('indexed_players', 0)} players.")
+
+    with st.expander("Batter FS UD Match Diagnostics", expanded=False):
+        dbg = st.session_state.get("batter_fs_ud_match_debug", {})
+        st.write(dbg if dbg else "Open Batter FS board to populate diagnostics.")
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
