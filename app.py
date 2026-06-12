@@ -19279,12 +19279,7 @@ def render_season_to_date_puller():
             st.session_state["pitcher_30_day_logs"] = pdf
             st.session_state["batter_30_day_logs"] = bdf
             off, bp = std_make_team_context(pdf, bdf)
-        
-            ok_save, save_info = save_season_logs_permanently(pdf, bdf, off, bp)
-            if ok_save:
-                st.success(f"Loaded pitcher season rows: {len(pdf)} | batter season rows: {len(bdf)} | team offense: {len(off)} | bullpen: {len(bp)} | permanently saved: {save_info}")
-            else:
-                st.warning(f"Loaded rows but permanent save failed: {save_info}")
+        st.success(f"Loaded pitcher season rows: {len(pdf)} | batter season rows: {len(bdf)} | team offense: {len(off)} | bullpen: {len(bp)}")
 
     ptab, btab, ttab = st.tabs(["Pitcher Season Logs", "Batter Season Logs", "Team Context"])
     with ptab:
@@ -19600,145 +19595,126 @@ def render_season_to_date_puller():
 
 
 # =========================
-# PERMANENT SEASON LOG STORAGE
-# Version: SEASON_LOG_PERSISTENCE_2026_06_12
+# EMBEDDED SEASON DATABASE LOADER
+# Version: EMBEDDED_SEASON_DB_2026_06_12
+#
+# Loads the season database files bundled with the app:
+# learning_data/Pitch.csv
+# learning_data/TeamOffense.csv
+# learning_data/Bullpen.csv
+#
+# Batter logs are optional. If learning_data/Batter.csv is added later,
+# it will auto-load too.
 #
 # Purpose:
-# - After pulling season logs once, save them permanently to disk.
-# - On app restart/refresh, auto-load saved logs.
-# - Keeps same session_state keys so Learning IQ keeps working.
+# - No need to pull pitcher/team/bullpen season data every app session.
+# - Learning IQ receives season data immediately on startup.
+# - Existing session_state names are preserved for compatibility.
 # =========================
-SEASON_LOG_PERSISTENCE_VERSION = "SEASON_LOG_PERSISTENCE_2026_06_12"
+EMBEDDED_SEASON_DB_VERSION = "EMBEDDED_SEASON_DB_2026_06_12"
 
-def _persist_base_dir():
+def _embedded_base_dir():
     try:
-        base = Path("learning_data")
-        base.mkdir(parents=True, exist_ok=True)
-        return base
+        return Path(__file__).resolve().parent / "learning_data"
     except Exception:
-        base = Path(".")
-        return base
+        return Path("learning_data")
 
-def _persist_paths():
-    base = _persist_base_dir()
-    return {
-        "pitcher": base / "pitcher_season_logs.csv",
-        "batter": base / "batter_season_logs.csv",
-        "offense": base / "team_season_offense.csv",
-        "bullpen": base / "team_season_bullpen.csv",
-    }
-
-def save_season_logs_permanently(pitcher_df=None, batter_df=None, offense_df=None, bullpen_df=None):
-    paths = _persist_paths()
-    saved = {}
+def _embedded_load_csv(path):
     try:
-        if pitcher_df is None:
-            pitcher_df = st.session_state.get("pitcher_season_logs", st.session_state.get("pitcher_30_day_logs", pd.DataFrame()))
-        if batter_df is None:
-            batter_df = st.session_state.get("batter_season_logs", st.session_state.get("batter_30_day_logs", pd.DataFrame()))
-        if offense_df is None:
-            offense_df = st.session_state.get("season_team_offense_df", st.session_state.get("team_30d_offense_df", pd.DataFrame()))
-        if bullpen_df is None:
-            bullpen_df = st.session_state.get("season_team_bullpen_df", st.session_state.get("team_14d_bullpen_df", pd.DataFrame()))
-
-        if isinstance(pitcher_df, pd.DataFrame) and not pitcher_df.empty:
-            pitcher_df.to_csv(paths["pitcher"], index=False)
-            saved["pitcher"] = len(pitcher_df)
-        if isinstance(batter_df, pd.DataFrame) and not batter_df.empty:
-            batter_df.to_csv(paths["batter"], index=False)
-            saved["batter"] = len(batter_df)
-        if isinstance(offense_df, pd.DataFrame) and not offense_df.empty:
-            offense_df.to_csv(paths["offense"], index=False)
-            saved["offense"] = len(offense_df)
-        if isinstance(bullpen_df, pd.DataFrame) and not bullpen_df.empty:
-            bullpen_df.to_csv(paths["bullpen"], index=False)
-            saved["bullpen"] = len(bullpen_df)
-
-        st.session_state["season_logs_last_save"] = saved
-        st.session_state["season_logs_persistence_version"] = SEASON_LOG_PERSISTENCE_VERSION
-        return True, saved
+        if path.exists():
+            return pd.read_csv(path)
     except Exception as e:
         try:
-            st.session_state["season_logs_save_error"] = repr(e)
+            st.session_state.setdefault("embedded_season_db_errors", [])
+            st.session_state["embedded_season_db_errors"].append(f"{path.name}: {repr(e)}")
         except Exception:
             pass
-        return False, {"error": repr(e)}
+    return pd.DataFrame()
 
-def load_saved_season_logs():
-    paths = _persist_paths()
-    loaded = {}
+def load_embedded_season_database(force=False):
     try:
-        if paths["pitcher"].exists():
-            pdf = pd.read_csv(paths["pitcher"])
-            st.session_state["pitcher_season_logs"] = pdf
-            st.session_state["pitcher_30_day_logs"] = pdf
-            loaded["pitcher"] = len(pdf)
-        if paths["batter"].exists():
-            bdf = pd.read_csv(paths["batter"])
-            st.session_state["batter_season_logs"] = bdf
-            st.session_state["batter_30_day_logs"] = bdf
-            loaded["batter"] = len(bdf)
-        if paths["offense"].exists():
-            off = pd.read_csv(paths["offense"])
-            st.session_state["season_team_offense_df"] = off
-            st.session_state["team_30d_offense_df"] = off
-            loaded["offense"] = len(off)
-        if paths["bullpen"].exists():
-            bp = pd.read_csv(paths["bullpen"])
-            st.session_state["season_team_bullpen_df"] = bp
-            st.session_state["team_14d_bullpen_df"] = bp
-            loaded["bullpen"] = len(bp)
-
-        st.session_state["season_logs_last_load"] = loaded
-        st.session_state["season_logs_persistence_version"] = SEASON_LOG_PERSISTENCE_VERSION
-        return bool(loaded), loaded
-    except Exception as e:
-        try:
-            st.session_state["season_logs_load_error"] = repr(e)
-        except Exception:
-            pass
-        return False, {"error": repr(e)}
-
-def autoload_season_logs_once():
-    try:
-        if st.session_state.get("season_logs_autoload_attempted"):
-            return
-        st.session_state["season_logs_autoload_attempted"] = True
-
-        has_pitcher = isinstance(st.session_state.get("pitcher_season_logs"), pd.DataFrame) and not st.session_state.get("pitcher_season_logs").empty
-        has_batter = isinstance(st.session_state.get("batter_season_logs"), pd.DataFrame) and not st.session_state.get("batter_season_logs").empty
-        if not has_pitcher and not has_batter:
-            load_saved_season_logs()
+        if st.session_state.get("embedded_season_db_loaded") and not force:
+            return st.session_state.get("embedded_season_db_status", {})
     except Exception:
         pass
 
-autoload_season_logs_once()
+    base = _embedded_base_dir()
+    status = {
+        "base": str(base),
+        "pitcher": 0,
+        "batter": 0,
+        "offense": 0,
+        "bullpen": 0,
+        "version": EMBEDDED_SEASON_DB_VERSION,
+    }
 
-def render_season_log_persistence_status():
-    st.markdown("### 💾 Season Data Storage")
-    loaded = st.session_state.get("season_logs_last_load", {})
-    saved = st.session_state.get("season_logs_last_save", {})
-    err_load = st.session_state.get("season_logs_load_error", "")
-    err_save = st.session_state.get("season_logs_save_error", "")
+    pitch_file = base / "Pitch.csv"
+    batter_file = base / "Batter.csv"
+    offense_file = base / "TeamOffense.csv"
+    bullpen_file = base / "Bullpen.csv"
 
-    if loaded:
-        st.success(f"Auto-loaded saved season data: {loaded}")
-    elif saved:
-        st.success(f"Saved season data permanently: {saved}")
+    pdf = _embedded_load_csv(pitch_file)
+    if not pdf.empty:
+        st.session_state["pitcher_season_logs"] = pdf
+        # Backward-compatible key used by existing IQ modules.
+        st.session_state["pitcher_30_day_logs"] = pdf
+        status["pitcher"] = len(pdf)
+
+    bdf = _embedded_load_csv(batter_file)
+    if not bdf.empty:
+        st.session_state["batter_season_logs"] = bdf
+        # Backward-compatible key used by existing IQ modules.
+        st.session_state["batter_30_day_logs"] = bdf
+        status["batter"] = len(bdf)
+
+    off = _embedded_load_csv(offense_file)
+    if not off.empty:
+        st.session_state["season_team_offense_df"] = off
+        st.session_state["team_30d_offense_df"] = off
+        status["offense"] = len(off)
+
+    bp = _embedded_load_csv(bullpen_file)
+    if not bp.empty:
+        st.session_state["season_team_bullpen_df"] = bp
+        st.session_state["team_14d_bullpen_df"] = bp
+        status["bullpen"] = len(bp)
+
+    st.session_state["embedded_season_db_loaded"] = True
+    st.session_state["embedded_season_db_status"] = status
+    return status
+
+def render_embedded_season_database_status():
+    st.markdown("### 🗂️ Embedded Season Database")
+    status = load_embedded_season_database(force=False)
+    if status.get("pitcher", 0) or status.get("offense", 0) or status.get("bullpen", 0):
+        st.success(
+            f"Loaded embedded database: "
+            f"Pitcher {status.get('pitcher', 0)} rows | "
+            f"Batter {status.get('batter', 0)} rows | "
+            f"Offense {status.get('offense', 0)} teams | "
+            f"Bullpen {status.get('bullpen', 0)} teams"
+        )
     else:
-        st.info("No saved season data loaded yet. Pull Season-To-Date Logs once, then it will save permanently.")
+        st.warning("No embedded season database files found in learning_data/.")
 
-    if err_load:
-        st.warning(f"Load warning: {err_load}")
-    if err_save:
-        st.warning(f"Save warning: {err_save}")
+    if status.get("batter", 0) == 0:
+        st.info("Batter.csv is optional and not bundled yet. Batter season logs can still be pulled later.")
 
-    if st.button("Save Current Season Logs Permanently", key="save_season_logs_permanent_manual"):
-        ok, info = save_season_logs_permanently()
-        if ok:
-            st.success(f"Season logs saved permanently: {info}")
-        else:
-            st.error(f"Could not save season logs: {info}")
+    errs = st.session_state.get("embedded_season_db_errors", [])
+    if errs:
+        with st.expander("Embedded DB Load Warnings", expanded=False):
+            for e in errs:
+                st.write(e)
+
+    if st.button("Reload Embedded Season Database", key="reload_embedded_season_db"):
+        new_status = load_embedded_season_database(force=True)
+        st.success(f"Reloaded embedded database: {new_status}")
+
+# Auto-load bundled season data immediately at app startup.
+try:
+    load_embedded_season_database(force=False)
+except Exception:
+    pass
 
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
