@@ -18207,13 +18207,15 @@ def render_fs_ud_watcher_controls():
         st.session_state["fs_ud_board_only_mode"] = st.toggle(
             "FS UD Board Only",
             value=st.session_state.get("fs_ud_board_only_mode", True),
-            help="Only for Pitcher FS and Batter FS. K Upside is not affected."
+            help="Only for Pitcher FS and Batter FS. K Upside is not affected.",
+            key="fs_ud_board_only_mode_toggle_unique"
         )
     with c2:
         auto = st.toggle(
             "FS Auto Refresh",
             value=st.session_state.get("fs_ud_auto_refresh", False),
-            help="Refreshes so Fantasy Points can appear once Underdog posts them."
+            help="Refreshes so Fantasy Points can appear once Underdog posts them.",
+            key="fs_ud_auto_refresh_toggle_unique"
         )
         st.session_state["fs_ud_auto_refresh"] = auto
 
@@ -18485,8 +18487,6 @@ with tab_pitcher_fs:
     render_pitcher_fs_tab(board)
 
 with tab_batter_fs:
-    render_fs_ud_watcher_controls()
-
     render_batter_fs_tab()
 
 with tab_moneyline:
@@ -18505,7 +18505,8 @@ with tab_moneyline:
         pass
 
 with tab_fs_ud_watcher:
-    render_fs_ud_watcher_controls()
+    st.markdown("### 🟣 FS UD Watcher")
+    st.caption("Controls are shown in Pitcher FS to avoid duplicate Streamlit widget IDs.")
     raw_fs_ud = _fsud_raw_df()
     if raw_fs_ud is not None and not raw_fs_ud.empty:
         st.dataframe(raw_fs_ud, use_container_width=True, hide_index=True)
