@@ -20194,6 +20194,181 @@ def render_opponent_history_engine_panel():
     except Exception as e:
         st.info(f"Opponent History waiting: {e}")
 
+
+# =========================
+# FINAL K PROJECTION CONNECTOR
+# Version: FINAL_K_PROJECTION_CONNECTOR_2026_06_12
+#
+# Purpose:
+# - Officially connects K Upside Core + Season Log Bridge + Opponent History Engine.
+# - Keeps original K PROJ visible.
+# - Creates Final K Projection, Final K Edge, Final K Decision.
+# - Uses capped nudges only; does not let history hijack the model.
+# =========================
+FINAL_K_PROJECTION_CONNECTOR_VERSION = "FINAL_K_PROJECTION_CONNECTOR_2026_06_12"
+
+def _fkc_num(x, default=None):
+    try:
+        if x in (None, "", "—", "WAITING_FOR_UD_LINE"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _fkc_line(row):
+    for c in ["UD/Line", "Line", "line", "K Line"]:
+        if c in row:
+            v = _fkc_num(row.get(c), None)
+            if v is not None:
+                return v
+    return None
+
+def _fkc_base_proj(row):
+    for c in ["K PROJ", "Projection", "Proj"]:
+        if c in row:
+            v = _fkc_num(row.get(c), None)
+            if v is not None:
+                return v
+    return None
+
+def _fkc_calc_final(row):
+    base = _fkc_base_proj(row)
+    if base is None:
+        return None, 0.0, "NO_BASE_PROJ"
+
+    season_nudge = _fkc_num(row.get("Season Log K Nudge"), 0.0) or 0.0
+    opp_nudge = _fkc_num(row.get("Opponent History Nudge"), 0.0) or 0.0
+
+    # Safety caps. Even if upstream changes later, connector stays conservative.
+    season_nudge = max(-0.55, min(0.45, season_nudge))
+    opp_nudge = max(-0.35, min(0.30, opp_nudge))
+
+    total = max(-0.75, min(0.60, season_nudge + opp_nudge))
+    final = round(base + total, 2)
+
+    if total >= 0.30:
+        label = "FINAL_K_UP"
+    elif total <= -0.30:
+        label = "FINAL_K_DOWN"
+    elif abs(total) >= 0.10:
+        label = "FINAL_K_MICRO"
+    else:
+        label = "FINAL_K_NEUTRAL"
+
+    return final, round(total, 2), label
+
+def _fkc_decision(row):
+    final, total_nudge, label = _fkc_calc_final(row)
+    line = _fkc_line(row)
+    if final is None:
+        return "NO_PROJECTION", "", ""
+    if line is None:
+        return "NO_UD_LINE", "", ""
+
+    edge = round(final - line, 2)
+    # Conservative decision rules. Final projection refines direction, but thin edges stay PASS.
+    if edge >= 1.25:
+        decision = "🔥 OVER"
+    elif edge >= 0.65:
+        decision = "⚠️ OVER LEAN"
+    elif edge <= -1.25:
+        decision = "🔥 UNDER"
+    elif edge <= -0.65:
+        decision = "⚠️ UNDER LEAN"
+    else:
+        decision = "🚫 PASS — FINAL K THIN EDGE"
+
+    return decision, edge, label
+
+def _fkc_apply_final_projection(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+
+    finals, total_nudges, labels, decisions, edges = [], [], [], [], []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        final, total_nudge, label = _fkc_calc_final(row)
+        decision, edge, _ = _fkc_decision(row)
+        finals.append(final if final is not None else "")
+        total_nudges.append(total_nudge)
+        labels.append(label)
+        decisions.append(decision)
+        edges.append(edge)
+
+    d["Original K PROJ"] = d["K PROJ"] if "K PROJ" in d.columns else ""
+    d["Final K Projection"] = finals
+    d["Final K Total Nudge"] = total_nudges
+    d["Final K Nudge Label"] = labels
+    d["Final K Edge"] = edges
+    d["Final K Decision"] = decisions
+    d["Final K Connector Version"] = FINAL_K_PROJECTION_CONNECTOR_VERSION
+
+    # Do not delete original Decision. Add clearer official final action column.
+    d["Final Main Engine Action"] = d["Final K Decision"]
+
+    # Optional: if user wants final projection to be the displayed K PROJ, toggle it.
+    # Default OFF for safe comparison. Turn on in UI after 1-2 slates if desired.
+    try:
+        if bool(st.session_state.get("use_final_k_projection_as_official", True)):
+            # Keep original in Original K PROJ, make K PROJ reflect connected final.
+            d["K PROJ"] = d["Final K Projection"]
+            if "Decision" in d.columns:
+                d["Original Decision"] = d["Decision"]
+                d["Decision"] = d["Final K Decision"]
+            if "Edge Gap" in d.columns:
+                d["Original Edge Gap"] = d["Edge Gap"]
+                d["Edge Gap"] = d["Final K Edge"]
+            if "Main Engine Action" in d.columns:
+                d["Original Main Engine Action"] = d["Main Engine Action"]
+                d["Main Engine Action"] = d["Final Main Engine Action"]
+    except Exception:
+        pass
+
+    return d
+
+if "build_kproj_table" in globals():
+    _prev_fkc_build_kproj_table = build_kproj_table
+
+    def build_kproj_table(board):
+        df = _prev_fkc_build_kproj_table(board)
+        try:
+            return _fkc_apply_final_projection(df)
+        except Exception:
+            return df
+
+def render_final_k_projection_connector_panel():
+    st.markdown("### ✅ Final K Projection Connector")
+    st.caption("Officially connects K Upside + Season Log Bridge + Opponent History. Original K PROJ is preserved for comparison.")
+    try:
+        st.session_state["use_final_k_projection_as_official"] = st.toggle(
+            "Use Final K Projection as Official K PROJ",
+            value=st.session_state.get("use_final_k_projection_as_official", True),
+            help="ON = K PROJ/Decision use the connected final projection. OFF = final projection is preview-only.",
+            key="use_final_k_projection_as_official_unique"
+        )
+    except Exception:
+        pass
+
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher", "Matchup", "Original K PROJ", "K PROJ", "Final K Projection",
+            "UD/Line", "Final K Edge", "Final K Decision", "Final K Total Nudge",
+            "Season Log K Nudge", "Opponent History Nudge",
+            "Season Avg K", "Season Recent3 K", "Opp Hist Avg K", "Opp Hist Starts",
+            "Decision", "Original Decision"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Final K Connector will populate after the K board is built.")
+    except Exception as e:
+        st.info(f"Final K Connector waiting: {e}")
+
 tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
