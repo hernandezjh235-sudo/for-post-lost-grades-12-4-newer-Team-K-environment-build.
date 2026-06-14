@@ -20835,6 +20835,345 @@ def render_true_projection_calibration_panel():
     except Exception as e:
         st.info(f"True Projection Calibration waiting: {e}")
 
+
+# =========================
+# TRUE PROJECTION STACK 1.1
+# Version: TRUE_PROJECTION_STACK_1_1_2026_06_14
+#
+# This is the stronger Version 1 test layer.
+# It sits AFTER the original True Projection Calibration layer and makes the final K PROJ
+# use the missing stronger pieces:
+# - Reality Calibration
+# - Stronger Line-Aware Hit Rate weighting
+# - Opponent-specific hit rate
+# - Volume Reality Check
+# - Soft Ceiling Clamp
+# - Better PASS filter
+#
+# It is intentionally capped. It should move more than 0.01 when logs disagree,
+# but it will not blindly force projections to season average.
+# =========================
+TRUE_PROJECTION_STACK_1_1_VERSION = "TRUE_PROJECTION_STACK_1_1_2026_06_14"
+
+def _tps_num(x, default=None):
+    try:
+        if x in (None, "", "—", "WAITING_FOR_UD_LINE", "NL"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _tps_cap(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _tps_line(row):
+    for c in ["UD/Line", "Line", "line", "K Line", "TPC Current Line"]:
+        v = _tps_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _tps_base(row):
+    # Use TPC output if available, otherwise the current K PROJ.
+    for c in ["TPC True K Projection", "K PROJ", "Final K Projection", "Projection", "Proj"]:
+        v = _tps_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _tps_anchor(row):
+    vals, weights = [], []
+    for c, w in [
+        ("TPC Season Avg K", 0.28),
+        ("TPC Season Median K", 0.17),
+        ("TPC Recent5 Avg K", 0.22),
+        ("TPC Recent3 Avg K", 0.15),
+        ("Season Avg K", 0.08),
+        ("Season Median K", 0.05),
+        ("Opp Hist Avg K", 0.05),
+    ]:
+        v = _tps_num(row.get(c), None)
+        if v is not None:
+            vals.append(v*w); weights.append(w)
+    if not weights:
+        return None
+    return sum(vals)/sum(weights)
+
+def _tps_hit_score(row):
+    vals, weights = [], []
+    for c, w, min_c in [
+        ("TPC Season Hit Rate %", 0.42, "TPC Season Games"),
+        ("TPC Recent5 Hit Rate %", 0.25, "TPC Recent5 Games"),
+        ("TPC Recent3 Hit Rate %", 0.12, None),
+        ("TPC Band Hit Rate %", 0.11, "TPC Band Games"),
+        ("TPC Opp Hit Rate %", 0.10, "TPC Opp Games"),
+    ]:
+        v = _tps_num(row.get(c), None)
+        if v is None:
+            continue
+        if min_c and c != "TPC Season Hit Rate %" and (_tps_num(row.get(min_c), 0) or 0) < 2:
+            continue
+        vals.append(v*w); weights.append(w)
+    if not weights:
+        return None
+    return sum(vals)/sum(weights)
+
+def _tps_support(row):
+    support = 0
+    notes = []
+    for c, threshold, note in [
+        ("TPC Season Avg K", 5.8, "SEASON_AVG"),
+        ("TPC Recent5 Avg K", 5.8, "RECENT5"),
+        ("TPC Recent3 Avg K", 6.0, "RECENT3"),
+        ("Pitcher K%", 25, "K_SKILL"),
+        ("Opp K%", 23, "OPP_K"),
+        ("Putaway/Whiff", 24, "WHIFF"),
+    ]:
+        v = _tps_num(row.get(c), None)
+        if v is not None and v >= threshold:
+            support += 1
+            notes.append(note)
+    hit = _tps_hit_score(row)
+    if hit is not None and hit >= 62:
+        support += 1
+        notes.append("HIT_RATE")
+    return support, "|".join(notes)
+
+def _tps_adjust(row):
+    base = _tps_base(row)
+    if base is None:
+        return None, 0.0, "NO_BASE", ""
+    line = _tps_line(row)
+    anchor = _tps_anchor(row)
+    sample = _tps_num(row.get("TPC Log Sample"), 0) or 0
+    if sample < 3 or anchor is None:
+        return base, 0.0, "NO_LOG_ANCHOR", ""
+
+    hit = _tps_hit_score(row)
+    support, notes = _tps_support(row)
+    adj = 0.0
+    labels = []
+    reasons = [f"base {base:.2f}", f"anchor {anchor:.2f}", f"support {support}:{notes}"]
+    if hit is not None:
+        reasons.append(f"hit {hit:.1f}")
+
+    # 1. Stronger reality calibration toward true log anchor.
+    gap = base - anchor
+    if gap >= 0.55:
+        # Base projection higher than season/recent reality.
+        if support >= 5:
+            adj -= _tps_cap((gap - 0.35) * 0.16, 0.00, 0.32)
+            labels.append("SUPPORTED_LIGHT_TRIM")
+        elif support >= 3:
+            adj -= _tps_cap((gap - 0.30) * 0.24, 0.05, 0.58)
+            labels.append("REALITY_TRIM")
+        else:
+            adj -= _tps_cap((gap - 0.25) * 0.34, 0.10, 0.95)
+            labels.append("STRONG_REALITY_TRIM")
+        reasons.append(f"HIGH_GAP_{gap:.2f}")
+    elif gap <= -0.75:
+        # Projection lower than real season/recent profile.
+        if support >= 3:
+            adj += _tps_cap((abs(gap) - 0.35) * 0.22, 0.05, 0.65)
+            labels.append("UNDER_FLOOR_LIFT")
+        else:
+            adj += _tps_cap((abs(gap) - 0.45) * 0.14, 0.03, 0.35)
+            labels.append("SMALL_UNDER_LIFT")
+        reasons.append(f"LOW_GAP_{gap:.2f}")
+
+    # 2. Current-line hit rate makes decision/projection move meaningfully.
+    if line is not None and hit is not None:
+        edge = base - line
+        if edge >= 1.0 and hit < 45:
+            adj -= 0.42
+            labels.append("HIT_RATE_STRONG_OVER_CONFLICT")
+        elif edge >= 0.65 and hit < 52:
+            adj -= 0.28
+            labels.append("HIT_RATE_OVER_CONFLICT")
+        elif edge <= 0.35 and hit >= 68:
+            adj += 0.32
+            labels.append("HIT_RATE_OVER_SUPPORT")
+        elif edge >= 0.35 and hit >= 72:
+            adj += 0.18
+            labels.append("HIT_RATE_CONFIRMS")
+        elif -0.25 < edge < 0.70 and hit <= 35:
+            adj -= 0.25
+            labels.append("HIT_RATE_UNDER_SUPPORT")
+
+    # 3. Opponent-specific hit rate boost/tax when sample exists.
+    opp_rate = _tps_num(row.get("TPC Opp Hit Rate %"), None)
+    opp_games = _tps_num(row.get("TPC Opp Games"), 0) or 0
+    if opp_rate is not None and opp_games >= 1 and line is not None:
+        edge = base - line
+        if edge > 0 and opp_rate < 40:
+            adj -= 0.18
+            labels.append("OPP_HIT_RATE_TAX")
+        elif edge < 0.65 and opp_rate >= 67:
+            adj += 0.16
+            labels.append("OPP_HIT_RATE_SUPPORT")
+
+    # 4. Volume reality check.
+    exp_bf = _tps_num(row.get("Exp BF"), None)
+    bf_vals = []
+    for c in ["TPC Season Avg BF", "TPC Recent5 Avg BF", "Season Avg BF"]:
+        v = _tps_num(row.get(c), None)
+        if v is not None:
+            bf_vals.append(v)
+    if exp_bf is not None and bf_vals:
+        bf_anchor = sum(bf_vals)/len(bf_vals)
+        bf_gap = exp_bf - bf_anchor
+        if bf_gap >= 2.5:
+            adj -= _tps_cap((bf_gap - 1.8) * 0.055, 0.06, 0.34)
+            labels.append("VOLUME_REALITY_TRIM")
+            reasons.append(f"BF_GAP_{bf_gap:.1f}")
+        elif bf_gap <= -3.0 and support >= 3:
+            adj += _tps_cap((abs(bf_gap)-2.0) * 0.035, 0.04, 0.22)
+            labels.append("VOLUME_FLOOR_LIFT")
+
+    # 5. Soft ceiling clamp: prevents unrealistic upside when profile/hit rate disagree.
+    projected = base + adj
+    if line is not None:
+        max_allowed = anchor + (1.35 if support >= 6 else 1.05 if support >= 4 else 0.75 if support >= 2 else 0.45)
+        if hit is not None and hit >= 70:
+            max_allowed += 0.25
+        if hit is not None and hit < 45:
+            max_allowed -= 0.15
+        if projected > max_allowed and projected - line >= 1.35:
+            cut = min(projected - max_allowed, 0.75)
+            adj -= cut
+            labels.append("SOFT_CEILING_CLAMP")
+            reasons.append(f"CEILING_{max_allowed:.2f}")
+
+    # Caps keep the engine safe.
+    adj = round(_tps_cap(adj, -1.20, 0.90), 2)
+    final = round(base + adj, 2)
+
+    # Avoid violent side flips.
+    if line is not None:
+        old_edge = base - line
+        new_edge = final - line
+        if old_edge > 0.35 and new_edge < -0.25:
+            final = round(line - 0.20, 2)
+            adj = round(final - base, 2)
+            labels.append("SOFTEN_OVER_TO_UNDER_FLIP")
+        elif old_edge < -0.35 and new_edge > 0.25:
+            final = round(line + 0.20, 2)
+            adj = round(final - base, 2)
+            labels.append("SOFTEN_UNDER_TO_OVER_FLIP")
+
+    return final, adj, "|".join(labels) if labels else "TPS_NO_CHANGE", "; ".join(reasons)
+
+def _tps_decision(row, proj):
+    line = _tps_line(row)
+    if proj is None:
+        return "NO_PROJECTION", ""
+    if line is None:
+        return "NO_UD_LINE", ""
+    edge = round(proj - line, 2)
+    hit = _tps_hit_score(row)
+
+    # Better PASS rules.
+    if -0.70 < edge < 0.70:
+        return "🚫 PASS — TRUE EDGE THIN", edge
+    if edge > 0 and hit is not None and hit < 45 and edge < 1.45:
+        return "🚫 PASS — HIT RATE CONFLICT", edge
+    if edge < 0 and hit is not None and hit > 62 and abs(edge) < 1.25:
+        return "🚫 PASS — UNDER HIT RATE CONFLICT", edge
+
+    if edge >= 1.35:
+        return "🔥 OVER", edge
+    if edge >= 0.70:
+        return "⚠️ OVER LEAN", edge
+    if edge <= -1.35:
+        return "🔥 UNDER", edge
+    if edge <= -0.70:
+        return "⚠️ UNDER LEAN", edge
+    return "🚫 PASS — TRUE EDGE THIN", edge
+
+def _tps_apply(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    finals, adjs, labels, reasons, decisions, edges = [], [], [], [], [], []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        final, adj, label, reason = _tps_adjust(row)
+        dec, edge = _tps_decision(row, final)
+        finals.append(final if final is not None else "")
+        adjs.append(adj)
+        labels.append(label)
+        reasons.append(reason)
+        decisions.append(dec)
+        edges.append(edge)
+
+    d["TPS Final K Projection"] = finals
+    d["TPS Adjustment"] = adjs
+    d["TPS Label"] = labels
+    d["TPS Reason"] = reasons
+    d["TPS Edge"] = edges
+    d["TPS Decision"] = decisions
+    d["TPS Version"] = TRUE_PROJECTION_STACK_1_1_VERSION
+
+    try:
+        if bool(st.session_state.get("use_true_projection_stack_1_1", True)):
+            if "K PROJ" in d.columns:
+                d["Pre-TPS K PROJ"] = d["K PROJ"]
+                d["K PROJ"] = d["TPS Final K Projection"]
+            if "Decision" in d.columns:
+                d["Pre-TPS Decision"] = d["Decision"]
+                d["Decision"] = d["TPS Decision"]
+            if "Edge Gap" in d.columns:
+                d["Pre-TPS Edge Gap"] = d["Edge Gap"]
+                d["Edge Gap"] = d["TPS Edge"]
+            if "Main Engine Action" in d.columns:
+                d["Pre-TPS Main Engine Action"] = d["Main Engine Action"]
+                d["Main Engine Action"] = d["TPS Decision"]
+    except Exception:
+        pass
+    return d
+
+if "build_kproj_table" in globals():
+    _prev_tps_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_tps_build_kproj_table(board)
+        try:
+            return _tps_apply(df)
+        except Exception:
+            return df
+
+def render_true_projection_stack_1_1_panel():
+    st.markdown("### 🎯 True Projection Stack 1.1")
+    st.caption("Stronger final projection layer: reality calibration + line-aware hit rate + opponent hit rate + volume reality + ceiling clamp.")
+    try:
+        st.session_state["use_true_projection_stack_1_1"] = st.toggle(
+            "Use True Projection Stack 1.1",
+            value=st.session_state.get("use_true_projection_stack_1_1", True),
+            key="use_true_projection_stack_1_1_unique"
+        )
+    except Exception:
+        pass
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher","Matchup","Pre-TPS K PROJ","K PROJ","TPS Final K Projection","UD/Line",
+            "TPS Edge","TPS Decision","TPS Adjustment","TPS Label",
+            "TPC Season Avg K","TPC Recent5 Avg K","TPC Season Hit Rate %",
+            "TPC Recent5 Hit Rate %","TPC Opp Hit Rate %","TPC Season Avg BF","Exp BF",
+            "TPS Reason"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("True Projection Stack 1.1 will populate after the K board builds.")
+    except Exception as e:
+        st.info(f"True Projection Stack waiting: {e}")
+
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
