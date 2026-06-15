@@ -21174,6 +21174,368 @@ def render_true_projection_stack_1_1_panel():
     except Exception as e:
         st.info(f"True Projection Stack waiting: {e}")
 
+
+# =========================
+# WIN-RATE STABILITY STACK 1.2
+# Version: WIN_RATE_STABILITY_STACK_1_2_2026_06_14
+# Conservative post-slate layer after 15-11 review.
+# Adds: ace/veteran leash, volume reality, projection reality calibration,
+# opponent hit-rate weighting, lineup/matchup K environment, and ML gate helper.
+# =========================
+WIN_RATE_STABILITY_STACK_VERSION = "WIN_RATE_STABILITY_STACK_1_2_2026_06_14"
+
+def _wrs_num(x, default=None):
+    try:
+        if x in (None, "", "—", "WAITING_FOR_UD_LINE", "NL"):
+            return default
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _wrs_cap(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _wrs_line(row):
+    for c in ["UD/Line", "Line", "line", "K Line", "TPC Current Line"]:
+        v = _wrs_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _wrs_base(row):
+    for c in ["TPS Final K Projection", "TPC True K Projection", "K PROJ", "Final K Projection", "Projection", "Proj"]:
+        v = _wrs_num(row.get(c), None)
+        if v is not None:
+            return v
+    return None
+
+def _wrs_anchor(row):
+    vals, weights = [], []
+    for c, w in [
+        ("TPC Season Avg K", 0.26), ("TPC Season Median K", 0.16),
+        ("TPC Recent5 Avg K", 0.22), ("TPC Recent3 Avg K", 0.14),
+        ("Season Avg K", 0.08), ("Season Median K", 0.05), ("Opp Hist Avg K", 0.09),
+    ]:
+        v = _wrs_num(row.get(c), None)
+        if v is not None:
+            vals.append(v*w); weights.append(w)
+    return None if not weights else sum(vals)/sum(weights)
+
+def _wrs_hit_score(row):
+    vals, weights = [], []
+    for c, w, min_c in [
+        ("TPC Season Hit Rate %", 0.38, "TPC Season Games"),
+        ("TPC Recent5 Hit Rate %", 0.24, "TPC Recent5 Games"),
+        ("TPC Recent3 Hit Rate %", 0.12, None),
+        ("TPC Band Hit Rate %", 0.10, "TPC Band Games"),
+        ("TPC Opp Hit Rate %", 0.16, "TPC Opp Games"),
+    ]:
+        v = _wrs_num(row.get(c), None)
+        if v is None:
+            continue
+        if min_c and c != "TPC Season Hit Rate %" and (_wrs_num(row.get(min_c), 0) or 0) < 2:
+            continue
+        vals.append(v*w); weights.append(w)
+    return None if not weights else sum(vals)/sum(weights)
+
+def _wrs_support(row):
+    support, notes = 0, []
+    for c, threshold, note in [
+        ("TPC Season Avg K", 5.8, "SEASON_AVG"),
+        ("TPC Recent5 Avg K", 5.8, "RECENT5"),
+        ("TPC Recent3 Avg K", 6.0, "RECENT3"),
+        ("Pitcher K%", 25, "K_SKILL"),
+        ("Opp K%", 23, "OPP_K"),
+        ("Putaway/Whiff", 24, "WHIFF"),
+    ]:
+        v = _wrs_num(row.get(c), None)
+        if v is not None and v >= threshold:
+            support += 1; notes.append(note)
+    hit = _wrs_hit_score(row)
+    if hit is not None and hit >= 62:
+        support += 1; notes.append("HIT_RATE")
+    opp_rate = _wrs_num(row.get("TPC Opp Hit Rate %"), None)
+    opp_games = _wrs_num(row.get("TPC Opp Games"), 0) or 0
+    if opp_rate is not None and opp_games >= 1 and opp_rate >= 65:
+        support += 1; notes.append("OPP_HISTORY")
+    return support, "|".join(notes)
+
+def _wrs_ace_score(row):
+    score, notes = 0, []
+    for c, threshold, pts, note in [
+        ("Pitcher K%", 27, 2, "ELITE_K"),
+        ("Pitcher K%", 24, 1, "GOOD_K"),
+        ("TPC Season Avg K", 6.0, 1, "SEASON_K"),
+        ("TPC Recent5 Avg K", 6.0, 1, "RECENT_K"),
+        ("TPC Season Avg IP", 5.7, 2, "IP_TRUST"),
+        ("TPC Season Avg IP", 5.2, 1, "IP_OK"),
+        ("TPC Season Avg BF", 23, 1, "BF_TRUST"),
+        ("TPC Season Avg Pitch Count", 92, 1, "PITCH_COUNT_TRUST"),
+    ]:
+        v = _wrs_num(row.get(c), None)
+        if v is not None and v >= threshold:
+            score += pts; notes.append(note)
+            if c == "Pitcher K%" and threshold == 27:
+                break
+            if c == "TPC Season Avg IP" and threshold == 5.7:
+                pass
+    hit = _wrs_hit_score(row)
+    if hit is not None and hit >= 60:
+        score += 1; notes.append("HIT_RATE_OK")
+    return score, "|".join(notes)
+
+def _wrs_adjust(row):
+    base = _wrs_base(row)
+    if base is None:
+        return None, 0.0, "NO_BASE", ""
+    line = _wrs_line(row)
+    anchor = _wrs_anchor(row)
+    hit = _wrs_hit_score(row)
+    support, support_notes = _wrs_support(row)
+    ace_score, ace_notes = _wrs_ace_score(row)
+
+    adj, labels = 0.0, []
+    reasons = [f"base {base:.2f}", f"support {support}:{support_notes}", f"ace {ace_score}:{ace_notes}"]
+    if anchor is not None: reasons.append(f"anchor {anchor:.2f}")
+    if hit is not None: reasons.append(f"hit {hit:.1f}")
+
+    # Ace/veteran leash + volume reality.
+    exp_ip = _wrs_num(row.get("IP Projection"), _wrs_num(row.get("Projected IP"), None))
+    exp_bf = _wrs_num(row.get("Exp BF"), None)
+    season_ip = _wrs_num(row.get("TPC Season Avg IP"), None)
+    season_bf = _wrs_num(row.get("TPC Season Avg BF"), _wrs_num(row.get("Season Avg BF"), None))
+    recent_bf = _wrs_num(row.get("TPC Recent5 Avg BF"), None)
+
+    if exp_ip is not None and season_ip is not None:
+        ip_gap = season_ip - exp_ip
+        if ip_gap >= 1.0 and ace_score >= 4:
+            adj += _wrs_cap((ip_gap - 0.55) * 0.18, 0.08, 0.45)
+            labels.append("ACE_LEASH_IP_LIFT"); reasons.append(f"IP_GAP_{ip_gap:.2f}")
+        elif ip_gap >= 0.75 and support >= 4:
+            adj += _wrs_cap((ip_gap - 0.45) * 0.12, 0.05, 0.25)
+            labels.append("VOLUME_IP_LIFT"); reasons.append(f"IP_GAP_{ip_gap:.2f}")
+
+    bf_vals = [v for v in [season_bf, recent_bf] if v is not None]
+    if exp_bf is not None and bf_vals:
+        bf_anchor = sum(bf_vals)/len(bf_vals)
+        bf_gap = bf_anchor - exp_bf
+        if bf_gap >= 3.0 and ace_score >= 4:
+            adj += _wrs_cap((bf_gap - 2.0) * 0.045, 0.06, 0.35)
+            labels.append("ACE_BF_VOLUME_LIFT")
+        elif bf_gap <= -3.0:
+            adj -= _wrs_cap((abs(bf_gap) - 2.0) * 0.055, 0.06, 0.35)
+            labels.append("BF_OVERPROJECTION_TRIM")
+
+    # Reality calibration + ceiling protection.
+    if anchor is not None:
+        gap = base - anchor
+        if gap >= 0.80:
+            if support >= 5 and hit is not None and hit >= 62:
+                trim = _wrs_cap((gap - 0.60) * 0.08, 0.00, 0.20)
+                labels.append("SUPPORTED_TINY_TRIM")
+            elif support >= 3:
+                trim = _wrs_cap((gap - 0.45) * 0.18, 0.05, 0.45)
+                labels.append("REALITY_TRIM")
+            else:
+                trim = _wrs_cap((gap - 0.35) * 0.30, 0.10, 0.85)
+                labels.append("STRONG_REALITY_TRIM")
+            adj -= trim; reasons.append(f"HIGH_GAP_{gap:.2f}")
+        elif gap <= -0.95:
+            if support >= 4 or ace_score >= 5:
+                lift = _wrs_cap((abs(gap) - 0.55) * 0.16, 0.05, 0.45)
+                labels.append("REALITY_UNDER_LIFT")
+            else:
+                lift = _wrs_cap((abs(gap) - 0.65) * 0.09, 0.02, 0.20)
+                labels.append("SMALL_UNDER_LIFT")
+            adj += lift; reasons.append(f"LOW_GAP_{gap:.2f}")
+
+    # Current-line hit rate and opponent-specific weighting.
+    if line is not None and hit is not None:
+        edge = base - line
+        if edge >= 1.0 and hit < 45:
+            adj -= 0.32; labels.append("HIT_RATE_OVER_CONFLICT")
+        elif edge >= 0.65 and hit < 52:
+            adj -= 0.20; labels.append("HIT_RATE_WEAK_OVER")
+        elif edge <= 0.35 and hit >= 68 and (support >= 3 or ace_score >= 4):
+            adj += 0.22; labels.append("HIT_RATE_OVER_SUPPORT")
+        elif edge >= 0.35 and hit >= 72:
+            adj += 0.10; labels.append("HIT_RATE_CONFIRM")
+
+        opp_rate = _wrs_num(row.get("TPC Opp Hit Rate %"), None)
+        opp_games = _wrs_num(row.get("TPC Opp Games"), 0) or 0
+        if opp_rate is not None and opp_games >= 1:
+            if edge > 0 and opp_rate < 40:
+                adj -= 0.14; labels.append("OPP_HIT_RATE_TAX")
+            elif edge < 0.70 and opp_rate >= 67:
+                adj += 0.12; labels.append("OPP_HIT_RATE_SUPPORT")
+
+    # Matchup K environment.
+    opp_k = _wrs_num(row.get("Opp K%"), None)
+    pitcher_k = _wrs_num(row.get("Pitcher K%"), None)
+    whiff = _wrs_num(row.get("Putaway/Whiff"), None)
+    if opp_k is not None and pitcher_k is not None:
+        if opp_k >= 24 and pitcher_k >= 25:
+            adj += 0.12; labels.append("MATCHUP_K_ENV_PLUS")
+        elif opp_k <= 19 and pitcher_k < 27:
+            adj -= 0.14; labels.append("MATCHUP_CONTACT_TAX")
+    if whiff is not None and whiff >= 27 and support >= 4:
+        adj += 0.08; labels.append("WHIFF_PLUS")
+
+    # Soft ceiling clamp after all context.
+    projected = base + adj
+    if line is not None and anchor is not None:
+        max_allowed = anchor + (1.45 if ace_score >= 6 else 1.20 if support >= 5 else 0.95 if support >= 3 else 0.55)
+        if hit is not None and hit >= 70: max_allowed += 0.25
+        if hit is not None and hit < 45: max_allowed -= 0.15
+        if projected > max_allowed and projected - line >= 1.40:
+            cut = min(projected - max_allowed, 0.40 if ace_score >= 6 else 0.65)
+            adj -= cut; labels.append("SOFT_CEILING_CLAMP"); reasons.append(f"CEILING_{max_allowed:.2f}")
+
+    adj = round(_wrs_cap(adj, -1.10, 0.90), 2)
+    final = round(base + adj, 2)
+
+    # Avoid violent side flips.
+    if line is not None:
+        old_edge, new_edge = base - line, final - line
+        if old_edge > 0.35 and new_edge < -0.25:
+            final = round(line - 0.20, 2); adj = round(final - base, 2); labels.append("SOFTEN_OVER_TO_UNDER_FLIP")
+        elif old_edge < -0.35 and new_edge > 0.25:
+            final = round(line + 0.20, 2); adj = round(final - base, 2); labels.append("SOFTEN_UNDER_TO_OVER_FLIP")
+
+    return final, adj, "|".join(labels) if labels else "WRS_NO_CHANGE", "; ".join(reasons)
+
+def _wrs_decision(row, proj):
+    line = _wrs_line(row)
+    if proj is None: return "NO_PROJECTION", ""
+    if line is None: return "NO_UD_LINE", ""
+    edge = round(proj - line, 2)
+    hit = _wrs_hit_score(row)
+    if -0.70 < edge < 0.70:
+        return "🚫 PASS — TRUE EDGE THIN", edge
+    if edge > 0 and hit is not None and hit < 45 and edge < 1.45:
+        return "🚫 PASS — HIT RATE CONFLICT", edge
+    if edge < 0 and hit is not None and hit > 62 and abs(edge) < 1.25:
+        return "🚫 PASS — UNDER HIT RATE CONFLICT", edge
+    if edge >= 1.35: return "🔥 OVER", edge
+    if edge >= 0.70: return "⚠️ OVER LEAN", edge
+    if edge <= -1.35: return "🔥 UNDER", edge
+    if edge <= -0.70: return "⚠️ UNDER LEAN", edge
+    return "🚫 PASS — TRUE EDGE THIN", edge
+
+def _wrs_apply(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    finals, adjs, labels, reasons, decisions, edges = [], [], [], [], [], []
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        final, adj, label, reason = _wrs_adjust(row)
+        dec, edge = _wrs_decision(row, final)
+        finals.append(final if final is not None else "")
+        adjs.append(adj); labels.append(label); reasons.append(reason)
+        decisions.append(dec); edges.append(edge)
+
+    d["WRS Final K Projection"] = finals
+    d["WRS Adjustment"] = adjs
+    d["WRS Label"] = labels
+    d["WRS Reason"] = reasons
+    d["WRS Edge"] = edges
+    d["WRS Decision"] = decisions
+    d["WRS Version"] = WIN_RATE_STABILITY_STACK_VERSION
+
+    try:
+        if bool(st.session_state.get("use_win_rate_stability_stack", True)):
+            if "K PROJ" in d.columns:
+                d["Pre-WRS K PROJ"] = d["K PROJ"]
+                d["K PROJ"] = d["WRS Final K Projection"]
+            if "Decision" in d.columns:
+                d["Pre-WRS Decision"] = d["Decision"]
+                d["Decision"] = d["WRS Decision"]
+            if "Edge Gap" in d.columns:
+                d["Pre-WRS Edge Gap"] = d["Edge Gap"]
+                d["Edge Gap"] = d["WRS Edge"]
+            if "Main Engine Action" in d.columns:
+                d["Pre-WRS Main Engine Action"] = d["Main Engine Action"]
+                d["Main Engine Action"] = d["WRS Decision"]
+    except Exception:
+        pass
+    return d
+
+if "build_kproj_table" in globals():
+    _prev_wrs_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_wrs_build_kproj_table(board)
+        try:
+            return _wrs_apply(df)
+        except Exception:
+            return df
+
+def render_win_rate_stability_stack_panel():
+    st.markdown("### 🧠 Win-Rate Stability Stack 1.2")
+    st.caption("Ace/veteran leash + volume reality + projection calibration + opponent hit rate + matchup K environment.")
+    try:
+        st.session_state["use_win_rate_stability_stack"] = st.toggle(
+            "Use Win-Rate Stability Stack 1.2",
+            value=st.session_state.get("use_win_rate_stability_stack", True),
+            key="use_win_rate_stability_stack_unique"
+        )
+    except Exception:
+        pass
+    try:
+        df = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        cols = [c for c in [
+            "Pitcher","Matchup","Pre-WRS K PROJ","K PROJ","WRS Final K Projection","UD/Line",
+            "WRS Edge","WRS Decision","WRS Adjustment","WRS Label",
+            "TPC Season Avg K","TPC Recent5 Avg K","TPC Season Hit Rate %",
+            "TPC Recent5 Hit Rate %","TPC Opp Hit Rate %","TPC Season Avg IP",
+            "TPC Season Avg BF","Exp BF","Pitcher K%","Opp K%","Putaway/Whiff","WRS Reason"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Win-Rate Stability Stack will populate after K board builds.")
+    except Exception as e:
+        st.info(f"Win-Rate Stability Stack waiting: {e}")
+
+MONEYLINE_CONFIDENCE_GATE_1_2_VERSION = "MONEYLINE_CONFIDENCE_GATE_1_2_2026_06_14"
+
+def apply_moneyline_confidence_gate_1_2_df(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    scores, gates = [], []
+    for _, rr in d.iterrows():
+        row = {str(k).lower(): v for k, v in rr.to_dict().items()}
+        score = 50
+        for k, v in row.items():
+            if "run diff" in k or "run differential" in k or "score edge" in k:
+                x = abs(_wrs_num(v, 0) or 0)
+                score += 20 if x >= 1.2 else 10 if x >= 0.65 else -12 if x < 0.35 else 0
+                break
+        for k, v in row.items():
+            if "ml edge" in k or ("edge" in k and "%" in k):
+                x = abs(_wrs_num(v, 0) or 0)
+                score += 16 if x >= 8 else 8 if x >= 4 else -10 if x < 2 else 0
+                break
+        status_text = " ".join(str(v).lower() for k, v in row.items() if "status" in k or "grade" in k)
+        if "playable" in status_text or "edge" in status_text:
+            score += 8
+        if "pass" in status_text:
+            score -= 8
+        score = int(max(0, min(100, score)))
+        gate = "ML_PLAY_CONFIDENT" if score >= 72 else "ML_LEAN_ONLY" if score >= 60 else "ML_PASS_WEAK_EDGE"
+        scores.append(score); gates.append(gate)
+    d["ML Gate Score 1.2"] = scores
+    d["ML Gate 1.2"] = gates
+    d["ML Gate Version 1.2"] = MONEYLINE_CONFIDENCE_GATE_1_2_VERSION
+    return d
+
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
