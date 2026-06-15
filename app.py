@@ -20442,22 +20442,75 @@ def _tpc_line(row):
 def _tpc_pitcher_col(df):
     return next((c for c in ["Pitcher", "Player", "Name", "pitcher"] if c in df.columns), None)
 
-def _tpc_get_logs_for_pitcher(player):
+def _tpc_load_embedded_pitch_logs():
+    """
+    Guaranteed embedded Pitch.csv loader.
+    Fixes cases where learning_data/Pitch.csv exists in GitHub,
+    but session_state logs are empty after refresh/redeploy.
+    """
     try:
+        cached = st.session_state.get("_tpc_embedded_pitch_logs_cache")
+        if isinstance(cached, pd.DataFrame) and not cached.empty:
+            return cached.copy()
+    except Exception:
+        pass
+
+    try:
+        from pathlib import Path as _Path
+        candidates = [
+            _Path("learning_data") / "Pitch.csv",
+            _Path.cwd() / "learning_data" / "Pitch.csv",
+            _Path(__file__).resolve().parent / "learning_data" / "Pitch.csv",
+        ]
+        for p in candidates:
+            if p.exists():
+                df = pd.read_csv(p)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    for c in ["K", "Ks", "SO", "IP", "BF", "Pitch Count", "Pitches", "ER", "HR", "BB", "WHIP"]:
+                        if c in df.columns:
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
+                    if "Date" in df.columns:
+                        df["_date"] = pd.to_datetime(df["Date"], errors="coerce")
+                    try:
+                        st.session_state["_tpc_embedded_pitch_logs_cache"] = df.copy()
+                        st.session_state["pitcher_season_logs"] = df.copy()
+                    except Exception:
+                        pass
+                    return df.copy()
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+def _tpc_get_logs_for_pitcher(player):
+    """
+    Reads pitcher game logs from:
+    1) st.session_state pitcher_season_logs
+    2) st.session_state pitcher_30_day_logs fallback
+    3) embedded learning_data/Pitch.csv guaranteed fallback
+    """
+    try:
+        sources = []
         for key in ["pitcher_season_logs", "pitcher_30_day_logs"]:
             df = st.session_state.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty and "Pitcher" in df.columns:
-                d = df.copy()
-                d["_p_norm"] = d["Pitcher"].map(_tpc_norm_name)
-                d = d[d["_p_norm"] == _tpc_norm_name(player)].copy()
-                if not d.empty:
-                    for c in ["K", "Ks", "SO", "IP", "BF", "Pitch Count", "Pitches", "ER", "HR", "BB", "WHIP"]:
-                        if c in d.columns:
-                            d[c] = pd.to_numeric(d[c], errors="coerce")
-                    if "Date" in d.columns:
-                        d["_date"] = pd.to_datetime(d["Date"], errors="coerce")
-                        d = d.sort_values("_date")
-                    return d
+                sources.append(df.copy())
+
+        embedded = _tpc_load_embedded_pitch_logs()
+        if isinstance(embedded, pd.DataFrame) and not embedded.empty and "Pitcher" in embedded.columns:
+            sources.append(embedded.copy())
+
+        for d in sources:
+            d["_p_norm"] = d["Pitcher"].map(_tpc_norm_name)
+            d = d[d["_p_norm"] == _tpc_norm_name(player)].copy()
+            if not d.empty:
+                for c in ["K", "Ks", "SO", "IP", "BF", "Pitch Count", "Pitches", "ER", "HR", "BB", "WHIP"]:
+                    if c in d.columns:
+                        d[c] = pd.to_numeric(d[c], errors="coerce")
+                if "Date" in d.columns:
+                    d["_date"] = pd.to_datetime(d["Date"], errors="coerce")
+                    d = d.sort_values("_date")
+                return d
     except Exception:
         pass
     return pd.DataFrame()
@@ -21536,6 +21589,20 @@ def apply_moneyline_confidence_gate_1_2_df(df):
     d["ML Gate Version 1.2"] = MONEYLINE_CONFIDENCE_GATE_1_2_VERSION
     return d
 
+
+
+def render_embedded_pitch_log_feed_check_panel():
+    st.markdown("### 🧪 Embedded Pitch Log Feed Check")
+    try:
+        df = _tpc_load_embedded_pitch_logs() if "_tpc_load_embedded_pitch_logs" in globals() else pd.DataFrame()
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.success(f"Embedded Pitch.csv loaded: {len(df)} rows")
+            show_cols = [c for c in ["Date", "Pitcher", "Team", "Opponent", "IP", "BF", "Pitch Count", "K"] if c in df.columns]
+            st.dataframe(df[show_cols].tail(10), use_container_width=True, hide_index=True)
+        else:
+            st.error("Embedded Pitch.csv not loaded. Make sure learning_data/Pitch.csv is next to app.py in GitHub.")
+    except Exception as e:
+        st.error(f"Embedded Pitch.csv check failed: {e}")
 
 # =========================
 # LINE-AWARE HIT RATE SMART DISPLAY + CONFIRMATION
