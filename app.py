@@ -22187,20 +22187,30 @@ def _rh_profile_for_row(row):
 
     ha_txt = "—"; ha_pct = None; ha_vals = []
     ha_label = "NO_HOME_AWAY_SPLIT"
+    desired_venue = None
+    venue_game_txt = []
     try:
         hacol = _rh_col(d, ["Home/Away", "H/A", "home_away"])
+        ocol_for_venue = _rh_col(d, ["Opponent", "Opp", "opponent"])
         if hacol and matchup:
             desired = None
             away, home = _slpb_split_matchup(matchup) if '_slpb_split_matchup' in globals() else ("", "")
             t = str(team or "").upper()
             if t and t in away: desired = "Away"
             elif t and t in home: desired = "Home"
+            desired_venue = desired
             if desired:
                 hd = d[d[hacol].astype(str).str.lower().str.contains(desired.lower(), na=False)]
                 if kcol and not hd.empty:
                     ha_vals = hd[kcol].dropna().astype(float).tolist()
                     ha_txt, ha_pct, _, _ = _rh_rate(ha_vals, line, side)
                     ha_label = desired.upper()
+                    for _, vrow in hd.tail(5).iterrows():
+                        kval = _rh_num(vrow.get(kcol), None)
+                        if kval is None: continue
+                        opp_txt = str(vrow.get(ocol_for_venue) if ocol_for_venue else "").strip() or "OPP"
+                        prefix = "@" if desired.lower() == "away" else "vs"
+                        venue_game_txt.append(f"{prefix} {opp_txt} = {_rh_fmt_num(kval)} Ks")
     except Exception:
         pass
 
@@ -22313,6 +22323,9 @@ def _rh_profile_for_row(row):
         "Sync Label": label,
         "Recent Ks": l10,
         "Recent FS": fs_vals,
+        "Recent L5 Ks": l5,
+        "Recent L3 Ks": vals[-3:],
+        "Venue Recent Games": venue_game_txt[-5:],
         "H2H Ks": h2h_vals[-10:],
         "Data Source": "Pitch.csv/session logs + board prop rows",
         "Version": RESEARCH_HUB_VERSION,
@@ -22542,6 +22555,95 @@ def _rh_narrative_sections(rr):
     }
 
 
+
+def _rh_matchup_summary(rr):
+    """Plain-English matchup explanation for the research card. Display only."""
+    opp = str(rr.get("H2H Opponent") or "opponent").strip() or "opponent"
+    opp_k = _rh_num(rr.get("Opp K%"), None)
+    opp_rank = rr.get("Opponent K Rank")
+    side = str(rr.get("K Pick") or "OVER").upper()
+    bits = []
+    if opp_k is not None:
+        if opp_k >= 23.5:
+            bits.append(f"{opp} profiles as a strikeout-friendly matchup from the loaded Opp K% ({_rh_fmt_num(opp_k)}%).")
+        elif opp_k <= 19.5:
+            bits.append(f"{opp} profiles as a tougher strikeout matchup from the loaded Opp K% ({_rh_fmt_num(opp_k)}%), so recent form should be downgraded slightly.")
+        else:
+            bits.append(f"{opp} grades as a mostly neutral strikeout matchup from the loaded Opp K% ({_rh_fmt_num(opp_k)}%).")
+    elif opp_rank not in [None, "", "—"]:
+        bits.append(f"Opponent K-rank is loaded ({opp_rank}); use it as matchup context, not as a projection override.")
+    else:
+        bits.append(f"No opponent K-rate/rank context loaded for {opp}; use recent form, venue split, and projection edge as the main signals.")
+    h2h = rr.get("H2H")
+    if h2h and str(h2h) != "—":
+        bits.append(f"Loaded H2H sample vs {opp}: {h2h} at this line.")
+    else:
+        bits.append(f"No loaded H2H sample vs {opp}, so H2H should carry 0% weight today.")
+    return bits
+
+
+def _rh_recent_trend_lines(rr):
+    vals5 = [_rh_num(v, None) for v in (rr.get("Recent L5 Ks") or [])]
+    vals5 = [float(v) for v in vals5 if v is not None]
+    vals3 = [_rh_num(v, None) for v in (rr.get("Recent L3 Ks") or [])]
+    vals3 = [float(v) for v in vals3 if v is not None]
+    out = []
+    if vals5:
+        out.append(f"{_rh_fmt_num(sum(vals5))} strikeouts in his last {len(vals5)} starts.")
+    if vals3 and len(vals3) >= 2:
+        out.append(f"{_rh_fmt_num(sum(vals3))} strikeouts over his last {len(vals3)} starts.")
+    if vals5:
+        out.append(f"Recent form average: {_rh_fmt_num(sum(vals5)/len(vals5))} Ks.")
+    return out
+
+
+def _rh_line_sensitivity(rr):
+    """Return Outlier-style line sensitivity rows without altering official decisions."""
+    proj = _rh_num(rr.get("K Projection"), None)
+    side = str(rr.get("K Pick") or "OVER").upper()
+    cur_line = _rh_num(rr.get("K Line"), None)
+    if proj is None:
+        return []
+    # Candidate lines around common K prop numbers.
+    candidates = []
+    for ln in [2.5,3.5,4.5,5.5,6.0,6.5,7.0,7.5,8.5,9.5]:
+        if cur_line is None or abs(ln-cur_line) <= 2.0 or ln == cur_line:
+            candidates.append(ln)
+    if cur_line is not None and cur_line not in candidates:
+        candidates.append(cur_line)
+    candidates = sorted(set(candidates))
+    rows = []
+    for ln in candidates:
+        gap = proj - ln
+        if side == "UNDER":
+            gap = -gap
+        if gap >= 1.25:
+            tag = "🟢 Strong " + ("Over" if side == "OVER" else "Under")
+        elif gap >= 0.65:
+            tag = "🟢 " + ("Over" if side == "OVER" else "Under")
+        elif gap >= 0.15:
+            tag = "🟡 Slight " + ("Over" if side == "OVER" else "Under")
+        elif gap >= -0.25:
+            tag = "🟡 Thin / pass if price is bad"
+        else:
+            tag = "🔴 Against projection"
+        rows.append((ln, tag))
+    return rows
+
+
+def _rh_short_verdict_note(rr, ns):
+    pitcher = rr.get("Pitcher") or "This pitcher"
+    sync = _rh_num(rr.get("Sync Score"), None)
+    hit = ns.get("hit_rate")
+    lean = ns.get("lean")
+    venue = rr.get("Home/Away Label") or rr.get("Venue") or "venue"
+    ha = rr.get("Home/Away") or "—"
+    if sync is not None and sync >= 75:
+        return f"{pitcher} has strong board-to-trend agreement: projection edge, recent hit rate ({hit}), and {venue} split ({ha}) are aligned."
+    if sync is not None and sync < 48:
+        return f"{pitcher} is against trend despite the official lean; treat this as a downgrade/pass signal unless the projection edge is large."
+    return f"{pitcher} is a mixed research profile. Use the official V1 projection first, then use this card to confirm or downgrade the play."
+
 def _rh_render_verdict_card(rr):
     ns = _rh_narrative_sections(rr)
     side = str(rr.get("K Pick") or "OVER").upper()
@@ -22553,6 +22655,14 @@ def _rh_render_verdict_card(rr):
         fair = f"{_rh_fmt_num(ns['fair_low'])}–{_rh_fmt_num(ns['fair_high'])} Ks"
     st.markdown("### Hit Rate")
     st.markdown(f"• **{ns['shown_label']}:** {ns['hit_rate']}  \n• **Average:** {_rh_fmt_num(ns['average'])} Ks  \n• **Median:** {_rh_fmt_num(ns['median'])} Ks")
+    st.markdown("### Recent Trend")
+    trend_lines = _rh_recent_trend_lines(rr)
+    if trend_lines:
+        for t in trend_lines:
+            st.markdown(f"• {t}")
+    else:
+        st.markdown("• No recent K trend summary loaded")
+
     st.markdown("### H2H / Home-Away")
     h2h_opp = rr.get("H2H Opponent") or "—"
     h2h_txt = rr.get("H2H") or "—"
@@ -22568,6 +22678,16 @@ def _rh_render_verdict_card(rr):
         f"• **{venue} split:** {ha_txt} {side_word} at this line"
         f" — Avg {_rh_fmt_num(ha_avg)} / Median {_rh_fmt_num(ha_med)}"
     )
+    venue_games = rr.get("Venue Recent Games") or []
+    if venue_games:
+        st.markdown(f"**Recent {str(venue).title()} starts:**")
+        for vg in venue_games[-5:]:
+            st.markdown(f"• {vg}")
+
+    st.markdown("### Matchup Summary")
+    for m in _rh_matchup_summary(rr):
+        st.markdown(f"• {m}")
+
     st.markdown("### The Good")
     for g in ns["goods"]:
         st.markdown(f"✅ {g}")
@@ -22578,7 +22698,16 @@ def _rh_render_verdict_card(rr):
     st.markdown(f"**Line:** {_rh_fmt_num(line)} Ks  \n\n**Hit Rate:** {ns['hit_rate']}  \n\n**Average:** {_rh_fmt_num(ns['average'])} Ks  \n\n**Projection:** {_rh_fmt_num(proj)} Ks  \n\n**Fair Line:** {fair}")
     lean = ns["lean"]
     color_icon = "🔴" if "UNDER" in str(lean).upper() else "🟢" if "OVER" in str(lean).upper() else "🟡"
+    st.markdown("### Line Sensitivity")
+    sensitivity = _rh_line_sensitivity(rr)
+    if sensitivity:
+        for ln, tag in sensitivity:
+            st.markdown(f"• **{_rh_fmt_num(ln)} Ks** → {tag}")
+    else:
+        st.markdown("• Line sensitivity unavailable because projection is missing")
+
     st.markdown(f"### Lean\n{color_icon} **{lean} {_rh_fmt_num(line)} Ks**  \n\n**Confidence:** {ns['confidence']}")
+    st.markdown(f"**Summary:** {_rh_short_verdict_note(rr, ns)}")
 
 
 def render_research_hub_tab(board):
