@@ -21877,11 +21877,34 @@ def _rh_board_base_df(board):
 
     for p in board or []:
         name = p.get("pitcher") or p.get("Pitcher") or p.get("Player") or ""
-        side = str(p.get("pick_side") or p.get("Pick") or "").upper()
-        line = _rh_num(p.get("line") or p.get("UD/Line") or p.get("Line"), None)
-        proj = _rh_num(p.get("projection") or p.get("K PROJ") or p.get("Projection"), None)
-        if not side and line is not None and proj is not None:
+
+        # IMPORTANT FIX:
+        # The Research Hub must mirror the official K PROJ / UPSIDE tab.
+        # Do NOT read the older raw p['projection'] first, because that can be
+        # the main/legacy projection and can disagree with the displayed K PROJ.
+        # This keeps the Research Hub display synced to the same kproj_decision()
+        # output used by the Projection Board. Display only; no projection math changed.
+        try:
+            kd = kproj_decision(p) if 'kproj_decision' in globals() else {}
+        except Exception:
+            kd = {}
+
+        line = _rh_num(kd.get("line"), None)
+        if line is None:
+            line = _rh_num(p.get("line") or p.get("UD/Line") or p.get("Line"), None)
+
+        proj = _rh_num(kd.get("projection"), None)
+        if proj is None:
+            proj = _rh_num(p.get("K PROJ") or p.get("Projection") or p.get("projection"), None)
+
+        side = str(kd.get("lean_side") or kd.get("decision") or p.get("pick_side") or p.get("Pick") or "").upper()
+        if "OVER" in side:
+            side = "OVER"
+        elif "UNDER" in side:
+            side = "UNDER"
+        elif line is not None and proj is not None:
             side = "OVER" if proj > line else "UNDER"
+
         fsrow = fs_lookup.get(_rh_norm(name), {})
         rows.append({
             "Pitcher": name,
