@@ -21808,7 +21808,7 @@ def render_line_aware_smart_confirm_panel():
 # UI / decision-support only. DOES NOT change K projections, FS projections, IP projections, or official decisions.
 # Uses session Pitch.csv / MLB game logs when available, plus board prop rows/line history when present.
 # =========================
-RESEARCH_HUB_VERSION = "RESEARCH_HUB_V1_2026_06_15"
+RESEARCH_HUB_VERSION = "RESEARCH_HUB_V1_6FIX_FINAL_2026_06_15"
 
 
 def _rh_norm(x):
@@ -21916,6 +21916,8 @@ def _rh_board_base_df(board):
             "K Edge": None if line is None or proj is None else round(proj - line, 2),
             "FS Projection": _rh_num(fsrow.get("FS Projection"), None),
             "IP Projection": _rh_num(p.get("ip_projection") or p.get("IP Projection") or p.get("IP Proj") or p.get("ip_floor"), _rh_num(fsrow.get("IP Projection"), None)),
+            "Opp K%": _rh_num(p.get("Opp K%") or p.get("Opponent K%") or p.get("OppK%") or p.get("opp_k_rate"), None),
+            "Opponent K Rank": p.get("Opponent K Rank") or p.get("Opp K Rank") or p.get("OppK Rank") or p.get("opp_k_rank") or "",
             "Raw": p,
         })
     return pd.DataFrame(rows)
@@ -21949,6 +21951,18 @@ def _rh_pitcher_logs(name):
     date_col = _rh_col(d, ["Date", "Game Date", "game_date"])
     if date_col:
         d["_rh_date"] = pd.to_datetime(d[date_col], errors="coerce")
+        # Research Hub regular-season safety filter. Keeps current-season/opening-day logs,
+        # but prevents old seasons, spring/reheab-looking dates, or stale copied logs from leaking into L5/L10/H2H.
+        try:
+            today_ts = pd.Timestamp(datetime.now().date())
+            season_year = int(today_ts.year)
+            season_open = pd.Timestamp(year=season_year, month=3, day=1)
+            # If app is run early in a calendar year, keep prior season logic conservative.
+            if today_ts.month <= 2:
+                season_open = pd.Timestamp(year=season_year-1, month=3, day=1)
+            d = d[(d["_rh_date"].isna()) | (d["_rh_date"] >= season_open)].copy()
+        except Exception:
+            pass
         d = d.sort_values("_rh_date")
     for c in d.columns:
         if str(c).lower().strip() in ["k", "so", "strikeouts", "ip", "bf", "pitch count", "pitches", "er", "r", "h", "bb", "hr", "whip"]:
@@ -22214,19 +22228,35 @@ def _rh_profile_for_row(row):
     if market_books:
         market_txt = ", ".join([f"{b['Book']} {b['Line']}" for b in market_books[:6]])
 
-    # Sync score: support/confirm V1 side. This is display-only; official picks are unchanged.
+    # Sync score: support/confirm V1 side. Display-only.
+    # Weighting keeps the official V1 board projection/edge as the king signal.
     parts = []
-    for pct, weight in [(l5_pct, 18), (l10_pct, 24), (l15_pct, 12), (ha_pct, 14), (h2h_pct, 12), (same_pct, 10)]:
-        if pct is not None:
-            parts.append((pct / 100.0, weight))
     edge = _rh_num(row.get("K Edge"), None)
     if edge is not None:
-        agree = 1.0 if (side == "OVER" and edge > 0) or (side == "UNDER" and edge < 0) else 0.35
-        parts.append((agree, 10))
+        # Bigger edge earns stronger score, but this never changes the official pick.
+        edge_strength = min(abs(edge) / 1.50, 1.0)
+        agree = edge_strength if ((side == "OVER" and edge > 0) or (side == "UNDER" and edge < 0)) else 0.25
+        parts.append((agree, 40))
+    # Hit-rate bucket = 25% total: L5 10, L10 10, same-line 5.
+    for pct, weight in [(l5_pct, 10), (l10_pct, 10), (same_pct, 5)]:
+        if pct is not None:
+            parts.append((pct / 100.0, weight))
+    # Home/Away and H2H each 10%.
+    for pct, weight in [(ha_pct, 10), (h2h_pct, 10)]:
+        if pct is not None:
+            parts.append((pct / 100.0, weight))
+    # Line movement = 5%.
     if move is not None:
-        # Line move up can support OVER market interest; move down supports UNDER.
         agree = 1.0 if (side == "OVER" and move > 0) or (side == "UNDER" and move < 0) else 0.45
-        parts.append((agree, 8))
+        parts.append((agree, 5))
+    # Role/IP = 10%.
+    try:
+        role_component = max(0, min(100, float(role_score))) / 100.0
+        if ip_trend.get("IP Trend Label") in ["RECENT LEASH DOWN", "VOLATILE IP", "NO_IP_LOGS", "NO_IP_COLUMN"]:
+            role_component *= 0.75
+        parts.append((role_component, 10))
+    except Exception:
+        pass
     if parts:
         sync = round(sum(v*w for v,w in parts) / max(sum(w for _,w in parts), 1) * 100, 1)
     else:
@@ -22242,6 +22272,8 @@ def _rh_profile_for_row(row):
         "K Line": line,
         "K Projection": row.get("K Projection"),
         "K Edge": row.get("K Edge"),
+        "Opp K%": row.get("Opp K%"),
+        "Opponent K Rank": row.get("Opponent K Rank"),
         "FS Projection": row.get("FS Projection"),
         "IP Projection": row.get("IP Projection"),
         "Recent IP Trend": ip_trend.get("Recent IP Trend"),
@@ -22261,11 +22293,15 @@ def _rh_profile_for_row(row):
         "Last 15 %": l15_pct,
         "Home/Away": ha_txt,
         "Home/Away %": ha_pct,
+        "Home/Away Avg": _rh_values_summary(ha_vals)[0],
+        "Home/Away Median": _rh_values_summary(ha_vals)[1],
         "Home/Away Label": ha_label,
         "Venue": ha_label,
         "H2H Opponent": opp if opp else "—",
         "H2H": h2h_txt,
         "H2H %": h2h_pct,
+        "H2H Avg": _rh_values_summary(h2h_vals)[0],
+        "H2H Median": _rh_values_summary(h2h_vals)[1],
         "Same-Line": same_txt,
         "Same-Line %": same_pct,
         "Open Line": open_line,
@@ -22325,6 +22361,16 @@ def _rh_fmt_num(x, nd=2):
 def _rh_side_word(side):
     side = str(side or "").upper()
     return "Over" if side == "OVER" else "Under" if side == "UNDER" else "Hit"
+
+
+def _rh_values_summary(vals):
+    vals = [_rh_num(v, None) for v in (vals or [])]
+    vals = [float(v) for v in vals if v is not None]
+    if not vals:
+        return None, None
+    avg = round(sum(vals) / len(vals), 2)
+    med = round(float(pd.Series(vals).median()), 2)
+    return avg, med
 
 
 def _rh_count_hit(vals, line, side):
@@ -22412,17 +22458,41 @@ def _rh_narrative_sections(rr):
         goods.append("Recent IP trend shows leash up")
     elif "LEASH DOWN" in ip_label or "VOLATILE" in ip_label:
         bads.append(f"IP trend warning: {ip_label}")
-    # Matchup context: avoid generic placeholder. Use actual H2H/Home-Away signals when available.
+    # Matchup context: real H2H, venue, and opponent K-rate signals. No vague placeholders.
     matchup = str(rr.get("Matchup") or "")
     opp_name = str(rr.get("H2H Opponent") or "").strip()
     if h2h and str(h2h) != "—":
-        h2h_vals = rr.get("H2H Ks") or []
+        h2h_avg = rr.get("H2H Avg")
         if h2h_pct is not None and h2h_pct < 50:
-            bads.append(f"H2H vs {opp_name or 'opponent'} is weak: {h2h} on this line")
+            bads.append(f"H2H vs {opp_name or 'opponent'} is weak: {h2h} cleared at this line")
         elif h2h_pct is not None and h2h_pct >= 50:
-            goods.append(f"H2H vs {opp_name or 'opponent'} has cleared this side: {h2h}")
+            goods.append(f"H2H vs {opp_name or 'opponent'} supports this side: {h2h} cleared at this line")
+        if h2h_avg is not None:
+            goods.append(f"H2H average vs {opp_name or 'opponent'}: {_rh_fmt_num(h2h_avg)} Ks")
     else:
         bads.append(f"No loaded H2H sample vs {opp_name or 'this opponent'}")
+    ha_pct = _rh_num(rr.get("Home/Away %"), None)
+    ha_avg = rr.get("Home/Away Avg")
+    venue_lbl = str(rr.get("Home/Away Label") or rr.get("Venue") or "venue")
+    if ha_pct is not None:
+        if ha_pct >= 60:
+            goods.append(f"{venue_lbl} split supports this side: {rr.get('Home/Away')} cleared")
+        elif ha_pct <= 40:
+            bads.append(f"{venue_lbl} split is weak for this side: {rr.get('Home/Away')} cleared")
+    if ha_avg is not None:
+        if side == "OVER" and line is not None and ha_avg < line:
+            bads.append(f"{venue_lbl} average ({_rh_fmt_num(ha_avg)} Ks) is below the line")
+        elif side == "UNDER" and line is not None and ha_avg > line:
+            bads.append(f"{venue_lbl} average ({_rh_fmt_num(ha_avg)} Ks) is above the line")
+    opp_k = _rh_num(rr.get("Opp K%"), None)
+    opp_rank = rr.get("Opponent K Rank")
+    if opp_k is not None:
+        if opp_k >= 23.5:
+            goods.append(f"Opponent strikeout context helps: Opp K% {_rh_fmt_num(opp_k)}")
+        elif opp_k <= 19.5:
+            bads.append(f"Opponent strikeout context is difficult: Opp K% {_rh_fmt_num(opp_k)}")
+    elif opp_rank not in [None, "", "—"]:
+        goods.append(f"Opponent K-rank loaded: {opp_rank}")
     # If no real negative is found, show a useful warning instead of a vague placeholder.
     if not bads:
         if proj is not None and avg is not None and side == "OVER" and proj < avg:
@@ -22488,7 +22558,16 @@ def _rh_render_verdict_card(rr):
     h2h_txt = rr.get("H2H") or "—"
     ha_txt = rr.get("Home/Away") or "—"
     venue = rr.get("Home/Away Label") or rr.get("Venue") or "—"
-    st.markdown(f"• **H2H vs {h2h_opp}:** {h2h_txt} {side_word} at this line  \n• **{venue} split:** {ha_txt} {side_word} at this line")
+    h2h_avg = rr.get("H2H Avg")
+    h2h_med = rr.get("H2H Median")
+    ha_avg = rr.get("Home/Away Avg")
+    ha_med = rr.get("Home/Away Median")
+    st.markdown(
+        f"• **H2H vs {h2h_opp}:** {h2h_txt} {side_word} at this line"
+        f" — Avg {_rh_fmt_num(h2h_avg)} / Median {_rh_fmt_num(h2h_med)}  \n"
+        f"• **{venue} split:** {ha_txt} {side_word} at this line"
+        f" — Avg {_rh_fmt_num(ha_avg)} / Median {_rh_fmt_num(ha_med)}"
+    )
     st.markdown("### The Good")
     for g in ns["goods"]:
         st.markdown(f"✅ {g}")
@@ -22520,9 +22599,9 @@ def render_research_hub_tab(board):
     c5.metric("Version", RESEARCH_HUB_VERSION.replace("RESEARCH_HUB_", ""))
 
     cols = [c for c in [
-        "Pitcher", "Matchup", "K Pick", "K Line", "K Projection", "K Edge", "FS Projection", "IP Projection",
+        "Pitcher", "Matchup", "K Pick", "K Line", "K Projection", "K Edge", "Opp K%", "Opponent K Rank", "FS Projection", "IP Projection",
         "Recent IP Trend", "IP Trend Label", "Role Stability", "Role Label",
-        "Last 5", "Last 10", "Last 15", "Home/Away", "Venue", "H2H Opponent", "H2H", "Same-Line", "Line Move", "Odds Comparison", "Sync Score", "Sync Label"
+        "Last 5", "Last 10", "Last 15", "Home/Away", "Home/Away Avg", "Venue", "H2H Opponent", "H2H", "H2H Avg", "Same-Line", "Line Move", "Odds Comparison", "Sync Score", "Sync Label"
     ] if c in df.columns]
     df_show = df[cols].sort_values(["Sync Score", "K Edge"], ascending=[False, False], na_position="last").copy()
     if "K Projection" in df_show.columns:
@@ -22556,9 +22635,15 @@ def render_research_hub_tab(board):
         st.markdown(f"**H2H vs {h2h_opp}:** {h2h_txt} {side_word_card} at this line")
         if rr.get("H2H Ks"):
             st.markdown("**H2H Ks:** " + ", ".join(_rh_fmt_num(v) for v in (rr.get("H2H Ks") or [])))
+            st.markdown(f"**H2H Avg / Median:** {_rh_fmt_num(rr.get('H2H Avg'))} / {_rh_fmt_num(rr.get('H2H Median'))}")
         else:
             st.markdown("**H2H Ks:** No loaded matchup sample")
         st.markdown(f"**{venue} split:** {ha_txt} {side_word_card} at this line")
+        st.markdown(f"**{venue} Avg / Median:** {_rh_fmt_num(rr.get('Home/Away Avg'))} / {_rh_fmt_num(rr.get('Home/Away Median'))}")
+        if rr.get("Opp K%") not in [None, "", "—"]:
+            st.markdown(f"**Opponent K Context:** Opp K% {_rh_fmt_num(rr.get('Opp K%'))}")
+        elif rr.get("Opponent K Rank") not in [None, "", "—"]:
+            st.markdown(f"**Opponent K Context:** Rank {rr.get('Opponent K Rank')}")
         st.markdown("**Recent Estimated FS Results**", unsafe_allow_html=True)
         st.markdown(_rh_bar_html(rr.get("Recent FS") or [], rr.get("FS Projection")), unsafe_allow_html=True)
         _rh_render_verdict_card(rr)
@@ -22568,9 +22653,15 @@ def render_research_hub_tab(board):
                 "Last 10": rr.get("Last 10"),
                 "Last 15": rr.get("Last 15"),
                 "Home/Away": rr.get("Home/Away"),
+                "Home/Away Avg": rr.get("Home/Away Avg"),
+                "Home/Away Median": rr.get("Home/Away Median"),
                 "Home/Away Label": rr.get("Home/Away Label"),
                 "H2H": rr.get("H2H"),
+                "H2H Avg": rr.get("H2H Avg"),
+                "H2H Median": rr.get("H2H Median"),
                 "H2H Ks": rr.get("H2H Ks"),
+                "Opp K%": rr.get("Opp K%"),
+                "Opponent K Rank": rr.get("Opponent K Rank"),
                 "Same-Line Hit Rate": rr.get("Same-Line"),
                 "Recent IP Trend": rr.get("Recent IP Trend"),
                 "Last 5 IP": rr.get("Last 5 IP"),
