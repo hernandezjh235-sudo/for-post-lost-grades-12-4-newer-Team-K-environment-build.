@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE + BATTER FS CLEAN"
+APP_VERSION = "v11.17 K PROJ UPSIDE + FANTASY SCORE + ML"
 
 try:
     import pytz
@@ -22948,13 +22948,15 @@ def render_research_hub_tab(board):
             })
         st.info("Use this as a confirmation/downgrade tool only. V1 official projection and official decision remain untouched.")
 
-tab_kproj, tab_pitcher_fs, tab_batter_fs, tab_research_hub, tab_moneyline, tab_iq, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_pitcher_fs, tab_research_hub, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
-    "BATTER FS",
     "🔎 RESEARCH HUB",
     "MONEYLINE EDGE",
+    "📥 SEASON DATA",
+    "🟣 FS UD WATCHER",
     "🧠 BASEBALL IQ",
+    "🧠 30D LEARNING IQ",
     "🧪 LEARNING LAB",
     "CALIBRATION AUDIT",
     "ALL PLAYERS",
@@ -22968,15 +22970,9 @@ with tab_kproj:
     render_kproj_tab(board)
 
 with tab_pitcher_fs:
-    render_pitcher_fs_tab(board)
+    render_fs_ud_watcher_controls()
 
-with tab_batter_fs:
-    st.markdown('<div class="section-title-pro">Batter FS</div>', unsafe_allow_html=True)
-    st.caption("Uses the existing Batter FS pull/source. K projections are untouched.")
-    try:
-        render_batter_fs_tab()
-    except Exception as e:
-        st.error(f"Batter FS tab failed to render: {e}")
+    render_pitcher_fs_tab(board)
 
 with tab_research_hub:
     render_research_hub_tab(board)
@@ -22984,8 +22980,33 @@ with tab_research_hub:
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
 
+with tab_mlb30_puller:
+    render_season_to_date_puller()
+
+    try:
+        _mlrd_df = ml_build_board(board)
+        with st.expander("Moneyline Run Differential IQ", expanded=False):
+            _mlrd_cols = [c for c in [
+                "Matchup", "Expected Score", "Expected Run Differential", "Run Differential Pick",
+                "Run Differential Label", "Away Offense vs Hand 30d", "Home Offense vs Hand 30d",
+                "Away Bullpen Run Prevention 14d", "Home Bullpen Run Prevention 14d"
+            ] if c in _mlrd_df.columns]
+            st.dataframe(_mlrd_df[_mlrd_cols], use_container_width=True, hide_index=True)
+    except Exception:
+        pass
+
+with tab_fs_ud_watcher:
+    st.markdown("### 🟣 FS UD Watcher")
+    st.caption("Controls are shown in Pitcher FS to avoid duplicate Streamlit widget IDs.")
+    raw_fs_ud = _fsud_raw_df()
+    if raw_fs_ud is not None and not raw_fs_ud.empty:
+        st.dataframe(raw_fs_ud, use_container_width=True, hide_index=True)
+
 with tab_iq:
     render_baseball_iq_tab(board)
+
+with tab_30d_learning:
+    render_30_day_gamelog_learning_iq()
 
 with tab_learning_lab:
     render_learning_lab_tab(board)
