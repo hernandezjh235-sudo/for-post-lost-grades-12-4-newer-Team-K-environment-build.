@@ -22262,6 +22262,8 @@ def _rh_profile_for_row(row):
         "Home/Away": ha_txt,
         "Home/Away %": ha_pct,
         "Home/Away Label": ha_label,
+        "Venue": ha_label,
+        "H2H Opponent": opp if opp else "—",
         "H2H": h2h_txt,
         "H2H %": h2h_pct,
         "Same-Line": same_txt,
@@ -22410,10 +22412,27 @@ def _rh_narrative_sections(rr):
         goods.append("Recent IP trend shows leash up")
     elif "LEASH DOWN" in ip_label or "VOLATILE" in ip_label:
         bads.append(f"IP trend warning: {ip_label}")
-    # Matchup note from text only; keep generic, not pretending advanced opponent data.
+    # Matchup context: avoid generic placeholder. Use actual H2H/Home-Away signals when available.
     matchup = str(rr.get("Matchup") or "")
-    if matchup:
-        bads.append(f"Matchup context still needs review: {matchup}")
+    opp_name = str(rr.get("H2H Opponent") or "").strip()
+    if h2h and str(h2h) != "—":
+        h2h_vals = rr.get("H2H Ks") or []
+        if h2h_pct is not None and h2h_pct < 50:
+            bads.append(f"H2H vs {opp_name or 'opponent'} is weak: {h2h} on this line")
+        elif h2h_pct is not None and h2h_pct >= 50:
+            goods.append(f"H2H vs {opp_name or 'opponent'} has cleared this side: {h2h}")
+    else:
+        bads.append(f"No loaded H2H sample vs {opp_name or 'this opponent'}")
+    # If no real negative is found, show a useful warning instead of a vague placeholder.
+    if not bads:
+        if proj is not None and avg is not None and side == "OVER" and proj < avg:
+            bads.append(f"Projection ({_rh_fmt_num(proj)} Ks) is lower than recent average ({_rh_fmt_num(avg)} Ks)")
+        elif proj is not None and avg is not None and side == "UNDER" and proj > avg:
+            bads.append(f"Projection ({_rh_fmt_num(proj)} Ks) is higher than recent average ({_rh_fmt_num(avg)} Ks)")
+        elif line is not None and avg is not None and abs(avg - line) < 0.35:
+            bads.append("Recent average is close to the line, so margin is thin")
+        else:
+            bads.append("No major red flags detected from loaded logs")
     sync = _rh_num(rr.get("Sync Score"), None)
     if sync is not None:
         if sync >= 75:
@@ -22464,6 +22483,12 @@ def _rh_render_verdict_card(rr):
         fair = f"{_rh_fmt_num(ns['fair_low'])}–{_rh_fmt_num(ns['fair_high'])} Ks"
     st.markdown("### Hit Rate")
     st.markdown(f"• **{ns['shown_label']}:** {ns['hit_rate']}  \n• **Average:** {_rh_fmt_num(ns['average'])} Ks  \n• **Median:** {_rh_fmt_num(ns['median'])} Ks")
+    st.markdown("### H2H / Home-Away")
+    h2h_opp = rr.get("H2H Opponent") or "—"
+    h2h_txt = rr.get("H2H") or "—"
+    ha_txt = rr.get("Home/Away") or "—"
+    venue = rr.get("Home/Away Label") or rr.get("Venue") or "—"
+    st.markdown(f"• **H2H vs {h2h_opp}:** {h2h_txt} {side_word} at this line  \n• **{venue} split:** {ha_txt} {side_word} at this line")
     st.markdown("### The Good")
     for g in ns["goods"]:
         st.markdown(f"✅ {g}")
@@ -22497,9 +22522,12 @@ def render_research_hub_tab(board):
     cols = [c for c in [
         "Pitcher", "Matchup", "K Pick", "K Line", "K Projection", "K Edge", "FS Projection", "IP Projection",
         "Recent IP Trend", "IP Trend Label", "Role Stability", "Role Label",
-        "Last 5", "Last 10", "Last 15", "Home/Away", "H2H", "Same-Line", "Line Move", "Odds Comparison", "Sync Score", "Sync Label"
+        "Last 5", "Last 10", "Last 15", "Home/Away", "Venue", "H2H Opponent", "H2H", "Same-Line", "Line Move", "Odds Comparison", "Sync Score", "Sync Label"
     ] if c in df.columns]
-    st.dataframe(df[cols].sort_values(["Sync Score", "K Edge"], ascending=[False, False], na_position="last"), use_container_width=True, hide_index=True)
+    df_show = df[cols].sort_values(["Sync Score", "K Edge"], ascending=[False, False], na_position="last").copy()
+    if "K Projection" in df_show.columns:
+        df_show = df_show.rename(columns={"K Projection": "Board K Projection"})
+    st.dataframe(df_show, use_container_width=True, hide_index=True)
 
     st.subheader("Clickable Player Cards")
     names = df["Pitcher"].dropna().astype(str).tolist()
@@ -22508,7 +22536,7 @@ def render_research_hub_tab(board):
     kline = _rh_num(rr.get("K Line"), None)
     with st.expander(f"{selected} — Full K/FS Research Card", expanded=True):
         a,b,c,d,e,f,g = st.columns(7)
-        a.metric("K Projection", rr.get("K Projection", "—"))
+        a.metric("Board K Projection", rr.get("K Projection", "—"))
         b.metric("K Line", rr.get("K Line", "—"))
         c.metric("K Edge", rr.get("K Edge", "—"))
         d.metric("FS Projection", rr.get("FS Projection", "—"))
@@ -22518,6 +22546,19 @@ def render_research_hub_tab(board):
         st.markdown(f"**Decision Support:** {rr.get('Sync Label')}  ")
         st.markdown("**Last 10 K Results**", unsafe_allow_html=True)
         st.markdown(_rh_bar_html(rr.get("Recent Ks") or [], kline), unsafe_allow_html=True)
+
+        st.markdown("### H2H / Home-Away Matchup Check")
+        h2h_opp = rr.get("H2H Opponent") or "—"
+        h2h_txt = rr.get("H2H") or "—"
+        ha_txt = rr.get("Home/Away") or "—"
+        venue = rr.get("Home/Away Label") or rr.get("Venue") or "—"
+        side_word_card = _rh_side_word(rr.get("K Pick"))
+        st.markdown(f"**H2H vs {h2h_opp}:** {h2h_txt} {side_word_card} at this line")
+        if rr.get("H2H Ks"):
+            st.markdown("**H2H Ks:** " + ", ".join(_rh_fmt_num(v) for v in (rr.get("H2H Ks") or [])))
+        else:
+            st.markdown("**H2H Ks:** No loaded matchup sample")
+        st.markdown(f"**{venue} split:** {ha_txt} {side_word_card} at this line")
         st.markdown("**Recent Estimated FS Results**", unsafe_allow_html=True)
         st.markdown(_rh_bar_html(rr.get("Recent FS") or [], rr.get("FS Projection")), unsafe_allow_html=True)
         _rh_render_verdict_card(rr)
