@@ -21808,7 +21808,7 @@ def render_line_aware_smart_confirm_panel():
 # UI / decision-support only. DOES NOT change K projections, FS projections, IP projections, or official decisions.
 # Uses session Pitch.csv / MLB game logs when available, plus board prop rows/line history when present.
 # =========================
-RESEARCH_HUB_VERSION = "RESEARCH_HUB_V1_6FIX_FINAL_2026_06_15"
+RESEARCH_HUB_VERSION = "RESEARCH_HUB_V1_HAND_SPLITS_RESEARCH_ONLY_2026_06_15"
 
 
 def _rh_norm(x):
@@ -21918,6 +21918,11 @@ def _rh_board_base_df(board):
             "IP Projection": _rh_num(p.get("ip_projection") or p.get("IP Projection") or p.get("IP Proj") or p.get("ip_floor"), _rh_num(fsrow.get("IP Projection"), None)),
             "Opp K%": _rh_num(p.get("Opp K%") or p.get("Opponent K%") or p.get("OppK%") or p.get("opp_k_rate"), None),
             "Opponent K Rank": p.get("Opponent K Rank") or p.get("Opp K Rank") or p.get("OppK Rank") or p.get("opp_k_rank") or "",
+            "Pitcher Hand": p.get("Throws") or p.get("Throwing Hand") or p.get("Pitcher Hand") or p.get("Hand") or p.get("p_throws") or p.get("throws") or "",
+            "Opp K% vs LHP": p.get("Opp K% vs LHP") or p.get("Opponent K% vs LHP") or p.get("Opp vs LHP K%") or p.get("opp_k_vs_lhp"),
+            "Opp K% vs RHP": p.get("Opp K% vs RHP") or p.get("Opponent K% vs RHP") or p.get("Opp vs RHP K%") or p.get("opp_k_vs_rhp"),
+            "Opp K Rank vs LHP": p.get("Opp K Rank vs LHP") or p.get("Opponent K Rank vs LHP") or p.get("opp_k_rank_vs_lhp") or "",
+            "Opp K Rank vs RHP": p.get("Opp K Rank vs RHP") or p.get("Opponent K Rank vs RHP") or p.get("opp_k_rank_vs_rhp") or "",
             "Raw": p,
         })
     return pd.DataFrame(rows)
@@ -21934,6 +21939,102 @@ def _rh_current_opponent(matchup, team=""):
     if team and team in home:
         return away
     return ""
+
+
+def _rh_pitcher_hand_from_row(row):
+    """Best-effort pitcher hand detector for Research Hub display only."""
+    raw = row.get("Raw") if isinstance(row, dict) else {}
+    candidates = []
+    for src in [row, raw if isinstance(raw, dict) else {}]:
+        for k in ["Throws", "Throwing Hand", "Pitcher Hand", "Hand", "P Hand", "P_Hand", "p_throws", "throws", "arm", "Pitcher Throws"]:
+            try:
+                candidates.append(src.get(k))
+            except Exception:
+                pass
+    txt = " ".join(str(x or "") for x in candidates).upper()
+    if "LHP" in txt or "LEFT" in txt or txt.strip() == "L":
+        return "LHP"
+    if "RHP" in txt or "RIGHT" in txt or txt.strip() == "R":
+        return "RHP"
+    # Some boards store a one-letter hand inside a longer label. Keep this conservative.
+    for x in candidates:
+        sx = str(x or "").strip().upper()
+        if sx in ["L", "LH", "LHP"]:
+            return "LHP"
+        if sx in ["R", "RH", "RHP"]:
+            return "RHP"
+    return "UNKNOWN"
+
+
+def _rh_extract_opp_hand_splits(row):
+    """Extract opponent K% vs LHP/RHP when available. Research Hub only; never changes projections."""
+    raw = row.get("Raw") if isinstance(row, dict) else {}
+    sources = [row, raw if isinstance(raw, dict) else {}]
+    l_keys = [
+        "Opp K% vs LHP", "Opponent K% vs LHP", "Opp vs LHP K%", "Opponent vs LHP K%",
+        "Team K% vs LHP", "Lineup K% vs LHP", "Opp K vs LHP", "opp_k_vs_lhp",
+        "opp_k_lhp", "Opponent K Rate vs LHP", "K% vs LHP"
+    ]
+    r_keys = [
+        "Opp K% vs RHP", "Opponent K% vs RHP", "Opp vs RHP K%", "Opponent vs RHP K%",
+        "Team K% vs RHP", "Lineup K% vs RHP", "Opp K vs RHP", "opp_k_vs_rhp",
+        "opp_k_rhp", "Opponent K Rate vs RHP", "K% vs RHP"
+    ]
+    rank_l_keys = ["Opp K Rank vs LHP", "Opponent K Rank vs LHP", "Rank vs LHP", "opp_k_rank_vs_lhp"]
+    rank_r_keys = ["Opp K Rank vs RHP", "Opponent K Rank vs RHP", "Rank vs RHP", "opp_k_rank_vs_rhp"]
+    def first_num(keys):
+        for src in sources:
+            for k in keys:
+                try:
+                    v = _rh_num(src.get(k), None)
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
+        return None
+    def first_val(keys):
+        for src in sources:
+            for k in keys:
+                try:
+                    v = src.get(k)
+                    if v not in [None, "", "—"]:
+                        return v
+                except Exception:
+                    pass
+        return ""
+    return {
+        "Pitcher Hand": _rh_pitcher_hand_from_row(row),
+        "Opp K% vs LHP": first_num(l_keys),
+        "Opp K% vs RHP": first_num(r_keys),
+        "Opp K Rank vs LHP": first_val(rank_l_keys),
+        "Opp K Rank vs RHP": first_val(rank_r_keys),
+    }
+
+
+def _rh_hand_matchup_grade(hand, overall_k=None, k_lhp=None, k_rhp=None):
+    """Grade opponent K matchup by pitcher handedness. Display/sync only, no projection change."""
+    hand = str(hand or "UNKNOWN").upper()
+    chosen = None
+    label = "overall"
+    if hand == "LHP":
+        chosen = _rh_num(k_lhp, None); label = "vs LHP"
+    elif hand == "RHP":
+        chosen = _rh_num(k_rhp, None); label = "vs RHP"
+    if chosen is None:
+        chosen = _rh_num(overall_k, None); label = "overall"
+    if chosen is None:
+        return {"Matchup Hand K%": None, "Matchup Split Used": label, "Handedness Matchup Grade": "NO HAND SPLIT", "Handedness Sync Adj": 0}
+    if chosen >= 24.5:
+        grade = "🟢 Favorable K Matchup"; adj = 5
+    elif chosen >= 22.5:
+        grade = "🟢 Slight K Boost"; adj = 3
+    elif chosen <= 18.5:
+        grade = "🔴 Difficult K Matchup"; adj = -5
+    elif chosen <= 20.5:
+        grade = "🟡 Slight K Downgrade"; adj = -3
+    else:
+        grade = "🟡 Neutral K Matchup"; adj = 0
+    return {"Matchup Hand K%": chosen, "Matchup Split Used": label, "Handedness Matchup Grade": grade, "Handedness Sync Adj": adj}
 
 
 def _rh_pitcher_logs(name):
@@ -22175,6 +22276,13 @@ def _rh_profile_for_row(row):
     d = _rh_pitcher_logs(name)
     kcol = _rh_k_col(d)
     vals = d[kcol].dropna().astype(float).tolist() if not d.empty and kcol else []
+    hand_splits = _rh_extract_opp_hand_splits(row)
+    hand_grade = _rh_hand_matchup_grade(
+        hand_splits.get("Pitcher Hand"),
+        row.get("Opp K%"),
+        hand_splits.get("Opp K% vs LHP"),
+        hand_splits.get("Opp K% vs RHP"),
+    )
     ip_trend = _rh_recent_ip_trend(d, row.get("IP Projection"))
     role_score, role_label, role_note = _rh_role_stability_score(d, row, ip_trend)
     l5 = vals[-5:]
@@ -22267,6 +22375,14 @@ def _rh_profile_for_row(row):
         parts.append((role_component, 10))
     except Exception:
         pass
+    # Opponent handedness split = small Research Hub sync modifier only (max +/-5 score points).
+    # It does NOT touch K Projection, FS Projection, IP Projection, confidence, or official decision.
+    try:
+        h_adj = _rh_num(hand_grade.get("Handedness Sync Adj"), 0) or 0
+        if h_adj != 0:
+            parts.append(((h_adj + 5) / 10.0, 5))
+    except Exception:
+        pass
     if parts:
         sync = round(sum(v*w for v,w in parts) / max(sum(w for _,w in parts), 1) * 100, 1)
     else:
@@ -22284,6 +22400,15 @@ def _rh_profile_for_row(row):
         "K Edge": row.get("K Edge"),
         "Opp K%": row.get("Opp K%"),
         "Opponent K Rank": row.get("Opponent K Rank"),
+        "Pitcher Hand": hand_splits.get("Pitcher Hand"),
+        "Opp K% vs LHP": hand_splits.get("Opp K% vs LHP"),
+        "Opp K% vs RHP": hand_splits.get("Opp K% vs RHP"),
+        "Opp K Rank vs LHP": hand_splits.get("Opp K Rank vs LHP"),
+        "Opp K Rank vs RHP": hand_splits.get("Opp K Rank vs RHP"),
+        "Matchup Split Used": hand_grade.get("Matchup Split Used"),
+        "Matchup Hand K%": hand_grade.get("Matchup Hand K%"),
+        "Handedness Matchup Grade": hand_grade.get("Handedness Matchup Grade"),
+        "Handedness Sync Adj": hand_grade.get("Handedness Sync Adj"),
         "FS Projection": row.get("FS Projection"),
         "IP Projection": row.get("IP Projection"),
         "Recent IP Trend": ip_trend.get("Recent IP Trend"),
@@ -22499,7 +22624,15 @@ def _rh_narrative_sections(rr):
             bads.append(f"{venue_lbl} average ({_rh_fmt_num(ha_avg)} Ks) is above the line")
     opp_k = _rh_num(rr.get("Opp K%"), None)
     opp_rank = rr.get("Opponent K Rank")
-    if opp_k is not None:
+    hand_k = _rh_num(rr.get("Matchup Hand K%"), None)
+    split_used = rr.get("Matchup Split Used") or "overall"
+    hand_grade = str(rr.get("Handedness Matchup Grade") or "")
+    if hand_k is not None and split_used != "overall":
+        if "Favorable" in hand_grade or "Boost" in hand_grade:
+            goods.append(f"Handedness split helps: opponent K% {split_used} is {_rh_fmt_num(hand_k)}%")
+        elif "Difficult" in hand_grade or "Downgrade" in hand_grade:
+            bads.append(f"Handedness split is tougher: opponent K% {split_used} is {_rh_fmt_num(hand_k)}%")
+    elif opp_k is not None:
         if opp_k >= 23.5:
             goods.append(f"Opponent strikeout context helps: Opp K% {_rh_fmt_num(opp_k)}")
         elif opp_k <= 19.5:
@@ -22561,19 +22694,26 @@ def _rh_matchup_summary(rr):
     opp = str(rr.get("H2H Opponent") or "opponent").strip() or "opponent"
     opp_k = _rh_num(rr.get("Opp K%"), None)
     opp_rank = rr.get("Opponent K Rank")
-    side = str(rr.get("K Pick") or "OVER").upper()
+    hand = str(rr.get("Pitcher Hand") or "UNKNOWN").upper()
+    k_lhp = _rh_num(rr.get("Opp K% vs LHP"), None)
+    k_rhp = _rh_num(rr.get("Opp K% vs RHP"), None)
+    match_k = _rh_num(rr.get("Matchup Hand K%"), None)
+    split_used = rr.get("Matchup Split Used") or "overall"
+    grade = rr.get("Handedness Matchup Grade") or "NO HAND SPLIT"
     bits = []
+    bits.append(f"Opponent: {opp}")
+    bits.append(f"Pitcher hand: {hand}")
     if opp_k is not None:
-        if opp_k >= 23.5:
-            bits.append(f"{opp} profiles as a strikeout-friendly matchup from the loaded Opp K% ({_rh_fmt_num(opp_k)}%).")
-        elif opp_k <= 19.5:
-            bits.append(f"{opp} profiles as a tougher strikeout matchup from the loaded Opp K% ({_rh_fmt_num(opp_k)}%), so recent form should be downgraded slightly.")
-        else:
-            bits.append(f"{opp} grades as a mostly neutral strikeout matchup from the loaded Opp K% ({_rh_fmt_num(opp_k)}%).")
+        bits.append(f"Overall opponent K%: {_rh_fmt_num(opp_k)}%")
+    if k_lhp is not None or k_rhp is not None:
+        bits.append(f"Opponent K% vs LHP/RHP: {_rh_fmt_num(k_lhp)}% / {_rh_fmt_num(k_rhp)}%")
+    if match_k is not None:
+        bits.append(f"Split used for this matchup: {split_used} = {_rh_fmt_num(match_k)}%")
+        bits.append(f"Matchup Grade: {grade}")
     elif opp_rank not in [None, "", "—"]:
         bits.append(f"Opponent K-rank is loaded ({opp_rank}); use it as matchup context, not as a projection override.")
     else:
-        bits.append(f"No opponent K-rate/rank context loaded for {opp}; use recent form, venue split, and projection edge as the main signals.")
+        bits.append(f"No handedness K split loaded for {opp}; using recent form, venue split, H2H, and projection edge as the main signals.")
     h2h = rr.get("H2H")
     if h2h and str(h2h) != "—":
         bits.append(f"Loaded H2H sample vs {opp}: {h2h} at this line.")
@@ -22728,7 +22868,7 @@ def render_research_hub_tab(board):
     c5.metric("Version", RESEARCH_HUB_VERSION.replace("RESEARCH_HUB_", ""))
 
     cols = [c for c in [
-        "Pitcher", "Matchup", "K Pick", "K Line", "K Projection", "K Edge", "Opp K%", "Opponent K Rank", "FS Projection", "IP Projection",
+        "Pitcher", "Matchup", "K Pick", "K Line", "K Projection", "K Edge", "Opp K%", "Opponent K Rank", "Pitcher Hand", "Opp K% vs LHP", "Opp K% vs RHP", "Matchup Split Used", "Matchup Hand K%", "Handedness Matchup Grade", "FS Projection", "IP Projection",
         "Recent IP Trend", "IP Trend Label", "Role Stability", "Role Label",
         "Last 5", "Last 10", "Last 15", "Home/Away", "Home/Away Avg", "Venue", "H2H Opponent", "H2H", "H2H Avg", "Same-Line", "Line Move", "Odds Comparison", "Sync Score", "Sync Label"
     ] if c in df.columns]
