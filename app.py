@@ -1364,6 +1364,40 @@ def pitch_count_trend_bf_factor(recent_rows):
     return 1.000, f"Neutral pitch-count trend (L3 avg {avg:.0f})"
 
 
+def bf_trend_bf_adjustment_v11_19(recent_rows):
+    """Last-3 BF trend: small, capped BF adjustment for K opportunity.
+
+    Uses only real recent game-log batters faced. This supports the existing leash
+    model without overriding K skill or creating fake volume.
+    """
+    vals = []
+    for r in (recent_rows or [])[:10]:
+        bf = safe_float(r.get("BF"), None)
+        if bf is not None and bf > 0:
+            vals.append(float(bf))
+    if len(vals) < 3:
+        return 0.0, "BF trend unavailable; neutral", None, None, 0.0
+    l3 = float(np.mean(vals[:3]))
+    l10 = float(np.mean(vals[:10])) if len(vals) >= 5 else float(np.mean(vals))
+    trend = l3 - l10
+    adj = 0.0
+    if trend >= 3.0:
+        adj = 0.45
+        note = f"Last-3 BF trend rising: +{adj:.2f} BF (L3 {l3:.1f} vs base {l10:.1f})"
+    elif trend >= 1.5:
+        adj = 0.25
+        note = f"Last-3 BF trend slightly rising: +{adj:.2f} BF (L3 {l3:.1f} vs base {l10:.1f})"
+    elif trend <= -3.0:
+        adj = -0.45
+        note = f"Last-3 BF trend falling: {adj:.2f} BF (L3 {l3:.1f} vs base {l10:.1f})"
+    elif trend <= -1.5:
+        adj = -0.25
+        note = f"Last-3 BF trend slightly falling: {adj:.2f} BF (L3 {l3:.1f} vs base {l10:.1f})"
+    else:
+        note = f"Last-3 BF trend neutral (L3 {l3:.1f} vs base {l10:.1f})"
+    return float(adj), note, round(l3, 1), round(l10, 1), round(trend, 1)
+
+
 def build_pitch_count_module(recent_rows):
     """Pitch Count 2.0: converts recent real pitch-count workload into a volume score.
 
@@ -2940,12 +2974,19 @@ def _update_context_avg(model, key, fields):
     return model
 
 def get_actual_pitcher_workload(game_pk, pitcher_id):
-    """Return actual K/BF/pitches/IP after game final for deeper learning."""
+    """Return actual K/BF/pitches/IP after game final for deeper learning.
+
+    Also returns actual pitcher team context so Manager Pull Learning does not fall
+    into UNKNOWN when the saved snapshot did not carry a clean team field.
+    """
     box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
     if not box:
         return {}
     for side in ["home", "away"]:
-        players = box.get("teams", {}).get(side, {}).get("players", {})
+        team_node = (box.get("teams", {}) or {}).get(side, {}) or {}
+        team_info = team_node.get("team", {}) or {}
+        team_abbrev = team_info.get("abbreviation") or team_info.get("teamCode") or team_info.get("fileCode") or team_info.get("name")
+        players = team_node.get("players", {})
         for p in players.values():
             person = p.get("person", {})
             if str(person.get("id")) == str(pitcher_id):
@@ -2958,8 +2999,64 @@ def get_actual_pitcher_workload(game_pk, pitcher_id):
                     "actual_er": safe_float(pitching.get("earnedRuns")),
                     "actual_hits": safe_float(pitching.get("hits")),
                     "actual_bb": safe_float(pitching.get("baseOnBalls")),
+                    "actual_hr": safe_float(pitching.get("homeRuns")),
+                    "actual_team": team_abbrev,
+                    "actual_team_id": team_info.get("id"),
+                    "actual_team_side": side,
                 }
     return {}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_team_manager_name_v11_20(team_id=None, team_abbrev=None):
+    """Best-effort live MLB manager resolver.
+
+    This is used for Manager Pull Learning labels only. It does not change
+    K projections, IP projections, BF projections, or pick decisions.
+    If MLB does not expose coach data for the team, it safely falls back
+    to TEAM:<abbr/id> instead of UNKNOWN.
+    """
+    try:
+        team_id_val = safe_int(team_id, None)
+        if team_id_val is not None:
+            for url in [
+                f"{MLB_BASE}/teams/{team_id_val}/coaches",
+                f"{MLB_BASE}/team/{team_id_val}/coaches",
+            ]:
+                data = safe_get_json(url, timeout=10)
+                if not isinstance(data, dict):
+                    continue
+                candidates = []
+                # MLB endpoints may use coaches, roster, or staff depending on season/API shape.
+                for key in ["coaches", "roster", "staff", "people"]:
+                    val = data.get(key)
+                    if isinstance(val, list):
+                        candidates.extend(val)
+                for item in candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    job = str(item.get("job") or item.get("jobTitle") or item.get("title") or item.get("position") or "").lower()
+                    person = item.get("person") if isinstance(item.get("person"), dict) else item
+                    name = person.get("fullName") or person.get("name") or item.get("name")
+                    if name and ("manager" in job or job in ["mgr"]):
+                        return str(name).strip()
+        abbr = str(team_abbrev or team_id or "UNKNOWN").strip()
+        return f"TEAM:{abbr}" if abbr and abbr.upper() != "UNKNOWN" else "UNKNOWN"
+    except Exception:
+        abbr = str(team_abbrev or team_id or "UNKNOWN").strip()
+        return f"TEAM:{abbr}" if abbr and abbr.upper() != "UNKNOWN" else "UNKNOWN"
+
+def manager_learning_key_from_pick_v11_20(pick):
+    """Return the best available manager-learning key without affecting projections."""
+    if not isinstance(pick, dict):
+        return "UNKNOWN"
+    for k in ["manager_name", "Manager", "manager", "manager_pull_learning_key"]:
+        val = pick.get(k)
+        if val and str(val).strip().upper() not in ["UNKNOWN", "NAN", "NONE"]:
+            return str(val).strip()
+    team_id = pick.get("actual_team_id") or pick.get("team_id") or pick.get("Team ID")
+    team_abbr = pick.get("actual_team") or pick.get("team") or pick.get("pitcher_team") or pick.get("Team") or pick.get("team_abbrev")
+    return get_team_manager_name_v11_20(team_id=team_id, team_abbrev=team_abbr)
 
 def update_deep_context_learning_after_grade(pick):
     """Accumulates post-game errors for future bullpen and umpire corrections."""
@@ -7474,6 +7571,20 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         leash["pitch_count_label"] = pitch_count_profile.get("label")
         leash["pitch_count_note"] = pitch_count_profile.get("note")
 
+    # v11.19 Last-3 BF trend: small K-opportunity adjustment.
+    # This supports IP/BF only and does not alter K skill.
+    try:
+        bf_trend_adj, bf_trend_note, bf_l3_avg, bf_base_avg, bf_trend_delta = bf_trend_bf_adjustment_v11_19(recent_rows)
+        leash["expected_bf"] = float(clamp((safe_float(leash.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF) + bf_trend_adj, 14, 31))
+        leash["bf_trend_adj"] = round(float(bf_trend_adj), 2)
+        leash["bf_trend_note"] = bf_trend_note
+        leash["bf_l3_avg"] = bf_l3_avg
+        leash["bf_base_avg"] = bf_base_avg
+        leash["bf_trend_delta"] = bf_trend_delta
+    except Exception as _bftrend_e:
+        leash["bf_trend_adj"] = 0.0
+        leash["bf_trend_note"] = f"BF trend skipped: {_bftrend_e}"
+
     # v11.18 targeted IP/BF safety patch from slate review.
     # Uses existing recent logs + profile; K skill core remains untouched.
     try:
@@ -8010,6 +8121,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "pitcher": pitcher_name,
         "hand": hand,
         "team": row["team"],
+        "team_id": row.get("team_id"),
+        "manager_name": get_team_manager_name_v11_20(row.get("team_id"), row.get("team")),
         "opponent": row["opponent"],
         "matchup": row["matchup"],
         "home_team": row["home_team"],
@@ -8286,6 +8399,7 @@ def save_many_once(new_picks):
 # VOLUME MISS LEARNING 2.0
 # =========================
 VOLUME_MISS_LEARNING_FILE = os.path.join(STORAGE_DIR, "k_volume_miss_learning.json")
+MANAGER_PULL_LEARNING_FILE = os.path.join(STORAGE_DIR, "manager_pull_learning.json")
 
 
 def _vl_float(row, *keys, default=None):
@@ -8452,10 +8566,139 @@ def get_actual_pitcher_ks(game_pk, pitcher_id):
                 return p.get("stats", {}).get("pitching", {}).get("strikeOuts", None)
     return None
 
+def _grade_result_key(row):
+    """Stable dedupe key for graded outcomes. Prevents duplicate learning samples.
+
+    Do NOT rely primarily on pick_id because the same pitcher/market can be saved
+    more than once with different ids during refreshes. The learning sample should
+    be unique by date + pitcher + market/line/side whenever possible.
+    """
+    if not isinstance(row, dict):
+        return "unknown"
+    parts = [
+        str(row.get("date") or row.get("game_date") or "")[:10],
+        str(row.get("pitcher_id") or ""),
+        normalize_name(row.get("pitcher") or row.get("player") or ""),
+        str(row.get("market") or row.get("prop_type") or "pitcher_ks"),
+        str(row.get("game_pk") or ""),
+        str(row.get("line") or row.get("final_line") or ""),
+        str(row.get("pick_side") or row.get("Decision") or row.get("Pick") or ""),
+    ]
+    stable = "graded::" + "|".join(parts)
+    # If no useful identifying info exists, fall back to pick_id.
+    if stable.replace("graded::", "").replace("|", "").strip():
+        return stable
+    if row.get("pick_id"):
+        return f"pick_id::{row.get('pick_id')}"
+    return "unknown"
+
+def update_manager_pull_learning_after_grade(pick):
+    """Collect manager/team pull behavior after grading.
+
+    Phase 1 is collection/audit only. It does not change future projections until
+    enough samples exist, which protects the K engine from overfitting.
+    """
+    try:
+        data = load_json(MANAGER_PULL_LEARNING_FILE, {})
+        team_key = str(manager_learning_key_from_pick_v11_20(pick))
+        if not team_key or team_key.upper() == "UNKNOWN":
+            # Last-resort fallback: use team/opponent bucket instead of dropping into UNKNOWN.
+            team_key = str(pick.get("actual_team") or pick.get("team") or pick.get("matchup_team") or pick.get("opponent") or "UNKNOWN")
+        projected_ip = safe_float(pick.get("projected_ip"), None)
+        actual_ip = safe_float(pick.get("actual_ip"), None)
+        projected_bf = safe_float(pick.get("expected_bf"), None)
+        actual_bf = safe_float(pick.get("actual_bf"), None)
+        actual_pitches = safe_float(pick.get("actual_pitches"), None)
+        actual_er = safe_float(pick.get("actual_er"), None)
+        actual_hits = safe_float(pick.get("actual_hits"), None)
+        actual_bb = safe_float(pick.get("actual_bb"), None)
+        actual_hr = safe_float(pick.get("actual_hr"), None)
+        bucket = data.get(team_key, {
+            "samples": 0, "avg_actual_ip": 0.0, "avg_actual_bf": 0.0,
+            "avg_actual_pitches": 0.0, "avg_er_at_pull": 0.0,
+            "avg_hits_at_pull": 0.0, "avg_bb_at_pull": 0.0, "avg_hr_at_pull": 0.0,
+            "early_pull_count": 0, "deep_leash_count": 0
+        })
+        n = int(bucket.get("samples", 0)) + 1
+        def avg(old, val):
+            old = safe_float(old, 0.0) or 0.0
+            val = safe_float(val, None)
+            if val is None:
+                return old
+            return round(old + (val - old) / n, 3)
+        bucket["samples"] = n
+        bucket["manager_learning_key"] = team_key
+        bucket["team"] = pick.get("actual_team") or pick.get("team") or pick.get("Team")
+        bucket["team_id"] = pick.get("actual_team_id") or pick.get("team_id")
+        bucket["manager_name"] = pick.get("manager_name") if not str(team_key).startswith("TEAM:") else None
+        bucket["avg_actual_ip"] = avg(bucket.get("avg_actual_ip"), actual_ip)
+        bucket["avg_actual_bf"] = avg(bucket.get("avg_actual_bf"), actual_bf)
+        bucket["avg_actual_pitches"] = avg(bucket.get("avg_actual_pitches"), actual_pitches)
+        bucket["avg_er_at_pull"] = avg(bucket.get("avg_er_at_pull"), actual_er)
+        bucket["avg_hits_at_pull"] = avg(bucket.get("avg_hits_at_pull"), actual_hits)
+        bucket["avg_bb_at_pull"] = avg(bucket.get("avg_bb_at_pull"), actual_bb)
+        bucket["avg_hr_at_pull"] = avg(bucket.get("avg_hr_at_pull"), actual_hr)
+        if actual_ip is not None and projected_ip is not None and actual_ip <= projected_ip - 1.0:
+            bucket["early_pull_count"] = int(bucket.get("early_pull_count", 0)) + 1
+        if actual_ip is not None and projected_ip is not None and actual_ip >= projected_ip + 1.0:
+            bucket["deep_leash_count"] = int(bucket.get("deep_leash_count", 0)) + 1
+        bucket["last_seen"] = now_iso()
+        data[team_key] = bucket
+        save_json(MANAGER_PULL_LEARNING_FILE, data)
+        return {"manager_pull_learning_key": team_key, "manager_pull_learning_samples": n}
+    except Exception as e:
+        return {"manager_pull_learning_error": str(e)[:160]}
+
+def parse_manual_slate_text_to_dataframe(raw_text):
+    """Parse the user's pasted slate format into a manual grading dataframe.
+
+    Accepts lines like:
+    • Gerrit Cole — U 5.5 — 4.83 K — IP 4.35❌6-IP6.0
+    """
+    import re
+    rows = []
+    if not raw_text:
+        return pd.DataFrame()
+    for raw in str(raw_text).splitlines():
+        line = raw.strip()
+        if not line or "•" not in line or not any(x in line for x in ["✅", "❌"]):
+            continue
+        try:
+            clean = line.replace("–", "—")
+            name_part = clean.split("•", 1)[1].split("—", 1)[0].strip()
+            if not name_part:
+                continue
+            result_part = clean.split("✅", 1)[1] if "✅" in clean else clean.split("❌", 1)[1]
+            mk = re.search(r"(-?\d+(?:\.\d+)?)", result_part)
+            if not mk:
+                continue
+            actual_k = safe_float(mk.group(1), None)
+            ip_val = None
+            mip = re.search(r"IP\s*([0-9]+(?:\.[0-9]+)?)", result_part, re.IGNORECASE)
+            if mip:
+                ip_val = _parse_manual_ip(mip.group(1))
+            side = None
+            line_val = None
+            ms = re.search(r"—\s*([OU])\s*([0-9]+(?:\.[0-9]+)?)", clean, re.IGNORECASE)
+            if ms:
+                side = "OVER" if ms.group(1).upper() == "O" else "UNDER"
+                line_val = safe_float(ms.group(2), None)
+            rr = {"Pitcher": name_part, "Actual K": actual_k}
+            if ip_val is not None:
+                rr["Actual IP"] = ip_val
+            if line_val is not None:
+                rr["Line"] = line_val
+            if side:
+                rr["Pick"] = side
+            rows.append(rr)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
 def grade_finished_games():
     picks = load_json(PICK_LOG, [])
     results = load_json(RESULT_LOG, [])
-    result_ids = set([r.get("pick_id") for r in results])
+    result_ids = set([_grade_result_key(r) for r in results])
     graded = 0
     for p in picks:
         if p.get("graded"):
@@ -8505,9 +8748,15 @@ def grade_finished_games():
         except Exception as _e:
             p["volume_miss_label"] = p.get("volume_miss_label") or "UNCLASSIFIED"
             p["volume_learning_detail"] = str(_e)[:120]
-        if p.get("pick_id") not in result_ids:
+        try:
+            _mgr_info = update_manager_pull_learning_after_grade(p)
+            p.update(_mgr_info)
+        except Exception as _e:
+            p["manager_pull_learning_error"] = str(_e)[:120]
+        grade_key = _grade_result_key(p)
+        if grade_key not in result_ids:
             results.append(dict(p))
-            result_ids.add(p.get("pick_id"))
+            result_ids.add(grade_key)
         graded += 1
     save_json(PICK_LOG, picks[-10000:])
     save_json(RESULT_LOG, results[-10000:])
@@ -8530,6 +8779,10 @@ def grade_finished_games_with_diagnostics():
     graded = grade_finished_games()
 
     after_results = load_json(RESULT_LOG, [])
+    try:
+        st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(after_results))
+    except Exception:
+        pass
     return {
         "graded": graded,
         "saved_snapshots": total_saved,
@@ -8540,6 +8793,7 @@ def grade_finished_games_with_diagnostics():
         "results_after": len(after_results),
         "pick_log_path": PICK_LOG,
         "result_log_path": RESULT_LOG,
+        "learning_lab_rows": len(after_results),
     }
 
 
@@ -8561,6 +8815,8 @@ def _manual_result_colmap(df):
         "actual_er": ["actual_er", "er", "earned_runs", "actual_earned_runs"],
         "actual_hits": ["actual_hits", "hits", "h"],
         "actual_bb": ["actual_bb", "bb", "walks", "base_on_balls"],
+        "actual_pitches": ["actual_pitches", "pitches", "pitch_count", "actual_pitch_count"],
+        "actual_hr": ["actual_hr", "hr", "home_runs", "home_runs_allowed", "actual_home_runs"],
         "date": ["date", "game_date"],
         "line": ["line", "k_line", "ud_line", "prop_line"],
         "pick_side": ["pick", "side", "pick_side", "decision"],
@@ -8642,7 +8898,7 @@ def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False)
 
     picks = load_json(PICK_LOG, [])
     results = load_json(RESULT_LOG, [])
-    result_ids = set([r.get("pick_id") for r in results])
+    result_ids = set([_grade_result_key(r) for r in results])
 
     for _, row in manual_df.iterrows():
         pitcher = row.get(colmap["pitcher"])
@@ -8681,6 +8937,14 @@ def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False)
             abb = safe_float(row.get(colmap["actual_bb"]))
             if abb is not None:
                 p["actual_bb"] = abb
+        if colmap.get("actual_pitches"):
+            apc = safe_float(row.get(colmap["actual_pitches"]))
+            if apc is not None:
+                p["actual_pitches"] = apc
+        if colmap.get("actual_hr"):
+            ahr = safe_float(row.get(colmap["actual_hr"]))
+            if ahr is not None:
+                p["actual_hr"] = ahr
         # Manual grading metadata.
         p["graded"] = True
         p["graded_at"] = now_iso()
@@ -8721,10 +8985,16 @@ def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False)
         except Exception as _e:
             p["volume_miss_label"] = p.get("volume_miss_label") or "UNCLASSIFIED"
             p["volume_learning_detail"] = str(_e)[:120]
+        try:
+            _mgr_info = update_manager_pull_learning_after_grade(p)
+            p.update(_mgr_info)
+        except Exception as _e:
+            p["manager_pull_learning_error"] = str(_e)[:120]
         picks[idx] = p
-        if p.get("pick_id") not in result_ids:
+        grade_key = _grade_result_key(p)
+        if grade_key not in result_ids:
             results.append(dict(p))
-            result_ids.add(p.get("pick_id"))
+            result_ids.add(grade_key)
         else:
             # Keep RESULT_LOG in sync if overwriting.
             for j, rr in enumerate(results):
@@ -17350,20 +17620,72 @@ def _learning_lab_batting_order(df):
     except Exception:
         return _ll_empty_note("Batting Order Learning")
 
+def _learning_lab_normalize_results_df(df):
+    """Normalize RESULT_LOG rows so Learning Lab and Calibration Audit read the same data."""
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        def first_present(cols):
+            for c in cols:
+                if c in d.columns:
+                    return c
+            return None
+        mappings = {
+            "Pitcher": ["Pitcher", "pitcher", "player"],
+            "Team": ["Team", "team", "actual_team", "pitcher_team"],
+            "Opponent": ["Opponent", "opponent"],
+            "Projection": ["Projection", "projection", "final_projection", "K PROJ", "Median"],
+            "Actual K": ["Actual K", "Actual Ks", "actual", "Result K"],
+            "Projected BF": ["Projected BF", "Exp BF", "expected_bf"],
+            "Actual BF": ["Actual BF", "actual_bf"],
+            "Projected IP": ["Projected IP", "IP Projection", "projected_ip", "IP Floor"],
+            "Actual IP": ["Actual IP", "actual_ip"],
+            "Projected ER": ["Projected ER", "ER Projection", "projected_er"],
+            "Actual ER": ["Actual ER", "actual_er"],
+            "Manager": ["Manager", "manager", "manager_name", "manager_pull_learning_key", "actual_team", "team", "Team"],
+            "Graded Result": ["graded_result", "Graded Result"],
+        }
+        for out_col, candidates in mappings.items():
+            c = first_present(candidates)
+            if c and out_col not in d.columns:
+                d[out_col] = d[c]
+        # Fallback to team bucket only when true manager labels are unavailable.
+        if "Manager" not in d.columns or d["Manager"].isna().all():
+            if "Team" in d.columns:
+                d["Manager"] = d["Team"]
+        # Remove ungraded/non-result rows.
+        if "Actual K" in d.columns:
+            d = d[pd.to_numeric(d["Actual K"], errors="coerce").notna()]
+        # Dedupe for Learning Lab display to prevent refresh duplicates.
+        key_cols = [c for c in ["date", "Pitcher", "Team", "line", "pick_side", "game_pk"] if c in d.columns]
+        if key_cols:
+            d = d.drop_duplicates(subset=key_cols, keep="last")
+        return d
+    except Exception:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
 def _learning_lab_get_history_df():
-    # Safe best-effort: looks for existing app state/history dfs without requiring new storage.
+    # Read the same persistent RESULT_LOG used by Calibration Audit so Learning Lab
+    # does not show WAITING when graded samples already exist.
     try:
         for key in ["graded_df", "graded_history", "learning_history", "after_games_df", "results_df"]:
             if key in st.session_state:
                 val = st.session_state.get(key)
                 if isinstance(val, pd.DataFrame) and not val.empty:
-                    return val
+                    return _learning_lab_normalize_results_df(val)
+        results = load_json(RESULT_LOG, [])
+        if results:
+            df = pd.DataFrame(results)
+            df = _learning_lab_normalize_results_df(df)
+            if not df.empty:
+                return df
         # If existing helper exists, try it.
         for fn in ["load_learning_history", "load_graded_history", "load_results_history"]:
             if fn in globals():
                 val = globals()[fn]()
                 if isinstance(val, pd.DataFrame) and not val.empty:
-                    return val
+                    return _learning_lab_normalize_results_df(val)
     except Exception:
         pass
     return pd.DataFrame()
@@ -23716,7 +24038,8 @@ with tab5:
 
     st.markdown('<div class="section-title-pro">Manual Actual Results Import — Secure Fallback</div>', unsafe_allow_html=True)
     st.caption("Use this if automatic MLB grading returns 0 or if you want to verify outcomes manually. Save the official snapshot before games, then after games paste/upload actual results and grade.")
-    st.code("Pitcher,Actual K,Actual IP,Actual BF,Actual ER\nGerrit Cole,6,6.0,24,2\nMichael Wacha,3,6.0,23,1", language="csv")
+    st.code("Pitcher,Actual K,Actual IP,Actual BF,Actual ER,Actual Hits,Actual BB,Actual Pitches\nGerrit Cole,6,6.0,24,2,5,2,96\nMichael Wacha,3,6.0,23,1,4,1,91", language="csv")
+    st.caption("You can also paste your slate notes exactly like: • Gerrit Cole — U 5.5 — 4.83 K — IP 4.35❌6-IP6.0")
     manual_file = st.file_uploader("Upload manual actual results CSV", type=["csv"], key="manual_actual_results_csv")
     manual_text = st.text_area("Or paste manual actual results CSV here", height=130, key="manual_actual_results_text")
     allow_manual_overwrite = st.checkbox("Allow overwrite of already graded rows", value=False, key="manual_grade_overwrite")
@@ -23726,9 +24049,17 @@ with tab5:
             manual_df = pd.read_csv(manual_file)
         elif manual_text.strip():
             from io import StringIO
-            manual_df = pd.read_csv(StringIO(manual_text.strip()))
+            try:
+                manual_df = pd.read_csv(StringIO(manual_text.strip()))
+            except Exception:
+                manual_df = parse_manual_slate_text_to_dataframe(manual_text.strip())
     except Exception as _manual_parse_e:
-        st.error(f"Manual CSV parse error: {_manual_parse_e}")
+        try:
+            manual_df = parse_manual_slate_text_to_dataframe(manual_text.strip())
+            if manual_df.empty:
+                st.error(f"Manual result parse error: {_manual_parse_e}")
+        except Exception:
+            st.error(f"Manual result parse error: {_manual_parse_e}")
     if not manual_df.empty:
         st.write({"Manual rows detected": len(manual_df), "Columns": list(manual_df.columns)})
         st.dataframe(manual_df.head(25), use_container_width=True, hide_index=True)
@@ -23798,6 +24129,19 @@ with tab5:
                 vol_rows.append(rr)
             st.dataframe(pd.DataFrame(vol_rows).sort_values("count", ascending=False), use_container_width=True, hide_index=True)
 
+        st.markdown('<div class="section-title-pro">Manager Pull Learning</div>', unsafe_allow_html=True)
+        mgr_data = load_json(MANAGER_PULL_LEARNING_FILE, {})
+        if mgr_data:
+            mgr_rows = []
+            for team_key, vals in mgr_data.items():
+                rr = {"Team/Manager Bucket": team_key}
+                if isinstance(vals, dict):
+                    rr.update(vals)
+                mgr_rows.append(rr)
+            st.dataframe(pd.DataFrame(mgr_rows).sort_values("samples", ascending=False), use_container_width=True, hide_index=True)
+        else:
+            st.info("Manager pull learning is collection-only until graded outcomes are added.")
+
         st.markdown('<div class="section-title-pro">K Miss Reason Learning</div>', unsafe_allow_html=True)
         miss_data = load_json(MISS_REASON_FILE, {})
         if miss_data:
@@ -23828,6 +24172,8 @@ with tab6:
     st.code(LONG_BACKTEST_FILE)
     st.write("Volume Miss Learning File:")
     st.code(VOLUME_MISS_LEARNING_FILE)
+    st.write("Manager Pull Learning File:")
+    st.code(MANAGER_PULL_LEARNING_FILE)
     st.subheader("Advanced Model Status")
     xgb_train_df = build_xgb_training_frame()
     st.write(f"XGBoost training samples available: {len(xgb_train_df)} / {XGB_MIN_GRADED_SAMPLES} needed")
