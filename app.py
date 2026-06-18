@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
+# ONE WAY PICKZ
+
+PITCHER STRIKEOUT ENGINE — ONE FILE — v11.9
 # MERGED: TRUE CALIBRATION + MANAGER HOOK + DENSITY ALTITUDE
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
@@ -9463,7 +9465,9 @@ def render_calibration_audit_tab():
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.17 SAFETY GATES + PASS DIRECTION</div>
+  <div class="big-title">🔥 ONE WAY PICKZ
+
+PITCHER STRIKEOUT ENGINE v11.17 VERIFIED LEARNING BUILD</div>
   <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
@@ -23791,10 +23795,9 @@ def render_pitcher_fs_tab(board=None):
     except Exception:
         pass
 
-tab_kproj, tab_pitcher_fs, tab_research_hub, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
-    "🔎 RESEARCH HUB",
     "MONEYLINE EDGE",
     "🧠 BASEBALL IQ",
     "🧠 30D LEARNING IQ",
@@ -23812,9 +23815,6 @@ with tab_kproj:
 
 with tab_pitcher_fs:
     render_pitcher_fs_tab(board)
-
-with tab_research_hub:
-    render_research_hub_tab(board)
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
