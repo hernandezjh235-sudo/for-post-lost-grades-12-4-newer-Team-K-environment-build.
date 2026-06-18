@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# ONE WAY PICKZ | PITCHER STRIKEOUT ENGINE | v11.17 VERIFIED LEARNING BUILD
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
 # MERGED: TRUE CALIBRATION + MANAGER HOOK + DENSITY ALTITUDE
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
