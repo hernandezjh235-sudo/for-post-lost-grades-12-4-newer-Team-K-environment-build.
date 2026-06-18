@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# ONE WAY PICKZ
-
-PITCHER STRIKEOUT ENGINE — ONE FILE — v11.9
+# ONE WAY PICKZ | PITCHER STRIKEOUT ENGINE | v11.17 VERIFIED LEARNING BUILD
 # MERGED: TRUE CALIBRATION + MANAGER HOOK + DENSITY ALTITUDE
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
@@ -9465,9 +9463,7 @@ def render_calibration_audit_tab():
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 ONE WAY PICKZ
-
-PITCHER STRIKEOUT ENGINE v11.17 VERIFIED LEARNING BUILD</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.17 SAFETY GATES + PASS DIRECTION</div>
   <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
