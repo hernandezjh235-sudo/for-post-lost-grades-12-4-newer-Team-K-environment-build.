@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE + FANTASY SCORE + ML"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION"
 
 try:
     import pytz
@@ -8648,6 +8648,119 @@ def update_manager_pull_learning_after_grade(pick):
         return {"manager_pull_learning_key": team_key, "manager_pull_learning_samples": n}
     except Exception as e:
         return {"manager_pull_learning_error": str(e)[:160]}
+
+
+def rebuild_manager_pull_learning_from_results_v11_21(results=None, merge_existing=True):
+    """Backfill active manager/team pull learning from graded RESULT_LOG rows.
+
+    This lets Manager Pull Learning populate from the same graded history already
+    used by Calibration Audit and Learning Lab. It is audit-only; it does not
+    change projections.
+    """
+    try:
+        if results is None:
+            results = load_json(RESULT_LOG, [])
+        data = load_json(MANAGER_PULL_LEARNING_FILE, {}) if merge_existing else {}
+        if not isinstance(data, dict):
+            data = {}
+        updated = 0
+        for row in results or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("graded_result") or "").upper() not in ["WIN", "LOSS"]:
+                continue
+            # Need at least one real pull/workload field.
+            if safe_float(row.get("actual_ip"), None) is None and safe_float(row.get("actual_bf"), None) is None:
+                continue
+            key = str(manager_learning_key_from_pick_v11_20(row))
+            if not key or key.upper() == "UNKNOWN":
+                key = str(row.get("actual_team") or row.get("team") or row.get("Team") or "UNKNOWN")
+            if not key or key.upper() == "UNKNOWN":
+                continue
+
+            rec = data.get(key, {
+                "samples": 0, "avg_actual_ip": 0.0, "avg_actual_bf": 0.0,
+                "avg_actual_pitches": 0.0, "avg_er_at_pull": 0.0,
+                "avg_hits_at_pull": 0.0, "avg_bb_at_pull": 0.0, "avg_hr_at_pull": 0.0,
+                "early_pull_count": 0, "deep_leash_count": 0,
+                "source": "RESULT_LOG_BACKFILL"
+            })
+            seen_keys = set(rec.get("_seen_grade_keys", []))
+            gkey = _grade_result_key(row)
+            if gkey in seen_keys:
+                continue
+            old_n = int(rec.get("samples", 0))
+            n = old_n + 1
+
+            def avg(old, val):
+                old = safe_float(old, 0.0) or 0.0
+                val = safe_float(val, None)
+                if val is None:
+                    return old
+                return round(old + (val - old) / max(n, 1), 3)
+
+            actual_ip = safe_float(row.get("actual_ip"), None)
+            projected_ip = safe_float(row.get("projected_ip") or row.get("Projected IP") or row.get("IP Projection"), None)
+
+            rec["samples"] = n
+            rec["manager_learning_key"] = key
+            rec["team"] = row.get("actual_team") or row.get("team") or row.get("Team")
+            rec["team_id"] = row.get("actual_team_id") or row.get("team_id")
+            rec["manager_name"] = row.get("manager_name") if not str(key).startswith("TEAM:") else rec.get("manager_name")
+            rec["avg_actual_ip"] = avg(rec.get("avg_actual_ip"), actual_ip)
+            rec["avg_actual_bf"] = avg(rec.get("avg_actual_bf"), row.get("actual_bf"))
+            rec["avg_actual_pitches"] = avg(rec.get("avg_actual_pitches"), row.get("actual_pitches"))
+            rec["avg_er_at_pull"] = avg(rec.get("avg_er_at_pull"), row.get("actual_er"))
+            rec["avg_hits_at_pull"] = avg(rec.get("avg_hits_at_pull"), row.get("actual_hits"))
+            rec["avg_bb_at_pull"] = avg(rec.get("avg_bb_at_pull"), row.get("actual_bb"))
+            rec["avg_hr_at_pull"] = avg(rec.get("avg_hr_at_pull"), row.get("actual_hr"))
+            if actual_ip is not None and projected_ip is not None and actual_ip <= projected_ip - 1.0:
+                rec["early_pull_count"] = int(rec.get("early_pull_count", 0)) + 1
+            if actual_ip is not None and projected_ip is not None and actual_ip >= projected_ip + 1.0:
+                rec["deep_leash_count"] = int(rec.get("deep_leash_count", 0)) + 1
+            seen_keys.add(gkey)
+            rec["_seen_grade_keys"] = list(seen_keys)[-5000:]
+            rec["last_seen"] = now_iso()
+            data[key] = rec
+            updated += 1
+        if updated:
+            save_json(MANAGER_PULL_LEARNING_FILE, data)
+        return data
+    except Exception:
+        return load_json(MANAGER_PULL_LEARNING_FILE, {})
+
+def build_manager_pull_learning_dashboard_v11_21(results=None):
+    """Return manager pull rows; auto-backfills from RESULT_LOG if needed."""
+    data = rebuild_manager_pull_learning_from_results_v11_21(results=results, merge_existing=True)
+    rows = []
+    for key, vals in (data or {}).items():
+        if not isinstance(vals, dict):
+            continue
+        rr = {"Team/Manager Bucket": key}
+        for k, v in vals.items():
+            if k == "_seen_grade_keys":
+                continue
+            rr[k] = v
+        samples = safe_float(rr.get("samples"), 0) or 0
+        ep = safe_float(rr.get("early_pull_count"), 0) or 0
+        dl = safe_float(rr.get("deep_leash_count"), 0) or 0
+        rr["early_pull_rate"] = round(ep / samples, 3) if samples else 0.0
+        rr["deep_leash_rate"] = round(dl / samples, 3) if samples else 0.0
+        rr["Learning Module"] = "Manager Pull Learning"
+        rr["Status"] = "ACTIVE_AUDIT_ONLY"
+        rows.append(rr)
+    if not rows:
+        return pd.DataFrame([{
+            "Learning Module": "Manager Pull Learning",
+            "Status": "NEEDS_GRADED_WORKLOAD_FIELDS",
+            "Meaning": "Graded rows loaded, but actual IP/BF/pitches fields are needed for manager pull learning.",
+            "Safe": "YES — no projections or picks changed",
+        }])
+    df = pd.DataFrame(rows)
+    if "samples" in df.columns:
+        df = df.sort_values("samples", ascending=False)
+    return df
+
 
 def parse_manual_slate_text_to_dataframe(raw_text):
     """Parse the user's pasted slate format into a manual grading dataframe.
@@ -17564,61 +17677,117 @@ def _learning_lab_manager_bias(df):
         return _ll_empty_note("Manager Bias Learning")
 
 def _learning_lab_run_suppression(df):
+    """Run-damage / run-suppression audit.
+
+    Fully connected for V1 pitcher-only grading:
+    - If projected ER exists, show projected ER bias.
+    - If older rows only have actual ER/H/BB/HR, still show actual run-damage buckets.
+    This is audit-only and does not change K projections.
+    """
     try:
         if df is None or df.empty:
             return _ll_empty_note("Run Suppression Learning")
         group = _ll_col(df, ["Pitcher", "Team", "team", "Opponent"])
-        proj_er = _ll_col(df, ["ER Projection", "Projected ER", "ER Proj"])
-        actual_er = _ll_col(df, ["Actual ER", "ER Actual", "Earned Runs"])
-        if not group or not proj_er or not actual_er:
+        proj_er = _ll_col(df, ["ER Projection", "Projected ER", "ER Proj", "Projected ER Allowed", "projected_er"])
+        actual_er = _ll_col(df, ["Actual ER", "ER Actual", "Earned Runs", "actual_er"])
+        actual_h = _ll_col(df, ["Actual Hits", "Hits Allowed", "Actual H", "actual_hits"])
+        actual_bb = _ll_col(df, ["Actual BB", "Walks Allowed", "Actual Walks", "actual_bb"])
+        actual_hr = _ll_col(df, ["Actual HR", "HR Allowed", "actual_hr"])
+        actual_ip = _ll_col(df, ["Actual IP", "actual_ip", "IP Actual"])
+
+        if not group:
             return _ll_empty_note("Run Suppression Learning")
+
         d = df.copy()
-        d["ER Error"] = pd.to_numeric(d[proj_er], errors="coerce") - pd.to_numeric(d[actual_er], errors="coerce")
-        out = d.groupby(group).agg(
-            Rows=("ER Error", "count"),
-            Avg_ER_Bias=("ER Error", "mean"),
-            Abs_ER_Error=("ER Error", lambda s: s.abs().mean())
-        ).reset_index()
+
+        if actual_er:
+            d["Actual ER Num"] = pd.to_numeric(d[actual_er], errors="coerce")
+        else:
+            d["Actual ER Num"] = np.nan
+        if actual_h:
+            d["Actual H Num"] = pd.to_numeric(d[actual_h], errors="coerce")
+        else:
+            d["Actual H Num"] = np.nan
+        if actual_bb:
+            d["Actual BB Num"] = pd.to_numeric(d[actual_bb], errors="coerce")
+        else:
+            d["Actual BB Num"] = np.nan
+        if actual_hr:
+            d["Actual HR Num"] = pd.to_numeric(d[actual_hr], errors="coerce")
+        else:
+            d["Actual HR Num"] = np.nan
+        if actual_ip:
+            d["Actual IP Num"] = pd.to_numeric(d[actual_ip], errors="coerce")
+        else:
+            d["Actual IP Num"] = np.nan
+
+        # If projected ER exists, this is a true bias audit.
+        if proj_er and actual_er:
+            d["Projected ER Num"] = pd.to_numeric(d[proj_er], errors="coerce")
+            d["ER Error"] = d["Projected ER Num"] - d["Actual ER Num"]
+            out = d.groupby(group).agg(
+                Rows=("ER Error", "count"),
+                Avg_ER_Bias=("ER Error", "mean"),
+                Abs_ER_Error=("ER Error", lambda s: s.abs().mean()),
+                Avg_Actual_ER=("Actual ER Num", "mean"),
+                Avg_Actual_H=("Actual H Num", "mean"),
+                Avg_Actual_BB=("Actual BB Num", "mean"),
+                Avg_Actual_HR=("Actual HR Num", "mean"),
+            ).reset_index()
+            out["Learning Mode"] = "PROJECTED_ER_BIAS"
+            out["Suggested Use"] = "Audit whether Pitcher FS over/under-projects earned runs."
+        else:
+            # Older snapshots may not have projected ER. Still learn actual run-damage profile.
+            if d[["Actual ER Num", "Actual H Num", "Actual BB Num", "Actual HR Num"]].dropna(how="all").empty:
+                out = _ll_empty_note("Run Suppression Learning")
+                out["Status"] = "NEEDS_ACTUAL_RUN_DAMAGE_FIELDS"
+                out["Meaning"] = "Rows loaded, but no Actual ER/H/BB/HR fields are available yet. Future grading will populate this."
+                return out
+            d["Run Damage Score"] = (
+                d["Actual ER Num"].fillna(0) * 12.0 +
+                d["Actual H Num"].fillna(0) * 2.0 +
+                d["Actual BB Num"].fillna(0) * 3.0 +
+                d["Actual HR Num"].fillna(0) * 8.0
+            ).clip(0, 100)
+            out = d.groupby(group).agg(
+                Rows=("Run Damage Score", "count"),
+                Avg_Run_Damage_Score=("Run Damage Score", "mean"),
+                Avg_Actual_ER=("Actual ER Num", "mean"),
+                Avg_Actual_H=("Actual H Num", "mean"),
+                Avg_Actual_BB=("Actual BB Num", "mean"),
+                Avg_Actual_HR=("Actual HR Num", "mean"),
+                Avg_Actual_IP=("Actual IP Num", "mean"),
+            ).reset_index()
+            out["Learning Mode"] = "ACTUAL_RUN_DAMAGE_PROFILE"
+            out["Suggested Use"] = "Audit-only run-damage profile for Pitcher FS and leash review."
+
+        for c in out.columns:
+            if c not in [group, "Learning Mode", "Suggested Use", "Learning Module", "Version"]:
+                try:
+                    out[c] = pd.to_numeric(out[c], errors="ignore")
+                    if pd.api.types.is_numeric_dtype(out[c]):
+                        out[c] = out[c].round(3)
+                except Exception:
+                    pass
         out["Learning Module"] = "Run Suppression Learning"
-        out["Suggested Use"] = "Audit whether Pitcher FS over/under-projects earned runs."
         out["Version"] = LEARNING_LAB_VERSION
-        return out.sort_values(["Rows", "Abs_ER_Error"], ascending=[False, False])
+        return out.sort_values(["Rows"], ascending=False)
     except Exception:
         return _ll_empty_note("Run Suppression Learning")
 
 def _learning_lab_batting_order(df):
-    try:
-        if df is None or df.empty:
-            return _ll_empty_note("Batting Order Learning")
-        player = _ll_col(df, ["Player", "Batter", "Name"])
-        expected_slot = _ll_col(df, ["Expected Slot", "Projected Slot", "Lineup Slot"])
-        actual_slot = _ll_col(df, ["Actual Slot", "Confirmed Slot"])
-        proj_fs = _ll_col(df, ["FS Projection", "Projected FS"])
-        actual_fs = _ll_col(df, ["Actual FS", "Fantasy Actual", "Actual Fantasy"])
-        if not player or not expected_slot or not actual_slot:
-            return _ll_empty_note("Batting Order Learning")
-        d = df.copy()
-        d["Slot Error"] = pd.to_numeric(d[expected_slot], errors="coerce") - pd.to_numeric(d[actual_slot], errors="coerce")
-        if proj_fs and actual_fs:
-            d["FS Error"] = pd.to_numeric(d[proj_fs], errors="coerce") - pd.to_numeric(d[actual_fs], errors="coerce")
-            out = d.groupby(player).agg(
-                Rows=("Slot Error", "count"),
-                Avg_Slot_Bias=("Slot Error", "mean"),
-                Abs_Slot_Error=("Slot Error", lambda s: s.abs().mean()),
-                Avg_FS_Bias=("FS Error", "mean")
-            ).reset_index()
-        else:
-            out = d.groupby(player).agg(
-                Rows=("Slot Error", "count"),
-                Avg_Slot_Bias=("Slot Error", "mean"),
-                Abs_Slot_Error=("Slot Error", lambda s: s.abs().mean())
-            ).reset_index()
-        out["Learning Module"] = "Batting Order Learning"
-        out["Suggested Use"] = "Find players/teams whose projected batting slot is often wrong."
-        out["Version"] = LEARNING_LAB_VERSION
-        return out.sort_values(["Rows", "Abs_Slot_Error"], ascending=[False, False])
-    except Exception:
-        return _ll_empty_note("Batting Order Learning")
+    """V1 is pitcher-only. Batting order learning belongs in V3 batter app.
+
+    Returning an explicit inactive note avoids confusing WAITING_FOR_GRADED_RESULTS
+    when the pitcher strikeout engine is correctly loading graded K history.
+    """
+    return pd.DataFrame([{
+        "Learning Module": "Batting Order Learning",
+        "Status": "INACTIVE_FOR_V1_PITCHER_ENGINE",
+        "Meaning": "This V1 app grades pitcher K props. Batting-order learning belongs in the V3 batter app.",
+        "Safe": "YES — no projections or picks changed",
+        "Version": LEARNING_LAB_VERSION,
+    }])
 
 def _learning_lab_normalize_results_df(df):
     """Normalize RESULT_LOG rows so Learning Lab and Calibration Audit read the same data."""
@@ -17643,6 +17812,9 @@ def _learning_lab_normalize_results_df(df):
             "Actual IP": ["Actual IP", "actual_ip"],
             "Projected ER": ["Projected ER", "ER Projection", "projected_er"],
             "Actual ER": ["Actual ER", "actual_er"],
+            "Actual Hits": ["Actual Hits", "actual_hits", "hits_allowed", "Hits Allowed"],
+            "Actual BB": ["Actual BB", "actual_bb", "walks_allowed", "Walks Allowed"],
+            "Actual HR": ["Actual HR", "actual_hr", "hr_allowed", "HR Allowed"],
             "Manager": ["Manager", "manager", "manager_name", "manager_pull_learning_key", "actual_team", "team", "Team"],
             "Graded Result": ["graded_result", "Graded Result"],
         }
@@ -24126,17 +24298,8 @@ with tab5:
             st.dataframe(pd.DataFrame(vol_rows).sort_values("count", ascending=False), use_container_width=True, hide_index=True)
 
         st.markdown('<div class="section-title-pro">Manager Pull Learning</div>', unsafe_allow_html=True)
-        mgr_data = load_json(MANAGER_PULL_LEARNING_FILE, {})
-        if mgr_data:
-            mgr_rows = []
-            for team_key, vals in mgr_data.items():
-                rr = {"Team/Manager Bucket": team_key}
-                if isinstance(vals, dict):
-                    rr.update(vals)
-                mgr_rows.append(rr)
-            st.dataframe(pd.DataFrame(mgr_rows).sort_values("samples", ascending=False), use_container_width=True, hide_index=True)
-        else:
-            st.info("Manager pull learning is collection-only until graded outcomes are added.")
+        mgr_df = build_manager_pull_learning_dashboard_v11_21(results)
+        st.dataframe(mgr_df, use_container_width=True, hide_index=True)
 
         st.markdown('<div class="section-title-pro">K Miss Reason Learning</div>', unsafe_allow_html=True)
         miss_data = load_json(MISS_REASON_FILE, {})
