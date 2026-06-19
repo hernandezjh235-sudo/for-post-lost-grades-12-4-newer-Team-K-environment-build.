@@ -14,6 +14,7 @@ import difflib
 import io
 import unicodedata
 import html
+import hashlib
 import requests
 import numpy as np
 import pandas as pd
@@ -21,7 +22,30 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD FINAL FIX"
+# =========================
+# STABLE PROJECTION SEEDING
+# =========================
+STABLE_PROJECTION_SEED_VERSION = "STABLE_SIM_SEED_2026_06_19"
+
+def stable_projection_seed(*parts):
+    """Create deterministic simulation seed from stable projection inputs.
+
+    Same pitcher/model inputs = same simulated projection on refresh.
+    Inputs changing (lineup, line, pitcher stats, BF, learning data) can still
+    change the projection normally.
+    """
+    try:
+        raw = "|".join([str(p) for p in parts])
+        digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
+        return int(digest[:8], 16)
+    except Exception:
+        return 20260619
+
+def stable_rng(*parts):
+    return np.random.default_rng(stable_projection_seed(*parts))
+
+
 
 try:
     import pytz
@@ -5166,7 +5190,18 @@ def simulate_matchup(pitcher_k, batter_rates, park=1.0, ump=1.0, sims=12000):
         k = calculate_log5_k_rate(pitcher_k, br)
         k *= park * ump * tto_decay_factor(idx)
         rates.append(clamp(k, 0.03, 0.60))
-    out = np.random.binomial(1, np.array(rates), size=(sims, len(rates))).sum(axis=1)
+
+    # Stable simulation: same inputs produce same output on refresh.
+    rng = stable_rng(
+        "simulate_matchup",
+        round(float(pitcher_k or 0), 6),
+        [round(float(x or 0), 6) for x in rates],
+        round(float(park or 1.0), 6),
+        round(float(ump or 1.0), 6),
+        int(sims),
+        STABLE_PROJECTION_SEED_VERSION,
+    )
+    out = rng.binomial(1, np.array(rates), size=(sims, len(rates))).sum(axis=1)
     return out, rates
 
 
@@ -5224,16 +5259,33 @@ def simulate_bayesian_markov_matchup(pitcher_k, batter_rates, expected_bf, park=
     rates_arr = np.array(base_rates, dtype=float)
     n_rates = len(rates_arr)
 
+    # Stable simulation: variance remains, but refreshes do not create new random projections.
+    rng = stable_rng(
+        "simulate_bayesian_markov_matchup",
+        round(float(pitcher_k or 0), 6),
+        [round(float(x or 0), 6) for x in base_rates],
+        round(float(expected_bf or 0), 6),
+        round(float(park or 1.0), 6),
+        round(float(ump or 1.0), 6),
+        round(float(data_score or 0), 4),
+        bool(lineup_locked),
+        bool(pitcher_confirmed),
+        str((leash or {}).get("leash_risk", "")),
+        round(float((leash or {}).get("ppb", 0) or 0), 4),
+        int(sims),
+        STABLE_PROJECTION_SEED_VERSION,
+    )
+
     for i in range(int(sims)):
-        sampled_bf = int(round(np.random.normal(expected_bf, bf_sd)))
+        sampled_bf = int(round(rng.normal(expected_bf, bf_sd)))
         sampled_bf = int(clamp(sampled_bf, 12, 34))
-        k_mult = float(np.random.normal(1.0, mult_sd))
+        k_mult = float(rng.normal(1.0, mult_sd))
         k_mult = clamp(k_mult, 0.72, 1.28)
         idx = np.arange(sampled_bf) % n_rates
         probs = np.clip(rates_arr[idx] * k_mult, 0.02, 0.68)
-        results[i] = np.random.binomial(1, probs).sum()
+        results[i] = rng.binomial(1, probs).sum()
 
-    note = f"Bayesian Markov MC: sims={int(sims)}, BF μ={expected_bf:.1f}, BF σ={bf_sd:.2f}, K σ={proj_std:.2f}"
+    note = f"Bayesian Markov MC: sims={int(sims)}, BF μ={expected_bf:.1f}, BF σ={bf_sd:.2f}, K σ={proj_std:.2f}, seed=stable"
     return results, base_rates, note
 
 
@@ -9184,6 +9236,49 @@ def render_kpis(picks, bankroll):
         </div>
         """, unsafe_allow_html=True)
 
+
+def official_card_k_projection(p):
+    """Display-only official K projection for player cards.
+
+    Priority:
+    1) Existing final/line-aware projection fields if already attached to row
+    2) K Upside final decision projection from kproj_decision/kproj_upside_projection
+    3) Raw projection fallback
+
+    This fixes card/board mismatch without changing the model, picks, saves, or grading.
+    """
+    try:
+        for c in [
+            "Line-Aware Smart Final K Projection",
+            "WRS Final K Projection",
+            "TPS Final K Projection",
+            "TPC True K Projection",
+            "Final K Projection",
+            "K PROJ",
+        ]:
+            if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
+                v = safe_float(p.get(c), None)
+                if v is not None:
+                    return round(float(v), 2), c
+        try:
+            d = kproj_decision(p)
+            v = safe_float(d.get("projection"), None)
+            if v is not None:
+                return round(float(v), 2), "K Upside Final"
+        except Exception:
+            pass
+        try:
+            v = safe_float(kproj_upside_projection(p), None)
+            if v is not None:
+                return round(float(v), 2), "K Upside Final"
+        except Exception:
+            pass
+        v = safe_float(p.get("projection"), None) if isinstance(p, dict) else None
+        return (round(float(v), 2), "Raw Projection") if v is not None else ("—", "Unavailable")
+    except Exception:
+        return (p.get("projection", "—") if isinstance(p, dict) else "—", "Fallback")
+
+
 def render_pick_card(p):
     prob = p.get("fair_probability")
     prob_pct = int(round(prob * 100)) if prob is not None else 0
@@ -9200,6 +9295,7 @@ def render_pick_card(p):
     edge_display = p.get("edge_ks") if p.get("edge_ks") is not None else "—"
     ev_display = f"{(p.get('ev') or 0)*100:.2f}%" if p.get("ev") is not None else "—"
     prob_display = f"{prob_pct}%" if prob is not None else "—"
+    card_k_projection, card_k_projection_source = official_card_k_projection(p)
     # Render-safe Last 10 K bars.
     # NOTE: this avoids standalone raw HTML ever being printed by Streamlit/tunnel caching.
     # The full card below is still rendered with unsafe_allow_html=True.
@@ -9232,7 +9328,7 @@ def render_pick_card(p):
           <span class="badge good-badge">{p.get('projection_source')}</span>
           <span class="badge">Lineup: {p.get('lineup_status')}</span>
         </div>
-        <div><div class="small-muted">Projection</div><div class="big-number {color_class}">{p.get('projection')}</div><div class="small-muted">BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
+        <div><div class="small-muted">Final K Projection</div><div class="big-number {color_class}">{card_k_projection}</div><div class="small-muted">{card_k_projection_source} | BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge: {edge_display} K</div></div>
         <div>
           <div class="small-muted">Model Side</div><div class="big-number {color_class}">{p.get('pick_side')}</div>
@@ -10933,6 +11029,13 @@ def render_kproj_pitcher_card(p):
     except Exception:
         pass
     dist_display = f"F {dist.get('floor')} | M {dist.get('median')} | C {dist.get('ceiling')}"
+    card_k_projection, card_k_projection_source = official_card_k_projection(p)
+    # K PROJ card should display the same final projection source as the board/card.
+    if card_k_projection != "—":
+        try:
+            d["projection"] = card_k_projection
+        except Exception:
+            pass
     edge_display = d.get("edge_display", "—")
     edge_class = d.get("edge_class", "yellow-badge")
     needs_display = "—" if d.get("over_needed") is None else f"{d.get('over_needed')}+"
@@ -10967,7 +11070,7 @@ def render_kproj_pitcher_card(p):
           <span class="badge {lineup_badge}">Lineup: {p.get('lineup_status')}</span>
           <span class="badge">K Upside: {p.get('elite_upside_score', 0)}/100</span>
         </div>
-        <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
+        <div><div class="small-muted">Final K Projection</div><div class="big-number green">{d['projection']}</div><div class="small-muted">{card_k_projection_source} | BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
         <div><div class="small-muted">Edge</div><div class="big-number green">{edge_display}</div><div class="small-muted">Under wins {under_max_display}</div></div>
         <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
