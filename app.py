@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ + OFFICIAL SIDE SYNC + PRE-RENDER DECISION FIX"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ + OFFICIAL SIDE SYNC"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -24177,124 +24177,6 @@ def render_pitcher_fs_tab(board=None):
         _render_fs_cards(df, kind="pitcher")
     except Exception:
         pass
-
-
-
-# =========================
-# PRE-RENDER OFFICIAL SIDE / DECISION SYNC FIX
-# Version: OFFICIAL_SIDE_SYNC_PRE_RENDER_2026_06_19
-# IMPORTANT:
-# - Display/label sync only
-# - Does NOT change projection formulas
-# - Does NOT change K PROJ math
-# - Makes Decision / Main Engine Action / Final K Decision agree with K PROJ vs UD/Line
-# =========================
-OFFICIAL_SIDE_SYNC_PRE_RENDER_VERSION = "OFFICIAL_SIDE_SYNC_PRE_RENDER_2026_06_19"
-
-def _pre_ows_num(x, default=None):
-    try:
-        if x is None or x == "":
-            return default
-        if isinstance(x, str):
-            xs = x.strip().upper()
-            if xs in {"NO LINE", "NO_UD_LINE", "WAITING_FOR_UD_LINE", "N/A", "—"}:
-                return default
-            x = x.replace("%", "").replace("+", "").strip()
-        v = float(x)
-        if pd.isna(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-def _pre_ows_side_from_edge(edge):
-    if edge is None:
-        return "NO_LINE"
-    if edge > 0:
-        return "OVER"
-    if edge < 0:
-        return "UNDER"
-    return "PUSH"
-
-def _pre_ows_decision_from_edge(edge):
-    if edge is None:
-        return "NO_UD_LINE"
-    side = _pre_ows_side_from_edge(edge)
-    ae = abs(float(edge))
-    if side == "PUSH":
-        return "🚫 PASS — NO EDGE"
-    if ae >= 1.25:
-        return f"🔥 {side}"
-    if ae >= 0.65:
-        return f"⚠️ {side} LEAN"
-    return f"🚫 PASS — {side} THIN EDGE"
-
-def _pre_sync_official_k_side_columns(df):
-    """Force final DISPLAY direction to match the final displayed K PROJ vs line.
-
-    This fixes cases like K PROJ 5.07 / line 4.5 still showing UNDER.
-    It only rewrites side/decision/edge display columns after all math layers finish.
-    """
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return df
-        d = df.copy()
-        if "K PROJ" not in d.columns or "UD/Line" not in d.columns:
-            return d
-
-        official_proj, official_edge, official_side, official_decision = [], [], [], []
-        for _, row in d.iterrows():
-            k = _pre_ows_num(row.get("K PROJ"), None)
-            line = _pre_ows_num(row.get("UD/Line"), None)
-            line_source = str(row.get("Line Source") or "").upper()
-            ud_raw = str(row.get("UD/Line") or "").upper()
-
-            if k is None or line is None or "NO LINE" in ud_raw or "NO_UD" in line_source:
-                official_proj.append(k if k is not None else row.get("K PROJ"))
-                official_edge.append("")
-                official_side.append("NO_LINE")
-                official_decision.append("NO_UD_LINE")
-                continue
-
-            edge = round(float(k) - float(line), 2)
-            side = _pre_ows_side_from_edge(edge)
-            dec = _pre_ows_decision_from_edge(edge)
-            official_proj.append(round(float(k), 2))
-            official_edge.append(edge)
-            official_side.append(side)
-            official_decision.append(dec)
-
-        # Official display columns mirror final K PROJ exactly.
-        d["Official K PROJ"] = official_proj
-        d["Official K Edge"] = official_edge
-        d["Official K Side"] = official_side
-        d["Official K Decision Synced"] = official_decision
-        d["Official Side Sync Version"] = OFFICIAL_SIDE_SYNC_PRE_RENDER_VERSION
-
-        # Sync the display/action columns read by the slate, player cards, IQ, and export.
-        for col in ["Edge Gap", "Final K Edge", "Line-Aware Smart Edge"]:
-            if col in d.columns:
-                d[col] = d["Official K Edge"]
-        if "Model Lean" in d.columns:
-            d["Model Lean"] = d["Official K Side"].replace({"NO_LINE": "NO_LINE", "PUSH": "PASS"})
-        for col in [
-            "Decision", "Main Engine Action", "Final K Decision", "Final Main Engine Action",
-            "Line-Aware Smart Decision"
-        ]:
-            if col in d.columns:
-                d[col] = d["Official K Decision Synced"]
-        return d
-    except Exception:
-        return df
-
-if "build_kproj_table" in globals():
-    _prev_pre_render_official_side_sync_build_kproj_table = build_kproj_table
-    def build_kproj_table(board):
-        df = _prev_pre_render_official_side_sync_build_kproj_table(board)
-        try:
-            return _pre_sync_official_k_side_columns(df)
-        except Exception:
-            return df
 
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
