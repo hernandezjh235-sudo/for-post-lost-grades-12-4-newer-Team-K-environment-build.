@@ -11319,7 +11319,7 @@ def _owp_final_pick_symbol(decision, edge=None):
     """UI-only: convert final Line-Aware decision to O/U with confidence icon."""
     s = str(decision or "").upper()
     ev = safe_float(edge, None)
-    # No-line/pass stays out of slip unless user wants notes.
+    # No-line/pass stays out of best-picks slate unless explicitly converted by the all-projections slate.
     if "NO LINE" in s or "NO_UD_LINE" in s:
         return "NO LINE"
     if "PASS" in s:
@@ -11338,7 +11338,50 @@ def _owp_final_pick_symbol(decision, edge=None):
     return base
 
 
-def build_copy_paste_k_slate(df, show_pass_notes=False):
+def _owp_all_projection_symbol(decision, final_projection, line, edge=None):
+    """UI-only O/U fallback for the All Players slate.
+
+    Priority:
+    1) Respect Line-Aware Smart Decision when it says OVER/UNDER.
+    2) For PASS / THIN EDGE / unclear decisions, force O/U from final Line-Aware projection vs UD line.
+
+    This does not change model math, player cards, saved projections, refresh logic, or any board columns.
+    """
+    s = str(decision or "").upper()
+    ev = safe_float(edge, None)
+    proj = safe_float(final_projection, None)
+    ln = safe_float(line, None)
+
+    if "NO LINE" in s or "NO_UD_LINE" in s or ln is None:
+        return "NO LINE"
+
+    if "OVER" in s and "UNDER" not in s:
+        base = "O"
+    elif "UNDER" in s:
+        base = "U"
+    elif proj is not None and proj > ln:
+        base = "O"
+    elif proj is not None and proj < ln:
+        base = "U"
+    else:
+        base = "PASS"
+
+    if base == "PASS":
+        return base
+
+    # For converted PASS rows, use the final projection edge when Line-Aware edge is missing/unclear.
+    if ev is None and proj is not None and ln is not None:
+        ev = proj - ln
+    abs_edge = abs(ev) if ev is not None else None
+
+    if abs_edge is not None and abs_edge >= 1.00:
+        return f"🔥 {base}"
+    if abs_edge is not None and abs_edge < 0.65:
+        return f"⚠️ {base}"
+    return base
+
+
+def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
     """Build the clean copy/paste slate from ONLY final Line-Aware Smart outputs.
 
     Required final columns:
@@ -11365,11 +11408,14 @@ def build_copy_paste_k_slate(df, show_pass_notes=False):
             for _, r in g.iterrows():
                 dec = r.get("Line-Aware Smart Decision")
                 edge = safe_float(r.get("Line-Aware Smart Edge"), None)
-                symbol = _owp_final_pick_symbol(dec, edge)
-                if symbol in ("PASS", "NO LINE") and not show_pass_notes:
-                    continue
                 line = safe_float(r.get("UD/Line"), None)
                 proj = safe_float(r.get("Line-Aware Smart Final K Projection"), None)
+                if force_all_players_ou:
+                    symbol = _owp_all_projection_symbol(dec, proj, line, edge)
+                else:
+                    symbol = _owp_final_pick_symbol(dec, edge)
+                if symbol in ("PASS", "NO LINE") and not show_pass_notes:
+                    continue
                 ip = safe_float(r.get("IP Floor"), None)
                 line_txt = "NO LINE" if line is None else f"{line:.1f}"
                 proj_txt = "—" if proj is None else f"{proj:.2f}"
@@ -11409,8 +11455,8 @@ def render_kproj_tab(board):
         st.info("No Underdog final O/U picks available for the best-picks slate yet.")
 
     st.subheader("Copy/Paste Slate — All Underdog Projections")
-    st.caption("Tracking list. Shows every Underdog player with a real line, including PASS rows, using the same final Line-Aware Smart projection columns.")
-    all_slate_text = build_copy_paste_k_slate(df, show_pass_notes=True)
+    st.caption("Tracking list. Shows every Underdog player with a real line as O/U only. It respects Line-Aware Smart OVER/UNDER first; PASS/THIN EDGE rows fall back to final projection vs line.")
+    all_slate_text = build_copy_paste_k_slate(df, show_pass_notes=True, force_all_players_ou=True)
     if all_slate_text:
         st.text_area("All projections slate", all_slate_text, height=520)
         st.download_button("Download all projections .txt", all_slate_text, file_name="one_way_pickz_all_underdog_projection_slate.txt", mime="text/plain")
