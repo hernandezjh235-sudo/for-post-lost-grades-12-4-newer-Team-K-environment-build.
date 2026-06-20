@@ -14,7 +14,6 @@ import difflib
 import io
 import unicodedata
 import html
-import hashlib
 import requests
 import numpy as np
 import pandas as pd
@@ -22,30 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ + OFFICIAL SIDE SYNC"
-# =========================
-# STABLE PROJECTION SEEDING
-# =========================
-STABLE_PROJECTION_SEED_VERSION = "STABLE_SIM_SEED_2026_06_19"
-
-def stable_projection_seed(*parts):
-    """Create deterministic simulation seed from stable projection inputs.
-
-    Same pitcher/model inputs = same simulated projection on refresh.
-    Inputs changing (lineup, line, pitcher stats, BF, learning data) can still
-    change the projection normally.
-    """
-    try:
-        raw = "|".join([str(p) for p in parts])
-        digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
-        return int(digest[:8], 16)
-    except Exception:
-        return 20260619
-
-def stable_rng(*parts):
-    return np.random.default_rng(stable_projection_seed(*parts))
-
-
+APP_VERSION = "v11.17 K PROJ UPSIDE + FANTASY SCORE + ML"
 
 try:
     import pytz
@@ -5190,18 +5166,7 @@ def simulate_matchup(pitcher_k, batter_rates, park=1.0, ump=1.0, sims=12000):
         k = calculate_log5_k_rate(pitcher_k, br)
         k *= park * ump * tto_decay_factor(idx)
         rates.append(clamp(k, 0.03, 0.60))
-
-    # Stable simulation: same inputs produce same output on refresh.
-    rng = stable_rng(
-        "simulate_matchup",
-        round(float(pitcher_k or 0), 6),
-        [round(float(x or 0), 6) for x in rates],
-        round(float(park or 1.0), 6),
-        round(float(ump or 1.0), 6),
-        int(sims),
-        STABLE_PROJECTION_SEED_VERSION,
-    )
-    out = rng.binomial(1, np.array(rates), size=(sims, len(rates))).sum(axis=1)
+    out = np.random.binomial(1, np.array(rates), size=(sims, len(rates))).sum(axis=1)
     return out, rates
 
 
@@ -5259,33 +5224,16 @@ def simulate_bayesian_markov_matchup(pitcher_k, batter_rates, expected_bf, park=
     rates_arr = np.array(base_rates, dtype=float)
     n_rates = len(rates_arr)
 
-    # Stable simulation: variance remains, but refreshes do not create new random projections.
-    rng = stable_rng(
-        "simulate_bayesian_markov_matchup",
-        round(float(pitcher_k or 0), 6),
-        [round(float(x or 0), 6) for x in base_rates],
-        round(float(expected_bf or 0), 6),
-        round(float(park or 1.0), 6),
-        round(float(ump or 1.0), 6),
-        round(float(data_score or 0), 4),
-        bool(lineup_locked),
-        bool(pitcher_confirmed),
-        str((leash or {}).get("leash_risk", "")),
-        round(float((leash or {}).get("ppb", 0) or 0), 4),
-        int(sims),
-        STABLE_PROJECTION_SEED_VERSION,
-    )
-
     for i in range(int(sims)):
-        sampled_bf = int(round(rng.normal(expected_bf, bf_sd)))
+        sampled_bf = int(round(np.random.normal(expected_bf, bf_sd)))
         sampled_bf = int(clamp(sampled_bf, 12, 34))
-        k_mult = float(rng.normal(1.0, mult_sd))
+        k_mult = float(np.random.normal(1.0, mult_sd))
         k_mult = clamp(k_mult, 0.72, 1.28)
         idx = np.arange(sampled_bf) % n_rates
         probs = np.clip(rates_arr[idx] * k_mult, 0.02, 0.68)
-        results[i] = rng.binomial(1, probs).sum()
+        results[i] = np.random.binomial(1, probs).sum()
 
-    note = f"Bayesian Markov MC: sims={int(sims)}, BF μ={expected_bf:.1f}, BF σ={bf_sd:.2f}, K σ={proj_std:.2f}, seed=stable"
+    note = f"Bayesian Markov MC: sims={int(sims)}, BF μ={expected_bf:.1f}, BF σ={bf_sd:.2f}, K σ={proj_std:.2f}"
     return results, base_rates, note
 
 
@@ -8701,119 +8649,6 @@ def update_manager_pull_learning_after_grade(pick):
     except Exception as e:
         return {"manager_pull_learning_error": str(e)[:160]}
 
-
-def rebuild_manager_pull_learning_from_results_v11_21(results=None, merge_existing=True):
-    """Backfill active manager/team pull learning from graded RESULT_LOG rows.
-
-    This lets Manager Pull Learning populate from the same graded history already
-    used by Calibration Audit and Learning Lab. It is audit-only; it does not
-    change projections.
-    """
-    try:
-        if results is None:
-            results = load_json(RESULT_LOG, [])
-        data = load_json(MANAGER_PULL_LEARNING_FILE, {}) if merge_existing else {}
-        if not isinstance(data, dict):
-            data = {}
-        updated = 0
-        for row in results or []:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("graded_result") or "").upper() not in ["WIN", "LOSS"]:
-                continue
-            # Need at least one real pull/workload field.
-            if safe_float(row.get("actual_ip"), None) is None and safe_float(row.get("actual_bf"), None) is None:
-                continue
-            key = str(manager_learning_key_from_pick_v11_20(row))
-            if not key or key.upper() == "UNKNOWN":
-                key = str(row.get("actual_team") or row.get("team") or row.get("Team") or "UNKNOWN")
-            if not key or key.upper() == "UNKNOWN":
-                continue
-
-            rec = data.get(key, {
-                "samples": 0, "avg_actual_ip": 0.0, "avg_actual_bf": 0.0,
-                "avg_actual_pitches": 0.0, "avg_er_at_pull": 0.0,
-                "avg_hits_at_pull": 0.0, "avg_bb_at_pull": 0.0, "avg_hr_at_pull": 0.0,
-                "early_pull_count": 0, "deep_leash_count": 0,
-                "source": "RESULT_LOG_BACKFILL"
-            })
-            seen_keys = set(rec.get("_seen_grade_keys", []))
-            gkey = _grade_result_key(row)
-            if gkey in seen_keys:
-                continue
-            old_n = int(rec.get("samples", 0))
-            n = old_n + 1
-
-            def avg(old, val):
-                old = safe_float(old, 0.0) or 0.0
-                val = safe_float(val, None)
-                if val is None:
-                    return old
-                return round(old + (val - old) / max(n, 1), 3)
-
-            actual_ip = safe_float(row.get("actual_ip"), None)
-            projected_ip = safe_float(row.get("projected_ip") or row.get("Projected IP") or row.get("IP Projection"), None)
-
-            rec["samples"] = n
-            rec["manager_learning_key"] = key
-            rec["team"] = row.get("actual_team") or row.get("team") or row.get("Team")
-            rec["team_id"] = row.get("actual_team_id") or row.get("team_id")
-            rec["manager_name"] = row.get("manager_name") if not str(key).startswith("TEAM:") else rec.get("manager_name")
-            rec["avg_actual_ip"] = avg(rec.get("avg_actual_ip"), actual_ip)
-            rec["avg_actual_bf"] = avg(rec.get("avg_actual_bf"), row.get("actual_bf"))
-            rec["avg_actual_pitches"] = avg(rec.get("avg_actual_pitches"), row.get("actual_pitches"))
-            rec["avg_er_at_pull"] = avg(rec.get("avg_er_at_pull"), row.get("actual_er"))
-            rec["avg_hits_at_pull"] = avg(rec.get("avg_hits_at_pull"), row.get("actual_hits"))
-            rec["avg_bb_at_pull"] = avg(rec.get("avg_bb_at_pull"), row.get("actual_bb"))
-            rec["avg_hr_at_pull"] = avg(rec.get("avg_hr_at_pull"), row.get("actual_hr"))
-            if actual_ip is not None and projected_ip is not None and actual_ip <= projected_ip - 1.0:
-                rec["early_pull_count"] = int(rec.get("early_pull_count", 0)) + 1
-            if actual_ip is not None and projected_ip is not None and actual_ip >= projected_ip + 1.0:
-                rec["deep_leash_count"] = int(rec.get("deep_leash_count", 0)) + 1
-            seen_keys.add(gkey)
-            rec["_seen_grade_keys"] = list(seen_keys)[-5000:]
-            rec["last_seen"] = now_iso()
-            data[key] = rec
-            updated += 1
-        if updated:
-            save_json(MANAGER_PULL_LEARNING_FILE, data)
-        return data
-    except Exception:
-        return load_json(MANAGER_PULL_LEARNING_FILE, {})
-
-def build_manager_pull_learning_dashboard_v11_21(results=None):
-    """Return manager pull rows; auto-backfills from RESULT_LOG if needed."""
-    data = rebuild_manager_pull_learning_from_results_v11_21(results=results, merge_existing=True)
-    rows = []
-    for key, vals in (data or {}).items():
-        if not isinstance(vals, dict):
-            continue
-        rr = {"Team/Manager Bucket": key}
-        for k, v in vals.items():
-            if k == "_seen_grade_keys":
-                continue
-            rr[k] = v
-        samples = safe_float(rr.get("samples"), 0) or 0
-        ep = safe_float(rr.get("early_pull_count"), 0) or 0
-        dl = safe_float(rr.get("deep_leash_count"), 0) or 0
-        rr["early_pull_rate"] = round(ep / samples, 3) if samples else 0.0
-        rr["deep_leash_rate"] = round(dl / samples, 3) if samples else 0.0
-        rr["Learning Module"] = "Manager Pull Learning"
-        rr["Status"] = "ACTIVE_AUDIT_ONLY"
-        rows.append(rr)
-    if not rows:
-        return pd.DataFrame([{
-            "Learning Module": "Manager Pull Learning",
-            "Status": "NEEDS_GRADED_WORKLOAD_FIELDS",
-            "Meaning": "Graded rows loaded, but actual IP/BF/pitches fields are needed for manager pull learning.",
-            "Safe": "YES — no projections or picks changed",
-        }])
-    df = pd.DataFrame(rows)
-    if "samples" in df.columns:
-        df = df.sort_values("samples", ascending=False)
-    return df
-
-
 def parse_manual_slate_text_to_dataframe(raw_text):
     """Parse the user's pasted slate format into a manual grading dataframe.
 
@@ -9236,61 +9071,6 @@ def render_kpis(picks, bankroll):
         </div>
         """, unsafe_allow_html=True)
 
-
-_OFFICIAL_CARD_ROW_GUARD = False
-
-def official_card_k_row(p):
-    """Build a one-player K board row so the card matches the table exactly.
-
-    This is display-only. It prevents card projection/edge/decision from using
-    an earlier layer while the table is using the final post-stack K PROJ.
-    """
-    global _OFFICIAL_CARD_ROW_GUARD
-    try:
-        if _OFFICIAL_CARD_ROW_GUARD:
-            return {}
-        _OFFICIAL_CARD_ROW_GUARD = True
-        df = build_kproj_table([p])
-        _OFFICIAL_CARD_ROW_GUARD = False
-        if df is not None and not df.empty:
-            return df.iloc[0].to_dict()
-    except Exception:
-        try:
-            _OFFICIAL_CARD_ROW_GUARD = False
-        except Exception:
-            pass
-    return {}
-
-def official_card_k_projection(p):
-    """Official card projection synced to the board K PROJ.
-
-    The card must show the same stabilized number as the table's K PROJ:
-    - Soriano should show 6.41
-    - Misiorowski should show 9.55
-    - Gausman should show 6.16, not 4.93
-
-    This is display-only and does not change the projection engine.
-    """
-    try:
-        row = official_card_k_row(p)
-        for c in ["K PROJ", "Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection"]:
-            if row and row.get(c) not in (None, "", "—"):
-                v = safe_float(row.get(c), None)
-                if v is not None:
-                    return round(float(v), 2), "Official K PROJ"
-
-        # Fallback if one-row table cannot be built.
-        for c in ["Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection", "K PROJ", "projection"]:
-            if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
-                v = safe_float(p.get(c), None)
-                if v is not None:
-                    return round(float(v), 2), "Official K PROJ"
-
-        return ("—", "Unavailable")
-    except Exception:
-        return (p.get("projection", "—") if isinstance(p, dict) else "—", "Fallback")
-
-
 def render_pick_card(p):
     prob = p.get("fair_probability")
     prob_pct = int(round(prob * 100)) if prob is not None else 0
@@ -9307,7 +9087,6 @@ def render_pick_card(p):
     edge_display = p.get("edge_ks") if p.get("edge_ks") is not None else "—"
     ev_display = f"{(p.get('ev') or 0)*100:.2f}%" if p.get("ev") is not None else "—"
     prob_display = f"{prob_pct}%" if prob is not None else "—"
-    card_k_projection, card_k_projection_source = official_card_k_projection(p)
     # Render-safe Last 10 K bars.
     # NOTE: this avoids standalone raw HTML ever being printed by Streamlit/tunnel caching.
     # The full card below is still rendered with unsafe_allow_html=True.
@@ -9340,7 +9119,7 @@ def render_pick_card(p):
           <span class="badge good-badge">{p.get('projection_source')}</span>
           <span class="badge">Lineup: {p.get('lineup_status')}</span>
         </div>
-        <div><div class="small-muted">Final K Projection</div><div class="big-number {color_class}">{card_k_projection}</div><div class="small-muted">{card_k_projection_source} | BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
+        <div><div class="small-muted">Projection</div><div class="big-number {color_class}">{p.get('projection')}</div><div class="small-muted">BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge: {edge_display} K</div></div>
         <div>
           <div class="small-muted">Model Side</div><div class="big-number {color_class}">{p.get('pick_side')}</div>
@@ -11041,41 +10820,6 @@ def render_kproj_pitcher_card(p):
     except Exception:
         pass
     dist_display = f"F {dist.get('floor')} | M {dist.get('median')} | C {dist.get('ceiling')}"
-    card_row = official_card_k_row(p)
-    card_k_projection, card_k_projection_source = official_card_k_projection(p)
-
-    # Full card sync: projection, edge, line, and decision must match K board row.
-    if card_row:
-        try:
-            if card_row.get("UD/Line") not in (None, "", "—"):
-                d["line"] = safe_float(card_row.get("UD/Line"), d.get("line"))
-            if card_row.get("Decision") not in (None, "", "—"):
-                d["decision"] = card_row.get("Decision")
-            if card_row.get("Model Lean") not in (None, "", "—"):
-                d["lean_side"] = card_row.get("Model Lean")
-            if card_row.get("Confidence %") not in (None, "", "—"):
-                d["confidence"] = (safe_float(card_row.get("Confidence %"), 0) or 0) / 100.0
-            if card_row.get("K PROJ") not in (None, "", "—"):
-                card_k_projection = round(float(safe_float(card_row.get("K PROJ"), card_k_projection)), 2)
-            official_edge_value = None
-            for ec in ["Edge Gap", "Official K Edge", "Line-Aware Smart Edge", "WRS Edge", "TPS Edge"]:
-                if card_row.get(ec) not in (None, "", "—"):
-                    official_edge_value = safe_float(card_row.get(ec), None)
-                    break
-            if official_edge_value is None and d.get("line") is not None and card_k_projection != "—":
-                official_edge_value = round(float(card_k_projection) - float(d.get("line")), 2)
-            if official_edge_value is not None:
-                d["line_edge"] = round(float(official_edge_value), 2)
-                d["edge_display"] = round(float(official_edge_value), 2)
-        except Exception:
-            pass
-
-    if card_k_projection != "—":
-        try:
-            d["projection"] = card_k_projection
-        except Exception:
-            pass
-
     edge_display = d.get("edge_display", "—")
     edge_class = d.get("edge_class", "yellow-badge")
     needs_display = "—" if d.get("over_needed") is None else f"{d.get('over_needed')}+"
@@ -11110,7 +10854,7 @@ def render_kproj_pitcher_card(p):
           <span class="badge {lineup_badge}">Lineup: {p.get('lineup_status')}</span>
           <span class="badge">K Upside: {p.get('elite_upside_score', 0)}/100</span>
         </div>
-        <div><div class="small-muted">Final K Projection</div><div class="big-number green">{d['projection']}</div><div class="small-muted">{card_k_projection_source} | BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
+        <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
         <div><div class="small-muted">Edge</div><div class="big-number green">{edge_display}</div><div class="small-muted">Under wins {under_max_display}</div></div>
         <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
@@ -11208,46 +10952,6 @@ def _short_lineup_source(row):
         return src.replace("_", " ").title()
     return "—"
 
-
-def normalize_official_kproj_columns(df):
-    """Display/export normalization only.
-
-    Keeps the official table projection aligned to the latest stabilized value.
-    Does not rebuild the model; it only prevents confusing intermediate columns.
-    """
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return df
-        d = df.copy()
-        official_cols = [
-            "Line-Aware Smart Final K Projection",
-            "WRS Final K Projection",
-            "TPS Final K Projection",
-            "K PROJ",
-            "TPC True K Projection",
-        ]
-        def pick_official(row):
-            for c in official_cols:
-                if c in row.index:
-                    v = safe_float(row.get(c), None)
-                    if v is not None:
-                        return round(float(v), 2)
-            v = safe_float(row.get("Final K Projection"), None)
-            return round(float(v), 2) if v is not None else row.get("K PROJ")
-        if "K PROJ" in d.columns:
-            d["Official K PROJ"] = d.apply(pick_official, axis=1)
-            d["K PROJ"] = d["Official K PROJ"]
-            if "UD/Line" in d.columns:
-                d["Official K Edge"] = d.apply(
-                    lambda r: None if safe_float(r.get("UD/Line"), None) is None or safe_float(r.get("K PROJ"), None) is None
-                    else round(float(safe_float(r.get("K PROJ"), 0)) - float(safe_float(r.get("UD/Line"), 0)), 2),
-                    axis=1
-                )
-        return d
-    except Exception:
-        return df
-
-
 def build_kproj_table(board):
     rows = []
     for p in board or []:
@@ -11301,7 +11005,6 @@ def build_kproj_table(board):
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = normalize_official_kproj_columns(df)
         df = df.sort_values(["Decision", "Confidence %", "K PROJ"], ascending=[True, False, False])
     return df
 
@@ -16780,52 +16483,22 @@ def _iq_label(score):
     return "FADE_IQ"
 
 def _baseball_iq_for_k_row(p):
-    """Baseball IQ K row synced to the same official K board/card row.
-
-    Prevents Baseball IQ from showing an old 10+ projection or an opposite
-    under/over decision when the K board has already trimmed it.
-    """
     try:
-        row = official_card_k_row(p) if "official_card_k_row" in globals() else {}
+        proj = _iq_num(_ks97_projection(p) if "_ks97_projection" in globals() else p.get("projection"), 0)
     except Exception:
-        row = {}
-
-    try:
-        if row:
-            proj = _iq_num(row.get("K PROJ"), 0)
-            line = _iq_num(row.get("UD/Line"), 0)
-            model_pick = row.get("Decision") or row.get("Model Lean") or p.get("Decision") or p.get("bet_action")
-            edge = _iq_num(row.get("Edge Gap") if row.get("Edge Gap") not in (None, "", "—") else row.get("Official K Edge"), 0)
-            opp_k = _iq_num(row.get("Opp K%"), 22)
-            bf = _iq_num(row.get("Exp BF"), 22)
-            role = _iq_num(row.get("Role Score"), 50)
-            starter = _iq_num(row.get("Starter Score"), 50)
-        else:
-            d = kproj_decision(p) if "kproj_decision" in globals() else {}
-            proj = _iq_num(d.get("projection") or p.get("K PROJ") or p.get("projection"), 0)
-            line = _iq_num(d.get("line") or p.get("line") or p.get("Line") or p.get("UD/Line"), 0)
-            model_pick = d.get("decision") or p.get("pick_side") or p.get("Decision") or p.get("bet_action")
-            edge = _iq_num(d.get("line_edge"), proj - line if line else 0)
-            opp_k = _iq_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 22)
-            if opp_k <= 1:
-                opp_k *= 100
-            bf = _iq_num(p.get("expected_bf") or p.get("Exp BF"), 22)
-            role = _iq_num(p.get("role_score") or p.get("Role Score"), 50)
-            starter = _iq_num(p.get("starter_score") or p.get("Starter Score"), 50)
-    except Exception:
-        proj = _iq_num(p.get("K PROJ") or p.get("projection"), 0)
-        line = _iq_num(p.get("line") or p.get("Line") or p.get("UD/Line"), 0)
-        edge = proj - line if line else 0
-        model_pick = p.get("Decision") or p.get("bet_action")
-        opp_k = _iq_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 22)
-        if opp_k <= 1:
-            opp_k *= 100
-        bf = _iq_num(p.get("expected_bf") or p.get("Exp BF"), 22)
-        role = _iq_num(p.get("role_score") or p.get("Role Score"), 50)
-        starter = _iq_num(p.get("starter_score") or p.get("Starter Score"), 50)
+        proj = _iq_num(p.get("projection") or p.get("K PROJ"), 0)
+    line = _iq_num(p.get("line") or p.get("Line") or p.get("UD/Line"), 0)
+    edge = proj - line if line else 0
 
     risk, rlabel, _ = _ks97_early_exit_risk(p) if "_ks97_early_exit_risk" in globals() else (50, "UNK", 0)
     conv, clabel, _ = _ks97_two_strike_conversion(p) if "_ks97_two_strike_conversion" in globals() else (50, "UNK", 0)
+
+    opp_k = _iq_num(p.get("opp_k") or p.get("Opp K%") or p.get("Opponent K%"), 22)
+    if opp_k <= 1:
+        opp_k *= 100
+    bf = _iq_num(p.get("expected_bf") or p.get("Exp BF"), 22)
+    role = _iq_num(p.get("role_score") or p.get("Role Score"), 50)
+    starter = _iq_num(p.get("starter_score") or p.get("Starter Score"), 50)
     leash = _iq_num(p.get("leash_score") or p.get("Leash Score"), 50)
 
     score = 50
@@ -16841,7 +16514,6 @@ def _baseball_iq_for_k_row(p):
 
     reasons = []
     if edge >= 1.0: reasons.append("Strong line edge")
-    if edge <= -1.0: reasons.append("Strong under edge")
     if opp_k >= 24: reasons.append("Opponent K-friendly")
     if bf >= 24: reasons.append("Strong BF/volume")
     if risk >= 65: reasons.append("Early-exit risk")
@@ -16855,7 +16527,7 @@ def _baseball_iq_for_k_row(p):
         "Matchup": p.get("matchup") or p.get("Matchup"),
         "Projection": round(proj, 2),
         "Line": line,
-        "Model Pick": model_pick,
+        "Model Pick": p.get("pick_side") or p.get("Decision") or p.get("bet_action"),
         "Baseball IQ Score": round(score, 1),
         "IQ Label": _iq_label(score),
         "Main Reasons": " | ".join(reasons),
@@ -17892,117 +17564,61 @@ def _learning_lab_manager_bias(df):
         return _ll_empty_note("Manager Bias Learning")
 
 def _learning_lab_run_suppression(df):
-    """Run-damage / run-suppression audit.
-
-    Fully connected for V1 pitcher-only grading:
-    - If projected ER exists, show projected ER bias.
-    - If older rows only have actual ER/H/BB/HR, still show actual run-damage buckets.
-    This is audit-only and does not change K projections.
-    """
     try:
         if df is None or df.empty:
             return _ll_empty_note("Run Suppression Learning")
         group = _ll_col(df, ["Pitcher", "Team", "team", "Opponent"])
-        proj_er = _ll_col(df, ["ER Projection", "Projected ER", "ER Proj", "Projected ER Allowed", "projected_er"])
-        actual_er = _ll_col(df, ["Actual ER", "ER Actual", "Earned Runs", "actual_er"])
-        actual_h = _ll_col(df, ["Actual Hits", "Hits Allowed", "Actual H", "actual_hits"])
-        actual_bb = _ll_col(df, ["Actual BB", "Walks Allowed", "Actual Walks", "actual_bb"])
-        actual_hr = _ll_col(df, ["Actual HR", "HR Allowed", "actual_hr"])
-        actual_ip = _ll_col(df, ["Actual IP", "actual_ip", "IP Actual"])
-
-        if not group:
+        proj_er = _ll_col(df, ["ER Projection", "Projected ER", "ER Proj"])
+        actual_er = _ll_col(df, ["Actual ER", "ER Actual", "Earned Runs"])
+        if not group or not proj_er or not actual_er:
             return _ll_empty_note("Run Suppression Learning")
-
         d = df.copy()
-
-        if actual_er:
-            d["Actual ER Num"] = pd.to_numeric(d[actual_er], errors="coerce")
-        else:
-            d["Actual ER Num"] = np.nan
-        if actual_h:
-            d["Actual H Num"] = pd.to_numeric(d[actual_h], errors="coerce")
-        else:
-            d["Actual H Num"] = np.nan
-        if actual_bb:
-            d["Actual BB Num"] = pd.to_numeric(d[actual_bb], errors="coerce")
-        else:
-            d["Actual BB Num"] = np.nan
-        if actual_hr:
-            d["Actual HR Num"] = pd.to_numeric(d[actual_hr], errors="coerce")
-        else:
-            d["Actual HR Num"] = np.nan
-        if actual_ip:
-            d["Actual IP Num"] = pd.to_numeric(d[actual_ip], errors="coerce")
-        else:
-            d["Actual IP Num"] = np.nan
-
-        # If projected ER exists, this is a true bias audit.
-        if proj_er and actual_er:
-            d["Projected ER Num"] = pd.to_numeric(d[proj_er], errors="coerce")
-            d["ER Error"] = d["Projected ER Num"] - d["Actual ER Num"]
-            out = d.groupby(group).agg(
-                Rows=("ER Error", "count"),
-                Avg_ER_Bias=("ER Error", "mean"),
-                Abs_ER_Error=("ER Error", lambda s: s.abs().mean()),
-                Avg_Actual_ER=("Actual ER Num", "mean"),
-                Avg_Actual_H=("Actual H Num", "mean"),
-                Avg_Actual_BB=("Actual BB Num", "mean"),
-                Avg_Actual_HR=("Actual HR Num", "mean"),
-            ).reset_index()
-            out["Learning Mode"] = "PROJECTED_ER_BIAS"
-            out["Suggested Use"] = "Audit whether Pitcher FS over/under-projects earned runs."
-        else:
-            # Older snapshots may not have projected ER. Still learn actual run-damage profile.
-            if d[["Actual ER Num", "Actual H Num", "Actual BB Num", "Actual HR Num"]].dropna(how="all").empty:
-                out = _ll_empty_note("Run Suppression Learning")
-                out["Status"] = "NEEDS_ACTUAL_RUN_DAMAGE_FIELDS"
-                out["Meaning"] = "Rows loaded, but no Actual ER/H/BB/HR fields are available yet. Future grading will populate this."
-                return out
-            d["Run Damage Score"] = (
-                d["Actual ER Num"].fillna(0) * 12.0 +
-                d["Actual H Num"].fillna(0) * 2.0 +
-                d["Actual BB Num"].fillna(0) * 3.0 +
-                d["Actual HR Num"].fillna(0) * 8.0
-            ).clip(0, 100)
-            out = d.groupby(group).agg(
-                Rows=("Run Damage Score", "count"),
-                Avg_Run_Damage_Score=("Run Damage Score", "mean"),
-                Avg_Actual_ER=("Actual ER Num", "mean"),
-                Avg_Actual_H=("Actual H Num", "mean"),
-                Avg_Actual_BB=("Actual BB Num", "mean"),
-                Avg_Actual_HR=("Actual HR Num", "mean"),
-                Avg_Actual_IP=("Actual IP Num", "mean"),
-            ).reset_index()
-            out["Learning Mode"] = "ACTUAL_RUN_DAMAGE_PROFILE"
-            out["Suggested Use"] = "Audit-only run-damage profile for Pitcher FS and leash review."
-
-        for c in out.columns:
-            if c not in [group, "Learning Mode", "Suggested Use", "Learning Module", "Version"]:
-                try:
-                    out[c] = pd.to_numeric(out[c], errors="ignore")
-                    if pd.api.types.is_numeric_dtype(out[c]):
-                        out[c] = out[c].round(3)
-                except Exception:
-                    pass
+        d["ER Error"] = pd.to_numeric(d[proj_er], errors="coerce") - pd.to_numeric(d[actual_er], errors="coerce")
+        out = d.groupby(group).agg(
+            Rows=("ER Error", "count"),
+            Avg_ER_Bias=("ER Error", "mean"),
+            Abs_ER_Error=("ER Error", lambda s: s.abs().mean())
+        ).reset_index()
         out["Learning Module"] = "Run Suppression Learning"
+        out["Suggested Use"] = "Audit whether Pitcher FS over/under-projects earned runs."
         out["Version"] = LEARNING_LAB_VERSION
-        return out.sort_values(["Rows"], ascending=False)
+        return out.sort_values(["Rows", "Abs_ER_Error"], ascending=[False, False])
     except Exception:
         return _ll_empty_note("Run Suppression Learning")
 
 def _learning_lab_batting_order(df):
-    """V1 is pitcher-only. Batting order learning belongs in V3 batter app.
-
-    Returning an explicit inactive note avoids confusing WAITING_FOR_GRADED_RESULTS
-    when the pitcher strikeout engine is correctly loading graded K history.
-    """
-    return pd.DataFrame([{
-        "Learning Module": "Batting Order Learning",
-        "Status": "INACTIVE_FOR_V1_PITCHER_ENGINE",
-        "Meaning": "This V1 app grades pitcher K props. Batting-order learning belongs in the V3 batter app.",
-        "Safe": "YES — no projections or picks changed",
-        "Version": LEARNING_LAB_VERSION,
-    }])
+    try:
+        if df is None or df.empty:
+            return _ll_empty_note("Batting Order Learning")
+        player = _ll_col(df, ["Player", "Batter", "Name"])
+        expected_slot = _ll_col(df, ["Expected Slot", "Projected Slot", "Lineup Slot"])
+        actual_slot = _ll_col(df, ["Actual Slot", "Confirmed Slot"])
+        proj_fs = _ll_col(df, ["FS Projection", "Projected FS"])
+        actual_fs = _ll_col(df, ["Actual FS", "Fantasy Actual", "Actual Fantasy"])
+        if not player or not expected_slot or not actual_slot:
+            return _ll_empty_note("Batting Order Learning")
+        d = df.copy()
+        d["Slot Error"] = pd.to_numeric(d[expected_slot], errors="coerce") - pd.to_numeric(d[actual_slot], errors="coerce")
+        if proj_fs and actual_fs:
+            d["FS Error"] = pd.to_numeric(d[proj_fs], errors="coerce") - pd.to_numeric(d[actual_fs], errors="coerce")
+            out = d.groupby(player).agg(
+                Rows=("Slot Error", "count"),
+                Avg_Slot_Bias=("Slot Error", "mean"),
+                Abs_Slot_Error=("Slot Error", lambda s: s.abs().mean()),
+                Avg_FS_Bias=("FS Error", "mean")
+            ).reset_index()
+        else:
+            out = d.groupby(player).agg(
+                Rows=("Slot Error", "count"),
+                Avg_Slot_Bias=("Slot Error", "mean"),
+                Abs_Slot_Error=("Slot Error", lambda s: s.abs().mean())
+            ).reset_index()
+        out["Learning Module"] = "Batting Order Learning"
+        out["Suggested Use"] = "Find players/teams whose projected batting slot is often wrong."
+        out["Version"] = LEARNING_LAB_VERSION
+        return out.sort_values(["Rows", "Abs_Slot_Error"], ascending=[False, False])
+    except Exception:
+        return _ll_empty_note("Batting Order Learning")
 
 def _learning_lab_normalize_results_df(df):
     """Normalize RESULT_LOG rows so Learning Lab and Calibration Audit read the same data."""
@@ -18027,9 +17643,6 @@ def _learning_lab_normalize_results_df(df):
             "Actual IP": ["Actual IP", "actual_ip"],
             "Projected ER": ["Projected ER", "ER Projection", "projected_er"],
             "Actual ER": ["Actual ER", "actual_er"],
-            "Actual Hits": ["Actual Hits", "actual_hits", "hits_allowed", "Hits Allowed"],
-            "Actual BB": ["Actual BB", "actual_bb", "walks_allowed", "Walks Allowed"],
-            "Actual HR": ["Actual HR", "actual_hr", "hr_allowed", "HR Allowed"],
             "Manager": ["Manager", "manager", "manager_name", "manager_pull_learning_key", "actual_team", "team", "Team"],
             "Graded Result": ["graded_result", "Graded Result"],
         }
@@ -24178,9 +23791,10 @@ def render_pitcher_fs_tab(board=None):
     except Exception:
         pass
 
-tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_pitcher_fs, tab_research_hub, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
+    "🔎 RESEARCH HUB",
     "MONEYLINE EDGE",
     "🧠 BASEBALL IQ",
     "🧠 30D LEARNING IQ",
@@ -24198,6 +23812,9 @@ with tab_kproj:
 
 with tab_pitcher_fs:
     render_pitcher_fs_tab(board)
+
+with tab_research_hub:
+    render_research_hub_tab(board)
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
@@ -24513,8 +24130,17 @@ with tab5:
             st.dataframe(pd.DataFrame(vol_rows).sort_values("count", ascending=False), use_container_width=True, hide_index=True)
 
         st.markdown('<div class="section-title-pro">Manager Pull Learning</div>', unsafe_allow_html=True)
-        mgr_df = build_manager_pull_learning_dashboard_v11_21(results)
-        st.dataframe(mgr_df, use_container_width=True, hide_index=True)
+        mgr_data = load_json(MANAGER_PULL_LEARNING_FILE, {})
+        if mgr_data:
+            mgr_rows = []
+            for team_key, vals in mgr_data.items():
+                rr = {"Team/Manager Bucket": team_key}
+                if isinstance(vals, dict):
+                    rr.update(vals)
+                mgr_rows.append(rr)
+            st.dataframe(pd.DataFrame(mgr_rows).sort_values("samples", ascending=False), use_container_width=True, hide_index=True)
+        else:
+            st.info("Manager pull learning is collection-only until graded outcomes are added.")
 
         st.markdown('<div class="section-title-pro">K Miss Reason Learning</div>', unsafe_allow_html=True)
         miss_data = load_json(MISS_REASON_FILE, {})
@@ -24767,114 +24393,3 @@ def ml_build_board(board):
     if not df.empty:
         df = df.sort_values('ML Edge %', ascending=False)
     return df
-
-
-# =========================
-# FINAL OFFICIAL SIDE / DECISION SYNC FIX
-# Version: OFFICIAL_SIDE_SYNC_2026_06_19
-# Display / table sync only:
-# - Does NOT change K projection formulas
-# - Does NOT change learning inputs
-# - Does NOT change manager/run/volume calculations
-# - Forces K PROJ, Official K PROJ, edge, lean, and decision direction to agree
-# =========================
-OFFICIAL_SIDE_SYNC_VERSION = "OFFICIAL_SIDE_SYNC_2026_06_19"
-
-def _ows_num(x, default=None):
-    try:
-        if x is None or x == "":
-            return default
-        if isinstance(x, str):
-            x = x.replace("%", "").replace("+", "").strip()
-        v = float(x)
-        if pd.isna(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-def _ows_side_from_edge(edge):
-    if edge is None:
-        return "NO_LINE"
-    if edge > 0:
-        return "OVER"
-    if edge < 0:
-        return "UNDER"
-    return "PUSH"
-
-def _ows_decision_from_edge(edge):
-    if edge is None:
-        return "NO_UD_LINE"
-    side = _ows_side_from_edge(edge)
-    ae = abs(float(edge))
-    if side == "PUSH":
-        return "🚫 PASS — NO EDGE"
-    if ae >= 1.00:
-        return f"🔥 {side}"
-    if ae >= 0.70:
-        return f"⚠️ {side} LEAN"
-    return f"🚫 PASS — {side} THIN EDGE"
-
-def _sync_official_k_side_columns(df):
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return df
-        d = df.copy()
-
-        for c in ["K PROJ", "UD/Line"]:
-            if c not in d.columns:
-                return d
-
-        official_proj, official_edge, official_side, official_decision = [], [], [], []
-
-        for _, row in d.iterrows():
-            k = _ows_num(row.get("K PROJ"), None)
-            line = _ows_num(row.get("UD/Line"), None)
-            line_source = str(row.get("Line Source") or "").upper()
-            if k is None or line is None or "NO LINE" in str(row.get("UD/Line")).upper() or "NO_UD" in line_source:
-                official_proj.append(k if k is not None else row.get("K PROJ"))
-                official_edge.append("")
-                official_side.append("NO_LINE")
-                official_decision.append("NO_UD_LINE")
-                continue
-
-            edge = round(float(k) - float(line), 2)
-            side = _ows_side_from_edge(edge)
-            dec = _ows_decision_from_edge(edge)
-
-            official_proj.append(round(float(k), 2))
-            official_edge.append(edge)
-            official_side.append(side)
-            official_decision.append(dec)
-
-        d["Official K PROJ"] = official_proj
-        d["Official K Edge"] = official_edge
-        d["Official K Side"] = official_side
-        d["Official K Decision Synced"] = official_decision
-
-        # These are the columns most UI/list/card sections read.
-        # Keep projection itself unchanged; only align direction/edge labels.
-        if "Edge Gap" in d.columns:
-            d["Edge Gap"] = d["Official K Edge"]
-        if "Model Lean" in d.columns:
-            d["Model Lean"] = d["Official K Side"].replace({"NO_LINE": "NO_LINE", "PUSH": "PASS"})
-        if "Decision" in d.columns:
-            d["Decision"] = d["Official K Decision Synced"]
-        if "Main Engine Action" in d.columns:
-            d["Main Engine Action"] = d["Official K Decision Synced"]
-        if "Final Main Engine Action" in d.columns:
-            d["Final Main Engine Action"] = d["Official K Decision Synced"]
-
-        return d
-    except Exception:
-        return df
-
-if "build_kproj_table" in globals():
-    _prev_official_side_sync_build_kproj_table = build_kproj_table
-    def build_kproj_table(board):
-        df = _prev_official_side_sync_build_kproj_table(board)
-        try:
-            return _sync_official_k_side_columns(df)
-        except Exception:
-            return df
-
