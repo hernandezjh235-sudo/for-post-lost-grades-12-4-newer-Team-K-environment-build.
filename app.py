@@ -11381,6 +11381,56 @@ def _owp_all_projection_symbol(decision, final_projection, line, edge=None):
     return base
 
 
+
+def _owp_one_final_row_per_pitcher(d):
+    """Display-only slate safeguard: one pitcher = one final slate row.
+
+    This does NOT change any projection math or board columns. It only prevents
+    duplicate alternate lines from printing in copy/paste slates.
+
+    Selection priority:
+    1) Keep valid Underdog rows with a real line.
+    2) Prefer rows with a real Line-Aware OVER/UNDER decision.
+    3) Prefer the row with the strongest absolute final edge.
+    4) Preserve original projection-board order after selecting one row.
+    """
+    try:
+        if not isinstance(d, pd.DataFrame) or d.empty or "Pitcher" not in d.columns:
+            return d
+        work = d.copy()
+        work["__owp_order"] = range(len(work))
+
+        def _score_row(r):
+            dec = str(r.get("Line-Aware Smart Decision", "")).upper()
+            line = safe_float(r.get("UD/Line"), None)
+            proj = safe_float(r.get("Line-Aware Smart Final K Projection"), None)
+            edge = safe_float(r.get("Line-Aware Smart Edge"), None)
+            if edge is None and proj is not None and line is not None:
+                edge = proj - line
+            abs_edge = abs(edge) if edge is not None else -1.0
+            source = str(r.get("Line Source", "")).upper()
+            valid_line = 1 if line is not None else 0
+            is_ud = 1 if source == "UNDERDOG" else 0
+            no_line = 1 if ("NO LINE" in dec or "NO_UD_LINE" in dec or not valid_line) else 0
+            has_ou = 1 if (("OVER" in dec) or ("UNDER" in dec)) and not no_line else 0
+            is_pass = 1 if "PASS" in dec else 0
+            # Bigger score wins. PASS rows can still win if they are the only row,
+            # but real O/U decisions and stronger edges beat duplicate alternates.
+            return (is_ud * 100000) + (valid_line * 10000) + (has_ou * 1000) - (is_pass * 20) + abs_edge
+
+        keep_indices = []
+        for _, g in work.groupby(work["Pitcher"].astype(str).str.strip(), sort=False):
+            if len(g) == 1:
+                keep_indices.append(g.index[0])
+                continue
+            scores = g.apply(_score_row, axis=1)
+            keep_indices.append(scores.sort_values(ascending=False).index[0])
+
+        out = work.loc[keep_indices].sort_values("__owp_order").drop(columns=["__owp_order"], errors="ignore")
+        return out
+    except Exception:
+        return d
+
 def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
     """Build the clean copy/paste slate from ONLY final Line-Aware Smart outputs.
 
@@ -11402,6 +11452,11 @@ def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=Fal
         for c in required:
             if c not in d.columns:
                 d[c] = None
+
+        # One final slate row per pitcher, using the final projection-board row selection logic.
+        # This is display-only and does not touch projections, cards, refresh, save, or grade.
+        d = _owp_one_final_row_per_pitcher(d)
+
         lines = []
         for matchup, g in d.groupby("Matchup", sort=False):
             block = []
