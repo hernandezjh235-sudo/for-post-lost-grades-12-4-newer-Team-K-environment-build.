@@ -11390,9 +11390,11 @@ def _owp_one_final_row_per_pitcher(d):
 
     Selection priority:
     1) Keep valid Underdog rows with a real line.
-    2) Prefer rows with a real Line-Aware OVER/UNDER decision.
-    3) Prefer the row with the strongest absolute final edge.
-    4) Preserve original projection-board order after selecting one row.
+    2) Prefer the CURRENT/primary Underdog line row when duplicate lines exist.
+       Since stale alternate rows usually remain as lower old lines, prefer the highest real UD/Line.
+    3) Prefer rows with a real Line-Aware OVER/UNDER decision.
+    4) Use strongest absolute final edge only as a tie-breaker, not as the main selector.
+    5) Preserve original projection-board order after selecting one row.
     """
     try:
         if not isinstance(d, pd.DataFrame) or d.empty or "Pitcher" not in d.columns:
@@ -11414,9 +11416,11 @@ def _owp_one_final_row_per_pitcher(d):
             no_line = 1 if ("NO LINE" in dec or "NO_UD_LINE" in dec or not valid_line) else 0
             has_ou = 1 if (("OVER" in dec) or ("UNDER" in dec)) and not no_line else 0
             is_pass = 1 if "PASS" in dec else 0
-            # Bigger score wins. PASS rows can still win if they are the only row,
-            # but real O/U decisions and stronger edges beat duplicate alternates.
-            return (is_ud * 100000) + (valid_line * 10000) + (has_ou * 1000) - (is_pass * 20) + abs_edge
+            # Bigger score wins. IMPORTANT: duplicate alternate lines must not choose the
+            # best edge first, because that can keep an old stale 6.5 when Underdog moved to 7.5.
+            # The display slate and board should keep ONE current/primary line per pitcher.
+            line_rank = float(line) if line is not None else -999.0
+            return (is_ud * 1000000) + (valid_line * 100000) + (line_rank * 1000) + (has_ou * 100) - (is_pass * 20) + abs_edge
 
         keep_indices = []
         for _, g in work.groupby(work["Pitcher"].astype(str).str.strip(), sort=False):
@@ -11491,6 +11495,10 @@ def render_kproj_tab(board):
         st.info("Click 🔄 Refresh Live Board first.")
         return
     df = build_kproj_table(board)
+    # One source of truth for this screen: dedupe BEFORE displaying Projection Board,
+    # slates, downloads, and pitcher-card filtering. This prevents Sale/Will-style
+    # duplicate lines from showing different projections in different sections.
+    df = _owp_one_final_row_per_pitcher(df)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("K Proj Rows", len(df))
     c2.metric("Over Leans", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()) if not df.empty else 0)
@@ -11519,7 +11527,23 @@ def render_kproj_tab(board):
         st.info("No Underdog projection rows available for the all-projections slate yet.")
 
     st.subheader("Pitcher Cards")
-    priority = sorted(board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
+    # Keep cards aligned with the same one-line-per-pitcher Projection Board rows.
+    selected_pitchers = set()
+    try:
+        selected_pitchers = set(df["Pitcher"].astype(str).str.strip().tolist())
+    except Exception:
+        selected_pitchers = set()
+    card_board = []
+    seen_card_pitchers = set()
+    for p in board:
+        nm = str(p.get("pitcher") or p.get("Pitcher") or "").strip()
+        if selected_pitchers and nm not in selected_pitchers:
+            continue
+        if nm in seen_card_pitchers:
+            continue
+        seen_card_pitchers.add(nm)
+        card_board.append(p)
+    priority = sorted(card_board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
     for p in priority[:20]:
         render_kproj_pitcher_card(p)
 
