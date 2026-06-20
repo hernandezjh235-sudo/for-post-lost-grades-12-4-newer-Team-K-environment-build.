@@ -22,7 +22,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ FULL SYNC"
+APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ FULL SYNC + FINAL SLATE COPY"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -9273,18 +9273,20 @@ def official_card_k_projection(p):
     """
     try:
         row = official_card_k_row(p)
-        for c in ["K PROJ", "Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection"]:
+        # FINAL CARD LOCK: the player card must display the LAST/FULLY FINAL output.
+        # Do NOT let early/intermediate K PROJ or Official K PROJ override Line-Aware Smart.
+        for c in ["Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection"]:
             if row and row.get(c) not in (None, "", "—"):
                 v = safe_float(row.get(c), None)
                 if v is not None:
-                    return round(float(v), 2), "Official K PROJ"
+                    return round(float(v), 2), "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
 
         # Fallback if one-row table cannot be built.
-        for c in ["Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection", "K PROJ", "projection"]:
+        for c in ["Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection", "projection"]:
             if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
                 v = safe_float(p.get(c), None)
                 if v is not None:
-                    return round(float(v), 2), "Official K PROJ"
+                    return round(float(v), 2), "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
 
         return ("—", "Unavailable")
     except Exception:
@@ -11049,16 +11051,22 @@ def render_kproj_pitcher_card(p):
         try:
             if card_row.get("UD/Line") not in (None, "", "—"):
                 d["line"] = safe_float(card_row.get("UD/Line"), d.get("line"))
-            if card_row.get("Decision") not in (None, "", "—"):
+            # FINAL CARD LOCK: decision/projection/edge come from Line-Aware Smart when present.
+            if card_row.get("Line-Aware Smart Decision") not in (None, "", "—"):
+                d["decision"] = card_row.get("Line-Aware Smart Decision")
+            elif card_row.get("Decision") not in (None, "", "—"):
                 d["decision"] = card_row.get("Decision")
             if card_row.get("Model Lean") not in (None, "", "—"):
                 d["lean_side"] = card_row.get("Model Lean")
             if card_row.get("Confidence %") not in (None, "", "—"):
                 d["confidence"] = (safe_float(card_row.get("Confidence %"), 0) or 0) / 100.0
-            if card_row.get("K PROJ") not in (None, "", "—"):
+            if card_row.get("Line-Aware Smart Final K Projection") not in (None, "", "—"):
+                card_k_projection = round(float(safe_float(card_row.get("Line-Aware Smart Final K Projection"), card_k_projection)), 2)
+                card_k_projection_source = "Line-Aware Smart Final"
+            elif card_row.get("K PROJ") not in (None, "", "—"):
                 card_k_projection = round(float(safe_float(card_row.get("K PROJ"), card_k_projection)), 2)
             official_edge_value = None
-            for ec in ["Edge Gap", "Official K Edge", "Line-Aware Smart Edge", "WRS Edge", "TPS Edge"]:
+            for ec in ["Line-Aware Smart Edge", "Edge Gap", "Official K Edge", "WRS Edge", "TPS Edge"]:
                 if card_row.get(ec) not in (None, "", "—"):
                     official_edge_value = safe_float(card_row.get(ec), None)
                     break
@@ -11305,6 +11313,76 @@ def build_kproj_table(board):
         df = df.sort_values(["Decision", "Confidence %", "K PROJ"], ascending=[True, False, False])
     return df
 
+
+
+def _owp_final_pick_symbol(decision, edge=None):
+    """UI-only: convert final Line-Aware decision to O/U with confidence icon."""
+    s = str(decision or "").upper()
+    ev = safe_float(edge, None)
+    # No-line/pass stays out of slip unless user wants notes.
+    if "NO LINE" in s or "NO_UD_LINE" in s:
+        return "NO LINE"
+    if "PASS" in s:
+        return "PASS"
+    if "OVER" in s:
+        base = "O"
+    elif "UNDER" in s:
+        base = "U"
+    else:
+        return "PASS"
+    abs_edge = abs(ev) if ev is not None else None
+    if abs_edge is not None and abs_edge >= 1.00:
+        return f"🔥 {base}"
+    if abs_edge is not None and abs_edge < 0.65:
+        return f"⚠️ {base}"
+    return base
+
+
+def build_copy_paste_k_slate(df, show_pass_notes=False):
+    """Build the clean copy/paste slate from ONLY final Line-Aware Smart outputs.
+
+    Required final columns:
+    Pitcher, Matchup, UD/Line, IP Floor,
+    Line-Aware Smart Final K Projection, Line-Aware Smart Decision, Line-Aware Smart Edge.
+    UI-only; does not change projection math.
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+        d = df.copy()
+        # Slate is Underdog only, as requested.
+        if "Line Source" in d.columns:
+            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
+        if "UD/Line" in d.columns:
+            d = d[~d["UD/Line"].astype(str).str.upper().isin(["NO LINE", "NO_UD_LINE", "", "NAN"])]
+        required = ["Pitcher", "Matchup", "UD/Line", "IP Floor", "Line-Aware Smart Final K Projection", "Line-Aware Smart Decision", "Line-Aware Smart Edge"]
+        for c in required:
+            if c not in d.columns:
+                d[c] = None
+        lines = []
+        for matchup, g in d.groupby("Matchup", sort=False):
+            block = []
+            for _, r in g.iterrows():
+                dec = r.get("Line-Aware Smart Decision")
+                edge = safe_float(r.get("Line-Aware Smart Edge"), None)
+                symbol = _owp_final_pick_symbol(dec, edge)
+                if symbol in ("PASS", "NO LINE") and not show_pass_notes:
+                    continue
+                line = safe_float(r.get("UD/Line"), None)
+                proj = safe_float(r.get("Line-Aware Smart Final K Projection"), None)
+                ip = safe_float(r.get("IP Floor"), None)
+                line_txt = "NO LINE" if line is None else f"{line:.1f}"
+                proj_txt = "—" if proj is None else f"{proj:.2f}"
+                ip_txt = "—" if ip is None else f"{ip:.2f}"
+                block.append(f"• {r.get('Pitcher')} — {symbol} {line_txt} — {proj_txt} K — IP {ip_txt}")
+            if block:
+                lines.append(str(matchup))
+                lines.extend(block)
+                lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as e:
+        return f"Slate builder unavailable: {e}"
+
 def render_kproj_tab(board):
     st.markdown('<div class="section-title-pro">K PROJ / Pure Upside Model</div>', unsafe_allow_html=True)
     st.caption("K Upside now uses true-talent projection + distribution simulation: floor, median, ceiling, volatility, recent Ks, BF, matchup, and Underdog line. Main engine stays separate.")
@@ -11320,6 +11398,15 @@ def render_kproj_tab(board):
 
     st.subheader("Projection Board")
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("Copy/Paste Slate — Final Line-Aware Smart Picks")
+    st.caption("Underdog only. Uses Line-Aware Smart Final K Projection + Line-Aware Smart Decision + Line-Aware Smart Edge. 🔥 = edge 1.00+ | ⚠️ = edge under 0.65.")
+    slate_text = build_copy_paste_k_slate(df, show_pass_notes=False)
+    if slate_text:
+        st.text_area("Slate list", slate_text, height=360)
+        st.download_button("Download slate .txt", slate_text, file_name="one_way_pickz_final_k_slate.txt", mime="text/plain")
+    else:
+        st.info("No Underdog final O/U picks available for the copy/paste slate yet.")
 
     st.subheader("Pitcher Cards")
     priority = sorted(board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
