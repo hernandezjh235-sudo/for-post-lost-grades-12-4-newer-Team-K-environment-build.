@@ -9206,6 +9206,196 @@ def build_signal_tracking():
     save_json(SIGNAL_TRACKING_FILE, rows)
     return df
 
+
+# =========================
+# SLATE QUALITY SCORE — ADVISORY ONLY
+# Does NOT change projections, K math, decisions, save/grade, or player cards.
+# It only grades how aggressive the slate should be played.
+# =========================
+def _sq_num(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def _sq_text(row):
+    try:
+        return " | ".join([str(v) for v in dict(row).values() if v is not None]).upper()
+    except Exception:
+        return str(row).upper()
+
+def compute_slate_quality_score(picks):
+    """Return advisory slate score based on role/leash/edge risk.
+
+    This is intentionally display-only. It does not mutate picks.
+    """
+    picks = list(picks or [])
+    total = len(picks)
+    if total == 0:
+        return {
+            "score": 0,
+            "label": "NO BOARD",
+            "emoji": "⚪",
+            "summary": "Refresh the board first.",
+            "reasons": ["No pitchers loaded yet."],
+            "counts": {}
+        }
+
+    low_leash = 0
+    opener_bulk = 0
+    thin_edge = 0
+    low_ip = 0
+    no_line = 0
+    strong_edge = 0
+    high_line_difficulty = 0
+    unknown_role = 0
+
+    for p in picks:
+        line = _sq_num(p.get("line", p.get("UD/Line", p.get("Current Line"))), None)
+        proj = _sq_num(
+            p.get("Line-Aware Smart Final K Projection",
+                  p.get("K PROJ",
+                        p.get("proj",
+                              p.get("projection",
+                                    p.get("Official K PROJ"))))),
+            None
+        )
+        edge = _sq_num(
+            p.get("Line-Aware Smart Edge",
+                  p.get("edge",
+                        p.get("Edge",
+                              p.get("Edge Gap",
+                                    p.get("Final K Edge"))))),
+            None
+        )
+        if edge is None and proj is not None and line is not None:
+            edge = proj - line
+
+        ip = _sq_num(p.get("IP Floor", p.get("ip_floor", p.get("IP", p.get("Projected IP")))), None)
+        blob = _sq_text(p)
+
+        if line is None:
+            no_line += 1
+        if edge is not None:
+            if abs(edge) < 0.50:
+                thin_edge += 1
+            if abs(edge) >= 1.25:
+                strong_edge += 1
+        if ip is not None and ip < 4.0:
+            low_ip += 1
+
+        if any(term in blob for term in ["OPENER", "BULK", "FOLLOWER", "RELIEVER", "BULLPEN GAME"]):
+            opener_bulk += 1
+        if any(term in blob for term in ["LOW_LEASH", "QUICK_HOOK", "LEASH_RISK", "DEEP_LEASH_UNDER_RISK", "MANAGER QUICK", "PULL RISK"]):
+            low_leash += 1
+        if any(term in blob for term in ["HIGH_LINE_DIFFICULTY", "INFLATED LINE", "LINE_DIFFICULTY_HIGH", "SET_HIGH", "ABOVE_HISTORY"]):
+            high_line_difficulty += 1
+        if any(term in blob for term in ["UNKNOWN_ROLE", "LOW_SAMPLE", "DEBUT", "ROOKIE", "NO_SAMPLE_GATE", "NO_LOG"]):
+            unknown_role += 1
+
+    # Sunday/getaway risk: advisory only.
+    try:
+        is_sunday = california_now().weekday() == 6
+    except Exception:
+        import datetime
+        is_sunday = datetime.datetime.now().weekday() == 6
+
+    score = 100
+    score -= opener_bulk * 5
+    score -= low_leash * 3
+    score -= thin_edge * 2
+    score -= low_ip * 2
+    score -= unknown_role * 2
+    score -= high_line_difficulty * 1
+    score -= no_line * 1
+    if is_sunday:
+        score -= 5
+
+    # Reward boards with a healthy amount of real strong edges.
+    if strong_edge >= 5:
+        score += 5
+    elif strong_edge >= 3:
+        score += 3
+
+    score = max(0, min(100, int(round(score))))
+
+    if score >= 80:
+        emoji, label, summary = "🟢", "ATTACK SLATE", "Board quality looks strong. Normal volume is acceptable if individual plays still pass filters."
+    elif score >= 60:
+        emoji, label, summary = "🟡", "SELECTIVE SLATE", "Use tighter selection. Prioritize strong edges and high-leash pitchers."
+    else:
+        emoji, label, summary = "🔴", "AVOID / TRACK ONLY", "High-volatility slate. Consider reducing volume and tracking more than betting."
+
+    reasons = []
+    if opener_bulk:
+        reasons.append(f"{opener_bulk} opener/bulk/role-risk flags")
+    if low_leash:
+        reasons.append(f"{low_leash} low-leash / quick-hook flags")
+    if thin_edge:
+        reasons.append(f"{thin_edge} thin-edge plays")
+    if low_ip:
+        reasons.append(f"{low_ip} pitchers with IP under 4.0")
+    if unknown_role:
+        reasons.append(f"{unknown_role} rookie/unknown/low-sample flags")
+    if high_line_difficulty:
+        reasons.append(f"{high_line_difficulty} inflated/high-difficulty line flags")
+    if no_line:
+        reasons.append(f"{no_line} rows without real lines")
+    if is_sunday:
+        reasons.append("Sunday/getaway-day volatility adjustment")
+    if not reasons:
+        reasons.append("No major slate-wide risk cluster detected")
+
+    return {
+        "score": score,
+        "label": label,
+        "emoji": emoji,
+        "summary": summary,
+        "reasons": reasons[:8],
+        "counts": {
+            "total": total,
+            "strong_edge": strong_edge,
+            "thin_edge": thin_edge,
+            "opener_bulk": opener_bulk,
+            "low_leash": low_leash,
+            "low_ip": low_ip,
+            "unknown_role": unknown_role,
+            "high_line_difficulty": high_line_difficulty,
+            "no_line": no_line,
+            "sunday": is_sunday,
+        }
+    }
+
+def render_slate_quality_score(picks):
+    """Render slate quality card. Advisory only."""
+    q = compute_slate_quality_score(picks)
+    reasons_html = "<br>".join([f"• {r}" for r in q.get("reasons", [])])
+    score = q.get("score", 0)
+    label = q.get("label", "NO BOARD")
+    emoji = q.get("emoji", "⚪")
+    summary = q.get("summary", "")
+    counts = q.get("counts", {}) or {}
+
+    color = "#22c55e" if score >= 80 else ("#f59e0b" if score >= 60 else "#ef4444")
+
+    st.markdown(f"""
+    <div class="green-card" style="border-left: 6px solid {color};">
+      <div class="small-muted">Slate Quality Score — Advisory Only</div>
+      <div class="big-number" style="color:{color};">{emoji} {score}/100 — {label}</div>
+      <div style="margin-top:6px;">{summary}</div>
+      <div style="margin-top:8px;" class="small-muted">
+        Total: {counts.get('total', 0)} | Strong edges: {counts.get('strong_edge', 0)} | Thin edges: {counts.get('thin_edge', 0)}
+      </div>
+      <div style="margin-top:8px;">{reasons_html}</div>
+      <div style="margin-top:8px;" class="small-muted">
+        This does not change projections. It only tells you how aggressive to be with today's board.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # =========================
 # RENDERING
 # =========================
