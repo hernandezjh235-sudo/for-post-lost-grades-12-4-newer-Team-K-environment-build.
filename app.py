@@ -1482,6 +1482,140 @@ def opponent_k_context_factor(lineup_k):
         return 0.970, "Low-K opponent context x0.970"
     return 1.000, "Neutral opponent K context"
 
+
+def build_csw_trend_score(statcast_profile, enabled=True):
+    """CSW Trend Score: recent CSW direction vs season Statcast baseline.
+
+    This is intentionally conservative. It only uses real Statcast pitch-level
+    aggregates already pulled by get_statcast_pitch_profile. Missing or thin data
+    returns neutral so the core projection is not hurt.
+    """
+    if not enabled or not isinstance(statcast_profile, dict) or not statcast_profile.get("available"):
+        return {"available": False, "score": 50, "label": "CSW_TREND_NEUTRAL", "k_factor": 1.0, "confidence_nudge": 0.0, "note": "CSW trend unavailable; neutral"}
+
+    season = safe_float(statcast_profile.get("csw"), None)
+    recent = safe_float(statcast_profile.get("csw_recent_30"), None)
+    if recent is None:
+        recent = safe_float(statcast_profile.get("csw_recent_45"), None)
+    base = season
+    recent_pitches = safe_int(statcast_profile.get("csw_recent_30_pitches"), 0) or safe_int(statcast_profile.get("csw_recent_45_pitches"), 0) or 0
+    total_pitches = safe_int(statcast_profile.get("rows"), 0) or 0
+
+    if season is None or recent is None or recent_pitches < 40 or total_pitches < 120:
+        return {"available": False, "score": 50, "label": "CSW_TREND_THIN", "k_factor": 1.0, "confidence_nudge": 0.0, "recent_csw": None if recent is None else round(recent*100,1), "season_csw": None if season is None else round(season*100,1), "note": "CSW trend thin; neutral"}
+
+    delta = float(recent - base)
+    score = 50.0 + clamp(delta * 625.0, -18.0, 18.0)
+
+    if recent >= 0.315 and delta >= 0.025:
+        label, k_factor, conf = "CSW_TREND_SURGING", 1.018, 3.0
+    elif delta >= 0.018:
+        label, k_factor, conf = "CSW_TREND_UP", 1.012, 2.0
+    elif delta <= -0.025 and recent <= 0.275:
+        label, k_factor, conf = "CSW_TREND_FADING", 0.982, -3.0
+    elif delta <= -0.018:
+        label, k_factor, conf = "CSW_TREND_DOWN", 0.988, -2.0
+    else:
+        label, k_factor, conf = "CSW_TREND_STABLE", 1.000, 0.0
+
+    return {
+        "available": True,
+        "score": round(float(clamp(score, 30, 70)), 1),
+        "label": label,
+        "k_factor": round(float(k_factor), 3),
+        "confidence_nudge": round(float(conf), 2),
+        "recent_csw": round(recent * 100, 1),
+        "season_csw": round(base * 100, 1),
+        "delta": round(delta * 100, 1),
+        "recent_pitches": int(recent_pitches),
+        "note": f"{label}: recent CSW {recent*100:.1f}% vs season {base*100:.1f}% ({delta*100:+.1f} pts); K factor x{k_factor:.3f}",
+    }
+
+
+def apply_csw_trend_adjustment(k_rate, csw_trend_profile, enabled=True):
+    kr = safe_float(k_rate, None)
+    if kr is None or not enabled or not isinstance(csw_trend_profile, dict):
+        return k_rate, "CSW trend adjustment skipped"
+    factor = safe_float(csw_trend_profile.get("k_factor"), 1.0) or 1.0
+    factor = float(clamp(factor, 0.975, 1.025))
+    return float(clamp(kr * factor, 0.08, 0.50)), csw_trend_profile.get("note", "CSW trend neutral")
+
+
+def build_opponent_k_trend_score(lineup_rows, lineup_k=None, enabled=True):
+    """Opponent K Trend Score from confirmed/projected lineup rolling K rates.
+
+    Compares current/rolling batter K pressure to season batter K pressure. This is
+    a small matchup-context layer, not a replacement for Log5 or the existing
+    opponent K context.
+    """
+    if not enabled:
+        return {"available": False, "score": 50, "label": "OPP_K_TREND_OFF", "k_factor": 1.0, "confidence_nudge": 0.0, "note": "Opponent K trend off"}
+
+    rows = [r for r in (lineup_rows or []) if isinstance(r, dict)]
+    recent_vals, season_vals = [], []
+    for r in rows[:9]:
+        # Stored as percentages on lineup rows.
+        r14 = safe_float(r.get("Rolling 14d K%"), None)
+        r30 = safe_float(r.get("Rolling 30d K%"), None)
+        seas = safe_float(r.get("Season K%"), None)
+        used = safe_float(r.get("Used K%"), None)
+        recent_pct = r14 if r14 is not None else r30
+        if recent_pct is None and used is not None:
+            recent_pct = used
+        if recent_pct is not None and 0 <= recent_pct <= 60:
+            recent_vals.append(recent_pct / 100.0)
+        if seas is not None and 0 <= seas <= 60:
+            season_vals.append(seas / 100.0)
+
+    if len(recent_vals) < 5 or len(season_vals) < 5:
+        lk = safe_float(lineup_k, None)
+        if lk is None:
+            return {"available": False, "score": 50, "label": "OPP_K_TREND_THIN", "k_factor": 1.0, "confidence_nudge": 0.0, "note": "Opponent K trend thin; neutral"}
+        # Fallback: use level only, not direction.
+        if lk >= LEAGUE_AVG_K + 0.025:
+            return {"available": False, "score": 56, "label": "OPP_K_LEVEL_HIGH", "k_factor": 1.006, "confidence_nudge": 0.5, "recent_k": round(lk*100,1), "season_k": None, "delta": None, "note": f"Opponent K level high ({lk*100:.1f}%); tiny K factor x1.006"}
+        if lk <= LEAGUE_AVG_K - 0.025:
+            return {"available": False, "score": 44, "label": "OPP_K_LEVEL_LOW", "k_factor": 0.994, "confidence_nudge": -0.5, "recent_k": round(lk*100,1), "season_k": None, "delta": None, "note": f"Opponent K level low ({lk*100:.1f}%); tiny K factor x0.994"}
+        return {"available": False, "score": 50, "label": "OPP_K_TREND_THIN", "k_factor": 1.0, "confidence_nudge": 0.0, "note": "Opponent K trend thin; neutral"}
+
+    recent = float(np.mean(recent_vals))
+    season = float(np.mean(season_vals))
+    delta = recent - season
+    score = 50.0 + clamp(delta * 525.0, -16.0, 16.0)
+
+    if delta >= 0.025:
+        label, k_factor, conf = "OPP_K_TREND_RISING", 1.014, 2.0
+    elif delta >= 0.015:
+        label, k_factor, conf = "OPP_K_TREND_SLIGHT_UP", 1.008, 1.0
+    elif delta <= -0.025:
+        label, k_factor, conf = "OPP_K_TREND_FALLING", 0.986, -2.0
+    elif delta <= -0.015:
+        label, k_factor, conf = "OPP_K_TREND_SLIGHT_DOWN", 0.992, -1.0
+    else:
+        label, k_factor, conf = "OPP_K_TREND_STABLE", 1.000, 0.0
+
+    return {
+        "available": True,
+        "score": round(float(clamp(score, 34, 66)), 1),
+        "label": label,
+        "k_factor": round(float(k_factor), 3),
+        "confidence_nudge": round(float(conf), 2),
+        "recent_k": round(recent * 100, 1),
+        "season_k": round(season * 100, 1),
+        "delta": round(delta * 100, 1),
+        "sample": min(len(recent_vals), len(season_vals)),
+        "note": f"{label}: opponent recent K {recent*100:.1f}% vs season {season*100:.1f}% ({delta*100:+.1f} pts); K factor x{k_factor:.3f}",
+    }
+
+
+def apply_opponent_k_trend_adjustment(matchup_k, opponent_k_trend_profile, enabled=True):
+    mk = safe_float(matchup_k, None)
+    if mk is None or not enabled or not isinstance(opponent_k_trend_profile, dict):
+        return matchup_k, "Opponent K trend adjustment skipped"
+    factor = safe_float(opponent_k_trend_profile.get("k_factor"), 1.0) or 1.0
+    factor = float(clamp(factor, 0.982, 1.018))
+    return float(clamp(mk * factor, 0.03, 0.60)), opponent_k_trend_profile.get("note", "Opponent K trend neutral")
+
 def pitch_count_trend_bf_factor(recent_rows):
     """Recent pitch-count trend factor for starter BF/leash.
 
@@ -4026,7 +4160,7 @@ def apply_repeat_matchup_factor(k_rate, repeat_profile):
 # =========================
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_statcast_pitch_profile(pitcher_id, days=365):
-    empty = {"available": False, "message": "No pitcher id", "rows": 0, "csw": None, "whiff": None, "chase": None, "zone_contact": None, "pitch_mix": [], "pitch_type_profile": [], "putaway": None, "fastball_velo_season": None, "fastball_velo_recent": None, "fastball_velo_delta": None, "pitch_usage_trend": None, "pitch_usage_note": None, "first_strike_pct": None}
+    empty = {"available": False, "message": "No pitcher id", "rows": 0, "csw": None, "whiff": None, "chase": None, "zone_contact": None, "pitch_mix": [], "pitch_type_profile": [], "putaway": None, "fastball_velo_season": None, "fastball_velo_recent": None, "fastball_velo_delta": None, "pitch_usage_trend": None, "pitch_usage_note": None, "first_strike_pct": None, "csw_recent_30": None, "csw_recent_30_pitches": 0, "csw_recent_45": None, "csw_recent_45_pitches": 0}
     if not pitcher_id:
         return empty
     end = datetime.now()
@@ -4149,6 +4283,32 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
         except Exception:
             first_strike_pct = None
 
+        csw_recent_30 = None
+        csw_recent_30_pitches = 0
+        csw_recent_45 = None
+        csw_recent_45_pitches = 0
+        try:
+            if "game_date" in df.columns:
+                df_csw = df.copy()
+                gdt = pd.to_datetime(df_csw["game_date"], errors="coerce")
+                for _days, _name in [(30, "30"), (45, "45")]:
+                    cut = pd.Timestamp(end.date()) - pd.Timedelta(days=_days)
+                    rec = df_csw[gdt >= cut]
+                    if len(rec) >= 40:
+                        rec_desc = rec["description"].astype(str).str.lower()
+                        rec_called = rec_desc.eq("called_strike")
+                        rec_whiff = rec_desc.isin(["swinging_strike", "swinging_strike_blocked", "foul_tip"])
+                        val = float((int(rec_called.sum()) + int(rec_whiff.sum())) / max(len(rec), 1))
+                        if _days == 30:
+                            csw_recent_30 = val
+                            csw_recent_30_pitches = int(len(rec))
+                        else:
+                            csw_recent_45 = val
+                            csw_recent_45_pitches = int(len(rec))
+        except Exception:
+            csw_recent_30 = csw_recent_45 = None
+            csw_recent_30_pitches = csw_recent_45_pitches = 0
+
         pitch_mix = []
         pitch_type_profile = []
         if "pitch_type" in df.columns:
@@ -4177,7 +4337,7 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
                     "Pitches": int(row["Pitches"]),
                     "Swings": int(row["Swings"]),
                 })
-        return {"available": True, "message": "Real Statcast pitch-level data loaded", "rows": pitch_count, "csw": None if csw is None else float(csw), "whiff": None if whiff is None else float(whiff), "chase": None if chase is None else float(chase), "zone_contact": None if zone_contact is None else float(zone_contact), "pitch_mix": pitch_mix, "pitch_type_profile": pitch_type_profile, "fastball_velo_season": None if fastball_velo_season is None else round(float(fastball_velo_season), 2), "fastball_velo_recent": None if fastball_velo_recent is None else round(float(fastball_velo_recent), 2), "fastball_velo_delta": None if fastball_velo_delta is None else round(float(fastball_velo_delta), 2), "pitch_usage_trend": pitch_usage_trend or [], "pitch_usage_note": pitch_usage_note or "No meaningful recent pitch-usage shift", "first_strike_pct": None if first_strike_pct is None else float(first_strike_pct)}
+        return {"available": True, "message": "Real Statcast pitch-level data loaded", "rows": pitch_count, "csw": None if csw is None else float(csw), "whiff": None if whiff is None else float(whiff), "chase": None if chase is None else float(chase), "zone_contact": None if zone_contact is None else float(zone_contact), "pitch_mix": pitch_mix, "pitch_type_profile": pitch_type_profile, "fastball_velo_season": None if fastball_velo_season is None else round(float(fastball_velo_season), 2), "fastball_velo_recent": None if fastball_velo_recent is None else round(float(fastball_velo_recent), 2), "fastball_velo_delta": None if fastball_velo_delta is None else round(float(fastball_velo_delta), 2), "pitch_usage_trend": pitch_usage_trend or [], "pitch_usage_note": pitch_usage_note or "No meaningful recent pitch-usage shift", "first_strike_pct": None if first_strike_pct is None else float(first_strike_pct), "csw_recent_30": None if csw_recent_30 is None else float(csw_recent_30), "csw_recent_30_pitches": int(csw_recent_30_pitches or 0), "csw_recent_45": None if csw_recent_45 is None else float(csw_recent_45), "csw_recent_45_pitches": int(csw_recent_45_pitches or 0)}
     except Exception as e:
         empty["message"] = f"Statcast unavailable: {e}"
         return empty
@@ -7624,6 +7784,15 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     pitcher_k, statcast_note = apply_statcast_csw_adjustment(pitcher_k, statcast_profile, enabled=use_statcast)
     pitcher_k_after_statcast = safe_float(pitcher_k, pitcher_k_before_statcast) or pitcher_k_before_statcast
 
+    # CSW Trend Score: small real Statcast recent-direction nudge.
+    try:
+        csw_trend_profile = build_csw_trend_score(statcast_profile, enabled=use_statcast)
+        pitcher_k, csw_trend_note = apply_csw_trend_adjustment(pitcher_k, csw_trend_profile, enabled=use_statcast)
+    except Exception as _cswtrend_e:
+        csw_trend_profile = {"available": False, "score": 50, "label": "CSW_TREND_ERROR", "k_factor": 1.0, "confidence_nudge": 0.0, "note": f"CSW trend skipped: {_cswtrend_e}"}
+        csw_trend_note = csw_trend_profile.get("note")
+    pitcher_k_after_csw_trend = safe_float(pitcher_k, pitcher_k_after_statcast) or pitcher_k_after_statcast
+
     # v9.6 upgrade: prefer true batter-vs-pitch-type matchup when lineup is available.
     matchup_profile = build_pitch_type_matchup_profile(
         statcast_profile,
@@ -7644,7 +7813,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             pitch_type_note = matchup_profile.get("message", pitch_type_note)
 
     batter_pitch_profile_rows = matchup_profile.get("batter_rows", []) if isinstance(matchup_profile, dict) else []
-    pitcher_k_after_pitch_type = safe_float(pitcher_k, pitcher_k_after_statcast) or pitcher_k_after_statcast
+    pitcher_k_after_pitch_type = safe_float(pitcher_k, pitcher_k_after_csw_trend) or pitcher_k_after_csw_trend
 
     # Sabermetric K Layer: CSW + whiff + chase + zone contact, lightly capped.
     try:
@@ -7824,6 +7993,13 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     pitcher_k_after_calibration = safe_float(pitcher_k, pitcher_k_after_k_context) or pitcher_k_after_k_context
 
     matchup_k = calculate_log5_k_rate(pitcher_k, lineup_k)
+    # Opponent K Trend Score: small matchup nudge from rolling lineup K pressure.
+    try:
+        opponent_k_trend_profile = build_opponent_k_trend_score(lineup_rows, lineup_k=lineup_k, enabled=True)
+        matchup_k, opponent_k_trend_note = apply_opponent_k_trend_adjustment(matchup_k, opponent_k_trend_profile, enabled=True)
+    except Exception as _oppktrend_e:
+        opponent_k_trend_profile = {"available": False, "score": 50, "label": "OPP_K_TREND_ERROR", "k_factor": 1.0, "confidence_nudge": 0.0, "note": f"Opponent K trend skipped: {_oppktrend_e}"}
+        opponent_k_trend_note = opponent_k_trend_profile.get("note")
     opp_context_factor, opp_context_note = opponent_k_context_factor(lineup_k)
     matchup_k = clamp(matchup_k * opp_context_factor, 0.03, 0.60)
     ump_mult, ump_name, umpire_note = umpire_factor(row["game_pk"], enabled=use_umpire)
@@ -7931,6 +8107,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "statcast_available": statcast_profile.get("available"),
         "statcast_csw": None if statcast_profile.get("csw") is None else statcast_profile.get("csw") * 100,
         "statcast_whiff": None if statcast_profile.get("whiff") is None else statcast_profile.get("whiff") * 100,
+        "csw_trend_score": csw_trend_profile.get("score") if "csw_trend_profile" in locals() else 50,
+        "csw_trend_factor": csw_trend_profile.get("k_factor") if "csw_trend_profile" in locals() else 1.0,
+        "opponent_k_trend_score": opponent_k_trend_profile.get("score") if "opponent_k_trend_profile" in locals() else 50,
+        "opponent_k_trend_factor": opponent_k_trend_profile.get("k_factor") if "opponent_k_trend_profile" in locals() else 1.0,
         "sabermetric_k_score": sabermetric_k_profile.get("score") if "sabermetric_k_profile" in locals() else 50,
         "sabermetric_k_factor": sabermetric_k_profile.get("k_factor") if "sabermetric_k_profile" in locals() else 1.0,
         "pitch_type_matchup_available": pitch_type_available,
@@ -8473,6 +8653,18 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "statcast_whiff": None if statcast_profile.get("whiff") is None else round(statcast_profile.get("whiff") * 100, 1),
         "statcast_chase": None if statcast_profile.get("chase") is None else round(statcast_profile.get("chase") * 100, 1),
         "statcast_zone_contact": None if statcast_profile.get("zone_contact") is None else round(statcast_profile.get("zone_contact") * 100, 1),
+        "csw_recent_30": None if statcast_profile.get("csw_recent_30") is None else round(statcast_profile.get("csw_recent_30") * 100, 1),
+        "csw_recent_45": None if statcast_profile.get("csw_recent_45") is None else round(statcast_profile.get("csw_recent_45") * 100, 1),
+        "csw_trend_score": csw_trend_profile.get("score") if "csw_trend_profile" in locals() else 50,
+        "csw_trend_label": csw_trend_profile.get("label") if "csw_trend_profile" in locals() else "CSW_TREND_UNKNOWN",
+        "csw_trend_factor": csw_trend_profile.get("k_factor") if "csw_trend_profile" in locals() else 1.0,
+        "csw_trend_note": csw_trend_note if "csw_trend_note" in locals() else "CSW trend unavailable",
+        "opponent_k_trend_score": opponent_k_trend_profile.get("score") if "opponent_k_trend_profile" in locals() else 50,
+        "opponent_k_trend_label": opponent_k_trend_profile.get("label") if "opponent_k_trend_profile" in locals() else "OPP_K_TREND_UNKNOWN",
+        "opponent_k_trend_factor": opponent_k_trend_profile.get("k_factor") if "opponent_k_trend_profile" in locals() else 1.0,
+        "opponent_recent_k": opponent_k_trend_profile.get("recent_k") if "opponent_k_trend_profile" in locals() else None,
+        "opponent_season_k": opponent_k_trend_profile.get("season_k") if "opponent_k_trend_profile" in locals() else None,
+        "opponent_k_trend_note": opponent_k_trend_note if "opponent_k_trend_note" in locals() else "Opponent K trend unavailable",
         "sabermetric_k_score": sabermetric_k_profile.get("score") if "sabermetric_k_profile" in locals() else 50,
         "sabermetric_k_label": sabermetric_k_profile.get("label") if "sabermetric_k_profile" in locals() else "SABER_UNKNOWN",
         "sabermetric_k_factor": sabermetric_k_profile.get("k_factor") if "sabermetric_k_profile" in locals() else 1.0,
