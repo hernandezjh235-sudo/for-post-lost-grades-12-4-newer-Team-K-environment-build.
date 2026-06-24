@@ -3265,7 +3265,7 @@ def get_actual_pitcher_workload(game_pk, pitcher_id):
             person = p.get("person", {})
             if str(person.get("id")) == str(pitcher_id):
                 pitching = p.get("stats", {}).get("pitching", {}) or {}
-                return {
+                workload = {
                     "actual": safe_float(pitching.get("strikeOuts")),
                     "actual_bf": safe_float(pitching.get("battersFaced")),
                     "actual_pitches": safe_float(pitching.get("numberOfPitches", pitching.get("pitchesThrown", pitching.get("pitchCount")))),
@@ -3278,7 +3278,226 @@ def get_actual_pitcher_workload(game_pk, pitcher_id):
                     "actual_team_id": team_info.get("id"),
                     "actual_team_side": side,
                 }
+                try:
+                    workload.update(get_actual_first_inning_pitcher_workload(game_pk, pitcher_id))
+                except Exception:
+                    pass
+                return workload
     return {}
+
+
+# -----------------------------------------------------------------------------
+# First Inning Layer 3.0 (TRACKING / WORKLOAD CONFIDENCE ONLY)
+# -----------------------------------------------------------------------------
+# This layer is intentionally conservative. It DOES NOT directly move K projection,
+# Line-Aware Smart Final K Projection, BF formula, IP formula, or official decisions.
+# It starts as day-1 tracking, then becomes a confidence/workload context once enough
+# graded samples exist.
+
+def get_actual_first_inning_pitcher_workload(game_pk, pitcher_id):
+    """Return first-inning workload for a pitcher from MLB play-by-play.
+
+    Fields are saved into the graded pick/result log so the model can learn first
+    inning efficiency over time. If play-by-play is unavailable, safely returns {}.
+    """
+    data = safe_get_json(f"{MLB_BASE}/game/{game_pk}/feed/live")
+    if not data:
+        return {}
+    plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+    pitcher_id_s = str(pitcher_id)
+    pitches = 0
+    batters_faced = 0
+    ks = 0
+    walks = 0
+    hits = 0
+    runs = 0
+    events_seen = 0
+    for play in plays:
+        try:
+            about = play.get("about") or {}
+            if int(about.get("inning") or 0) != 1:
+                continue
+            matchup = play.get("matchup") or {}
+            pitcher = matchup.get("pitcher") or {}
+            if str(pitcher.get("id")) != pitcher_id_s:
+                continue
+            batters_faced += 1
+            events_seen += 1
+            for ev in (play.get("playEvents") or []):
+                details = ev.get("details") or {}
+                if ev.get("isPitch") or details.get("isPitch"):
+                    pitches += 1
+            result = play.get("result") or {}
+            event_type = str(result.get("eventType") or result.get("event") or "").lower()
+            if "strikeout" in event_type:
+                ks += 1
+            if event_type in ["walk", "intent_walk", "hit_by_pitch"] or "walk" in event_type:
+                walks += 1
+            if event_type in ["single", "double", "triple", "home_run"]:
+                hits += 1
+            rbi = safe_float(result.get("rbi"), 0) or 0
+            runs += int(max(0, rbi))
+        except Exception:
+            continue
+    if events_seen <= 0 and pitches <= 0:
+        return {}
+    return {
+        "first_inning_pitches_actual": int(pitches),
+        "first_inning_bf_actual": int(batters_faced),
+        "first_inning_k_actual": int(ks),
+        "first_inning_bb_actual": int(walks),
+        "first_inning_hits_actual": int(hits),
+        "first_inning_runs_actual": int(runs),
+        "first_inning_tracked_at": now_iso(),
+    }
+
+
+def _first_inning_label(avg_pitches, samples=0):
+    if not samples or avg_pitches is None:
+        return "FI_TRACK_ONLY"
+    x = float(avg_pitches)
+    if x < 12:
+        return "FI_ELITE_EFFICIENT_START"
+    if x <= 15:
+        return "FI_GOOD_START"
+    if x <= 18:
+        return "FI_AVERAGE_START"
+    if x <= 22:
+        return "FI_STRESS_START"
+    return "FI_DANGER_HIGH_PITCH_1ST"
+
+
+def _first_inning_confidence(samples):
+    n = int(samples or 0)
+    if n <= 0:
+        return "DAY_1_TRACK_ONLY"
+    if n < 3:
+        return "LOW_SAMPLE_TRACK_ONLY"
+    if n < 6:
+        return "SMALL_SAMPLE_DISPLAY_ONLY"
+    if n < 10:
+        return "USABLE_CONTEXT_LIGHT"
+    return "STABLE_CONTEXT"
+
+
+def build_first_inning_efficiency_profile(pitcher_id=None, pitcher_name=None, results=None):
+    """Build first-inning efficiency profile from graded results.
+
+    Design: informational/context only. projection_impact_k is always 0.00 so
+    tomorrow's K projections are protected while data accumulates.
+    """
+    results = load_json(RESULT_LOG, []) if results is None else (results or [])
+    rows = []
+    pid_s = str(pitcher_id) if pitcher_id is not None else ""
+    name_s = str(pitcher_name or "").strip().lower()
+    for r in results:
+        try:
+            if pid_s and str(r.get("pitcher_id") or r.get("Pitcher ID") or "") != pid_s:
+                # If pitcher ID is missing in older rows, allow exact name match below.
+                if name_s and str(r.get("pitcher") or r.get("Pitcher") or "").strip().lower() != name_s:
+                    continue
+            elif not pid_s and name_s and str(r.get("pitcher") or r.get("Pitcher") or "").strip().lower() != name_s:
+                continue
+            fp = safe_float(r.get("first_inning_pitches_actual"), None)
+            if fp is None:
+                continue
+            rows.append(r)
+        except Exception:
+            continue
+    samples = len(rows)
+    def avg_field(field):
+        vals = [safe_float(x.get(field), None) for x in rows]
+        vals = [v for v in vals if v is not None]
+        return None if not vals else round(float(np.mean(vals)), 2)
+    avg_p = avg_field("first_inning_pitches_actual")
+    avg_bf = avg_field("first_inning_bf_actual")
+    avg_k = avg_field("first_inning_k_actual")
+    avg_bb = avg_field("first_inning_bb_actual")
+    label = _first_inning_label(avg_p, samples)
+    confidence = _first_inning_confidence(samples)
+    score = 50.0
+    if avg_p is not None and samples >= 3:
+        # Score is a workload confidence clue only. It does not alter projections.
+        score = 50.0 + clamp((16.5 - float(avg_p)) * 3.0, -25, 25)
+    score = round(float(clamp(score, 20, 80)), 1)
+    if samples <= 0:
+        note = "First inning layer is live but starts at Day 1: tracking only; no projection impact."
+    else:
+        note = f"{label}: {samples} graded sample(s), avg 1st inning pitches {avg_p}; confidence {confidence}. Projection impact 0.00 K."
+    return {
+        "samples": samples,
+        "avg_pitches": avg_p,
+        "avg_bf": avg_bf,
+        "avg_k": avg_k,
+        "avg_bb": avg_bb,
+        "score": score,
+        "label": label,
+        "confidence": confidence,
+        "projection_impact_k": 0.0,
+        "note": note,
+    }
+
+
+def build_decision_tier_3_0(p, d=None):
+    """Non-invasive decision tier display.
+
+    This creates a clearer middle ground between hard PASS and official plays.
+    It does not overwrite the existing Decision, Line-Aware Smart Decision, K PROJ,
+    projection, IP, BF, or saved grading logic.
+    """
+    d = d or {}
+    decision = str(d.get("decision") or p.get("Line-Aware Smart Decision") or p.get("Decision") or "").upper()
+    lean = str(d.get("lean_side") or p.get("Model Lean") or p.get("market_lean") or "").upper()
+    edge = abs(safe_float(d.get("line_edge"), safe_float(p.get("Line-Aware Smart Edge"), safe_float(p.get("Edge Gap"), 0))) or 0)
+    hit = safe_float(d.get("hit_rate"), None)
+    role_score = safe_float(d.get("role_score"), safe_float(p.get("Role Score"), 50)) or 50
+    starter_score = safe_float(d.get("starter_score"), safe_float(p.get("Starter Score"), 50)) or 50
+    conflict = safe_float(p.get("conflict_score_2_2") or p.get("Conflict Score 2.2") or p.get("conflict_score"), 0) or 0
+    market_agree = str(p.get("market_agreement") or p.get("Market Agree") or "").upper()
+    fi_label = str(p.get("first_inning_efficiency_label") or "")
+
+    reasons = []
+    if "OVER" in lean:
+        lean_side = "OVER"
+    elif "UNDER" in lean:
+        lean_side = "UNDER"
+    else:
+        lean_side = "LEAN"
+
+    if "🔥" in decision or decision.startswith("✅ OVER") or decision.startswith("✅ UNDER"):
+        tier = "OFFICIAL"
+    elif "OVER LEAN" in decision or "UNDER LEAN" in decision:
+        tier = "PLAYABLE"
+    elif "PASS" in decision and edge >= 0.45:
+        tier = f"PASS-LEAN {lean_side}"
+        reasons.append("Projection still has directional lean; not a dead play")
+    elif "PASS" in decision:
+        tier = "TRACK ONLY"
+    else:
+        tier = "TRACK ONLY"
+
+    if conflict >= 3:
+        if tier == "OFFICIAL":
+            tier = "PLAYABLE"
+        elif tier == "PLAYABLE":
+            tier = f"PASS-LEAN {lean_side}"
+        reasons.append("conflict score elevated")
+    if market_agree in ["DISAGREE", "MARKET_DISAGREE"] and tier == "OFFICIAL":
+        tier = "PLAYABLE"
+        reasons.append("market disagreement")
+    if role_score < 45 or starter_score < 45:
+        tier = "TRACK ONLY" if "PASS-LEAN" in tier or tier == "PLAYABLE" else tier
+        reasons.append("role/starter confidence low")
+    if "DANGER" in fi_label and tier == "OFFICIAL":
+        tier = "PLAYABLE"
+        reasons.append("first inning stress profile warning")
+    if edge < 0.25 and "PASS" in decision:
+        tier = "AVOID"
+        reasons.append("edge too thin")
+    return {
+        "decision_tier_3_0": tier,
+        "decision_tier_3_0_note": "; ".join(reasons) if reasons else "Tier is display-only; core projection unchanged.",
+    }
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -7839,6 +8058,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     profile = get_pitcher_profile(pid)
     recent_rows = get_recent_logs(pid)
     leash = build_leash_model(recent_rows)
+    # First Inning Layer 3.0: tracking / workload-confidence context only.
+    # Day-1 starts neutral and never moves K projection directly.
+    first_inning_profile = build_first_inning_efficiency_profile(pid, pitcher_name)
 
     lineup_k, lineup_rows, lineup_msg, lineup_locked = calculate_lineup_k_rate(row["game_pk"], row["opp_side"], hand)
     if lineup_k is None:
@@ -8611,6 +8833,17 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "pitch_count_bf_factor": leash.get("pitch_count_bf_factor"),
         "pitch_count_volatility_tax": leash.get("pitch_count_volatility_tax"),
         "pitch_count_note": leash.get("pitch_count_note"),
+        "first_inning_layer_version": "FIRST_INNING_LAYER_3_0_TRACKING_ONLY_2026_06_24",
+        "first_inning_sample": first_inning_profile.get("samples") if "first_inning_profile" in locals() else 0,
+        "first_inning_avg_pitches": first_inning_profile.get("avg_pitches") if "first_inning_profile" in locals() else None,
+        "first_inning_avg_bf": first_inning_profile.get("avg_bf") if "first_inning_profile" in locals() else None,
+        "first_inning_avg_k": first_inning_profile.get("avg_k") if "first_inning_profile" in locals() else None,
+        "first_inning_avg_bb": first_inning_profile.get("avg_bb") if "first_inning_profile" in locals() else None,
+        "first_inning_efficiency_score": first_inning_profile.get("score") if "first_inning_profile" in locals() else 50,
+        "first_inning_efficiency_label": first_inning_profile.get("label") if "first_inning_profile" in locals() else "FI_TRACK_ONLY",
+        "first_inning_confidence": first_inning_profile.get("confidence") if "first_inning_profile" in locals() else "DAY_1_TRACK_ONLY",
+        "first_inning_projection_impact_k": first_inning_profile.get("projection_impact_k") if "first_inning_profile" in locals() else 0.0,
+        "first_inning_note": first_inning_profile.get("note") if "first_inning_profile" in locals() else "First inning layer unavailable; no projection impact.",
         "leash_risk": leash.get("leash_risk"),
         "bullpen_status": bullpen_usage.get("label") if isinstance(bullpen_usage, dict) else None,
         "bullpen_bf_factor": round(safe_float(bullpen_factor, 1.0), 3),
@@ -9614,9 +9847,14 @@ def _sq_text(row):
         return str(row).upper()
 
 def compute_slate_quality_score(picks):
-    """Return advisory slate score based on role/leash/edge risk.
+    """Return advisory slate score based on playable-edge quality and slate-wide risk.
 
-    This is intentionally display-only. It does not mutate picks.
+    Display-only. This does not mutate picks or change projections, K math,
+    save/grade, odds, or player cards.
+
+    v2 fix: avoid punishing the whole slate to 0/100 when there are many good
+    individual plays. Strong/playable edges now lift the board, and risk
+    penalties are capped so the slate label better matches real results.
     """
     picks = list(picks or [])
     total = len(picks)
@@ -9630,14 +9868,20 @@ def compute_slate_quality_score(picks):
             "counts": {}
         }
 
-    low_leash = 0
     opener_bulk = 0
+    low_leash = 0
     thin_edge = 0
     low_ip = 0
     no_line = 0
     strong_edge = 0
+    playable_edge = 0
+    official_like = 0
+    market_agree = 0
+    market_disagree = 0
     high_line_difficulty = 0
     unknown_role = 0
+    confidence_vals = []
+    edge_vals = []
 
     for p in picks:
         line = _sq_num(p.get("line", p.get("UD/Line", p.get("Current Line"))), None)
@@ -9660,19 +9904,36 @@ def compute_slate_quality_score(picks):
         if edge is None and proj is not None and line is not None:
             edge = proj - line
 
+        conf = _sq_num(p.get("Confidence %", p.get("confidence", p.get("Confidence"))), None)
+        if conf is not None:
+            # Some app rows may store 0-1 instead of 0-100.
+            if 0 <= conf <= 1:
+                conf *= 100
+            confidence_vals.append(conf)
+
         ip = _sq_num(p.get("IP Floor", p.get("ip_floor", p.get("IP", p.get("Projected IP")))), None)
         blob = _sq_text(p)
 
         if line is None:
             no_line += 1
         if edge is not None:
-            if abs(edge) < 0.50:
+            abs_edge = abs(edge)
+            edge_vals.append(abs_edge)
+            if abs_edge < 0.50:
                 thin_edge += 1
-            if abs(edge) >= 1.25:
+            if abs_edge >= 0.75:
+                playable_edge += 1
+            if abs_edge >= 1.25:
                 strong_edge += 1
         if ip is not None and ip < 4.0:
             low_ip += 1
 
+        if any(term in blob for term in ["OFFICIAL", "ELITE EDGE", "MARKET CONFIRMS", "🔥", "LOCK", "ATTACK"]):
+            official_like += 1
+        if any(term in blob for term in ["MARKET_AGREE", "MARKET AGREE", "MARKET CONFIRMS", "AGREE"]):
+            market_agree += 1
+        if any(term in blob for term in ["MARKET_DISAGREE", "MARKET DISAGREE", "DISAGREE", "CONFLICT"]):
+            market_disagree += 1
         if any(term in blob for term in ["OPENER", "BULK", "FOLLOWER", "RELIEVER", "BULLPEN GAME"]):
             opener_bulk += 1
         if any(term in blob for term in ["LOW_LEASH", "QUICK_HOOK", "LEASH_RISK", "DEEP_LEASH_UNDER_RISK", "MANAGER QUICK", "PULL RISK"]):
@@ -9682,40 +9943,81 @@ def compute_slate_quality_score(picks):
         if any(term in blob for term in ["UNKNOWN_ROLE", "LOW_SAMPLE", "DEBUT", "ROOKIE", "NO_SAMPLE_GATE", "NO_LOG"]):
             unknown_role += 1
 
-    # Sunday/getaway risk: advisory only.
     try:
         is_sunday = california_now().weekday() == 6
     except Exception:
         import datetime
         is_sunday = datetime.datetime.now().weekday() == 6
 
-    score = 100
-    score -= opener_bulk * 5
-    score -= low_leash * 3
-    score -= thin_edge * 2
-    score -= low_ip * 2
-    score -= unknown_role * 2
-    score -= high_line_difficulty * 1
-    score -= no_line * 1
-    if is_sunday:
-        score -= 5
+    avg_conf = sum(confidence_vals) / len(confidence_vals) if confidence_vals else 0.0
+    avg_edge = sum(edge_vals) / len(edge_vals) if edge_vals else 0.0
 
-    # Reward boards with a healthy amount of real strong edges.
-    if strong_edge >= 5:
+    # Build from a neutral base so quality edges can overcome slate noise.
+    score = 45.0
+
+    # Positive quality signals: this is what makes a board yellow/green when there
+    # are actually enough good plays.
+    score += min(24, strong_edge * 2.0)
+    score += min(12, playable_edge * 0.75)
+    score += min(10, official_like * 1.0)
+    score += min(8, market_agree * 0.6)
+    if avg_conf >= 70:
+        score += 8
+    elif avg_conf >= 64:
         score += 5
-    elif strong_edge >= 3:
+    elif avg_conf >= 58:
         score += 3
+    if avg_edge >= 1.20:
+        score += 6
+    elif avg_edge >= 0.90:
+        score += 4
+    elif avg_edge >= 0.65:
+        score += 2
+
+    # Risk signals: capped so one noisy slate cannot auto-drop to 0 when it still
+    # contains many good plays.
+    score -= min(14, opener_bulk * 0.7)
+    score -= min(10, low_leash * 0.8)
+    score -= min(8, thin_edge * 0.8)
+    score -= min(10, low_ip * 0.6)
+    score -= min(8, unknown_role * 0.8)
+    score -= min(6, high_line_difficulty * 0.7)
+    score -= min(5, no_line * 0.5)
+    score -= min(6, market_disagree * 0.5)
+    if is_sunday:
+        score -= 3
+
+    # Strong-edge override: a board with enough legitimate edges should never
+    # show 0/100 AVOID just because the full slate also has risk flags.
+    if strong_edge >= 10 and (avg_conf >= 55 or official_like >= 5):
+        score = max(score, 52)
+    elif strong_edge >= 7 and (avg_conf >= 55 or official_like >= 4):
+        score = max(score, 45)
+    elif strong_edge >= 5 and playable_edge >= 10:
+        score = max(score, 40)
 
     score = max(0, min(100, int(round(score))))
 
     if score >= 80:
-        emoji, label, summary = "🟢", "ATTACK SLATE", "Board quality looks strong. Normal volume is acceptable if individual plays still pass filters."
-    elif score >= 60:
-        emoji, label, summary = "🟡", "SELECTIVE SLATE", "Use tighter selection. Prioritize strong edges and high-leash pitchers."
+        emoji, label, summary = "🟢", "STRONG SLATE", "Plenty of quality edges. Still confirm each player card, market, and Outlier before final slips."
+    elif score >= 65:
+        emoji, label, summary = "🟢", "ATTACK SPOTS", "Good board quality. Attack the strongest edges, not every play."
+    elif score >= 45:
+        emoji, label, summary = "🟡", "SELECTIVE SLATE", "Playable slate. Focus on strong edges, market agreement, and clean workload profiles."
+    elif score >= 25:
+        emoji, label, summary = "🟠", "TRACK CAREFULLY", "Thin or volatile board. Smaller volume and tighter filtering recommended."
     else:
-        emoji, label, summary = "🔴", "AVOID / TRACK ONLY", "High-volatility slate. Consider reducing volume and tracking more than betting."
+        emoji, label, summary = "🔴", "AVOID / TRACK ONLY", "Very weak board quality. Track more than betting unless individual cards are exceptional."
 
     reasons = []
+    if strong_edge:
+        reasons.append(f"{strong_edge} strong-edge plays helped the slate score")
+    if playable_edge:
+        reasons.append(f"{playable_edge} playable-edge rows detected")
+    if official_like:
+        reasons.append(f"{official_like} official/market-confirm style signals")
+    if market_agree:
+        reasons.append(f"{market_agree} market-agree signals")
     if opener_bulk:
         reasons.append(f"{opener_bulk} opener/bulk/role-risk flags")
     if low_leash:
@@ -9744,6 +10046,10 @@ def compute_slate_quality_score(picks):
         "counts": {
             "total": total,
             "strong_edge": strong_edge,
+            "playable_edge": playable_edge,
+            "official_like": official_like,
+            "market_agree": market_agree,
+            "market_disagree": market_disagree,
             "thin_edge": thin_edge,
             "opener_bulk": opener_bulk,
             "low_leash": low_leash,
@@ -9751,6 +10057,8 @@ def compute_slate_quality_score(picks):
             "unknown_role": unknown_role,
             "high_line_difficulty": high_line_difficulty,
             "no_line": no_line,
+            "avg_conf": round(avg_conf, 1),
+            "avg_edge": round(avg_edge, 2),
             "sunday": is_sunday,
         }
     }
@@ -9765,7 +10073,7 @@ def render_slate_quality_score(picks):
     summary = q.get("summary", "")
     counts = q.get("counts", {}) or {}
 
-    color = "#22c55e" if score >= 80 else ("#f59e0b" if score >= 60 else "#ef4444")
+    color = "#22c55e" if score >= 65 else ("#f59e0b" if score >= 45 else ("#f97316" if score >= 25 else "#ef4444"))
 
     st.markdown(f"""
     <div class="green-card" style="border-left: 6px solid {color};">
@@ -9773,7 +10081,7 @@ def render_slate_quality_score(picks):
       <div class="big-number" style="color:{color};">{emoji} {score}/100 — {label}</div>
       <div style="margin-top:6px;">{summary}</div>
       <div style="margin-top:8px;" class="small-muted">
-        Total: {counts.get('total', 0)} | Strong edges: {counts.get('strong_edge', 0)} | Thin edges: {counts.get('thin_edge', 0)}
+        Total: {counts.get('total', 0)} | Strong edges: {counts.get('strong_edge', 0)} | Playable: {counts.get('playable_edge', 0)} | Thin: {counts.get('thin_edge', 0)}
       </div>
       <div style="margin-top:8px;">{reasons_html}</div>
       <div style="margin-top:8px;" class="small-muted">
@@ -11877,6 +12185,16 @@ def render_kproj_pitcher_card(p):
     no_vig_o_display = _card_pct(p.get('market_over_no_vig'))
     no_vig_u_display = _card_pct(p.get('market_under_no_vig'))
     no_vig_note_display = html.escape(str(p.get('market_no_vig_note') or 'No paired odds saved yet'))
+    tier3 = build_decision_tier_3_0(p, d)
+    decision_tier_display = html.escape(str(tier3.get('decision_tier_3_0') or 'TRACK ONLY'))
+    decision_tier_note_display = html.escape(str(tier3.get('decision_tier_3_0_note') or 'Tier is display-only; core projection unchanged.'))
+    fi_sample_display = p.get('first_inning_sample', 0)
+    fi_avg_p_display = '—' if p.get('first_inning_avg_pitches') is None else f"{safe_float(p.get('first_inning_avg_pitches'),0):.1f}"
+    fi_avg_bf_display = '—' if p.get('first_inning_avg_bf') is None else f"{safe_float(p.get('first_inning_avg_bf'),0):.1f}"
+    fi_avg_k_display = '—' if p.get('first_inning_avg_k') is None else f"{safe_float(p.get('first_inning_avg_k'),0):.2f}"
+    fi_label_display = html.escape(str(p.get('first_inning_efficiency_label') or 'FI_TRACK_ONLY'))
+    fi_conf_display = html.escape(str(p.get('first_inning_confidence') or 'DAY_1_TRACK_ONLY'))
+    fi_note_display = html.escape(str(p.get('first_inning_note') or 'First inning layer tracking only; no projection impact.'))
     slate_q = st.session_state.get('slate_quality_info') or compute_slate_quality_score([p])
     slate_badge_text = f"{slate_q.get('emoji','⚪')} {slate_q.get('label','NO BOARD')} {slate_q.get('score',0)}/100"
     st.markdown(f"""
@@ -11893,7 +12211,7 @@ def render_kproj_pitcher_card(p):
         <div><div class="small-muted">Final K Projection</div><div class="big-number green">{d['projection']}</div><div class="small-muted">{card_k_projection_source} | BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
         <div><div class="small-muted">Edge</div><div class="big-number green">{edge_display}</div><div class="small-muted">Under wins {under_max_display}</div></div>
-        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
+        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}<br>Tier 3.0: {decision_tier_display}</div></div>
       </div>
       <div class="hr-soft"></div>
       <div class="mobile-decision-grid">
@@ -11903,6 +12221,8 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Avg Ks</div><div class="kpi-value" style="font-size:18px;">{avg_k_display}</div><div class="kpi-sub">{avg_k_sub}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Form</div><div class="kpi-value" style="font-size:15px;">{p.get('recent_vs_season_flag', '—')}</div><div class="kpi-sub">L3 {p.get('recent_form_l3', '—')} | L10 {p.get('recent_form_l10', '—')}</div></div>
@@ -11915,6 +12235,11 @@ def render_kproj_pitcher_card(p):
         <div class="kpi-value" style="font-size:16px;">{html.escape(why_summary)}</div>
         <div class="kpi-sub" style="margin-top:8px;"><b>Green signals:</b><br>{why_green_html}</div>
         <div class="kpi-sub" style="margin-top:8px;"><b>Risk checks:</b><br>{why_risk_html}</div>
+      </div>
+      <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
+        <div class="small-muted">First Inning Layer 3.0</div>
+        <div class="kpi-value" style="font-size:16px;">{fi_label_display} • {fi_conf_display}</div>
+        <div class="kpi-sub" style="margin-top:6px;">{fi_note_display}<br><b>Projection impact:</b> 0.00 K until enough graded samples prove value.</div>
       </div>
       <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
         <div class="small-muted">Projection Attribution</div>
@@ -11942,10 +12267,25 @@ def render_kproj_pitcher_card(p):
                 k_val = r.get("Used K%")
                 if k_val is None:
                     k_val = r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate")
+                kv_num = safe_float(k_val, None)
+                if kv_num is not None and abs(kv_num) <= 1.0:
+                    kv_num *= 100.0
+                if kv_num is None:
+                    k_tag = "—"
+                elif kv_num >= 30:
+                    k_tag = "🔥 Very High-K"
+                elif kv_num >= 25:
+                    k_tag = "⭐ High-K"
+                elif kv_num <= 15:
+                    k_tag = "⚠️ Contact"
+                else:
+                    k_tag = "Neutral"
                 rows.append({
                     "#": i,
                     "Batter": r.get("Batter") or r.get("Name") or r.get("Player") or r.get("player") or "",
+                    "Hand": r.get("Bat Side") or r.get("Bats") or r.get("Hand") or r.get("Side") or "—",
                     "K%": _display_pct_value(k_val),
+                    "K Tag": k_tag,
                     "Lineup Source": _short_lineup_source(r),
                     "K Data": r.get("K Source") or r.get("Source") or r.get("K_Note") or "",
                 })
@@ -12033,6 +12373,7 @@ def build_kproj_table(board):
     for p in board or []:
         d = kproj_decision(p)
         dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
+        tier3 = build_decision_tier_3_0(p, d)
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
@@ -12073,6 +12414,15 @@ def build_kproj_table(board):
             "Matchup Hist Label": p.get("matchup_history_label"),
             "Hit Rate %": None if d.get("hit_rate") is None else round(d.get("hit_rate") * 100, 1),
             "Tier": d.get("tier"),
+            "Decision Tier 3.0": tier3.get("decision_tier_3_0"),
+            "Decision Tier 3.0 Note": tier3.get("decision_tier_3_0_note"),
+            "1st Inning Sample": p.get("first_inning_sample"),
+            "1st Inning Avg Pitches": p.get("first_inning_avg_pitches"),
+            "1st Inning Avg BF": p.get("first_inning_avg_bf"),
+            "1st Inning Avg K": p.get("first_inning_avg_k"),
+            "1st Inning Label": p.get("first_inning_efficiency_label"),
+            "1st Inning Confidence": p.get("first_inning_confidence"),
+            "1st Inning Projection Impact": p.get("first_inning_projection_impact_k"),
             "Role Score": d.get("role_score"),
             "Starter Score": d.get("starter_score"),
             "IP Floor": d.get("ip_floor"),
