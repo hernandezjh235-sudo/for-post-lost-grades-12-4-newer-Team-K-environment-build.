@@ -9852,7 +9852,7 @@ def compute_slate_quality_score(picks):
     Display-only. This does not mutate picks or change projections, K math,
     save/grade, odds, or player cards.
 
-    v2 fix: avoid punishing the whole slate to 0/100 when there are many good
+    v3 fix: avoid under-scoring selective/profitable slates when there are many good
     individual plays. Strong/playable edges now lift the board, and risk
     penalties are capped so the slate label better matches real results.
     """
@@ -9987,14 +9987,20 @@ def compute_slate_quality_score(picks):
     if is_sunday:
         score -= 3
 
-    # Strong-edge override: a board with enough legitimate edges should never
-    # show 0/100 AVOID just because the full slate also has risk flags.
-    if strong_edge >= 10 and (avg_conf >= 55 or official_like >= 5):
-        score = max(score, 52)
+    # Strong-edge / playable-board override: a slate with enough legitimate
+    # edges should not grade like a dead board just because the full slate also
+    # contains risky starters. This is still advisory only and does not touch
+    # any player projection, IP, BF, odds, save, or grade logic.
+    if strong_edge >= 12 and playable_edge >= 18 and (market_agree >= 8 or official_like >= 8):
+        # Example: a 17-12 / ~59% type board should land around Selective 60,
+        # not low-yellow/near-track.
+        score = max(score, 60)
+    elif strong_edge >= 10 and playable_edge >= 15 and (avg_conf >= 55 or official_like >= 5):
+        score = max(score, 56)
     elif strong_edge >= 7 and (avg_conf >= 55 or official_like >= 4):
-        score = max(score, 45)
+        score = max(score, 47)
     elif strong_edge >= 5 and playable_edge >= 10:
-        score = max(score, 40)
+        score = max(score, 42)
 
     score = max(0, min(100, int(round(score))))
 
