@@ -26528,7 +26528,7 @@ def _okr_pitcher_hand_from_any(row=None, p=None):
         sources.append(row)
     if isinstance(p, dict):
         sources.append(p)
-    keys = ["Pitcher Hand", "Throws", "Throwing Hand", "Hand", "P Hand", "p_throws", "throws", "arm", "Pitcher Throws"]
+    keys = ["Pitcher Hand", "pitcher_hand", "Throws", "Throwing Hand", "Hand", "hand", "P Hand", "p_throws", "throws", "arm", "Pitcher Throws", "pitcher_throws", "throwing_hand", "throws_hand"]
     txts = []
     for src in sources:
         for k in keys:
