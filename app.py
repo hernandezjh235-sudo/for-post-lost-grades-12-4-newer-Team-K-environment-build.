@@ -12201,7 +12201,6 @@ def render_kproj_pitcher_card(p):
     okr_k_hand_display = html.escape(str(okr_ctx.get('k_hand', '—')))
     okr_rank_hand_display = html.escape(str(okr_ctx.get('rank_hand', '—')))
     okr_source_display = html.escape(str(okr_ctx.get('source', ''))[:80])
-    okr_overall_line = html.escape(str(okr_ctx.get('overall_line', 'Overall: — / —')))
     okr_rhp_line = html.escape(str(okr_ctx.get('rhp_line', 'RHP: — / —')))
     okr_lhp_line = html.escape(str(okr_ctx.get('lhp_line', 'LHP: — / —')))
     okr_l30_rhp_line = html.escape(str(okr_ctx.get('l30_rhp_line', 'L30 RHP: — / —')))
@@ -12242,7 +12241,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_overall_line}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}<br>Source: MLB.com official K% (SO/PA)</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}</div></div>
         <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
@@ -12275,7 +12274,7 @@ def render_kproj_pitcher_card(p):
         <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
         <div class="kpi-box"><div class="kpi-label">Pitcher K%</div><div class="kpi-value">{pk*100:.1f}%</div><div class="kpi-sub">Season/recent blend</div></div>
         <div class="kpi-box"><div class="kpi-label">Opp K%</div><div class="kpi-value">{ok*100:.1f}%</div><div class="kpi-sub">Lineup/team matchup</div></div>
-        <div class="kpi-box"><div class="kpi-label">Team K Rank</div><div class="kpi-value" style="font-size:16px;">{okr_rank_hand_display}</div><div class="kpi-sub">{okr_team_display} vs {okr_hand_display}<br>{okr_k_hand_display}<br>MLB.com Official</div></div>
+        <div class="kpi-box"><div class="kpi-label">Team K Rank</div><div class="kpi-value" style="font-size:16px;">{okr_rank_hand_display}</div><div class="kpi-sub">{okr_team_display} vs {okr_hand_display}<br>{okr_k_hand_display}</div></div>
         <div class="kpi-box"><div class="kpi-label">Distribution</div><div class="kpi-value" style="font-size:17px;">{dist_display}</div><div class="kpi-sub">Floor | Median | Ceiling</div></div>
         <div class="kpi-box"><div class="kpi-label">Last 10 Starts</div>{recent_html}</div>
       </div>
@@ -12703,7 +12702,7 @@ def render_kproj_tab(board):
     # Shows the verified Top-5 lists from the same MLB official pull used by the card boxes.
     try:
         with st.expander("Opponent Team K Rank Audit — Top 5 by split", expanded=False):
-            st.caption("Pulled from MLB.com official team hitting stats backend. K% is SO / PA. Rank #1 = highest team K%. This is an audit panel only. StatMuse raw SO vs starters is a reference check, not the app's main source.")
+            st.caption("Pulled from MLB.com official team hitting stats backend. Rank #1 = highest team K%. This is an audit panel only.")
             ktop = _okr_top5_test_table() if '_okr_top5_test_table' in globals() else pd.DataFrame()
             if isinstance(ktop, pd.DataFrame) and not ktop.empty:
                 st.dataframe(ktop, use_container_width=True, hide_index=True)
@@ -26328,7 +26327,7 @@ def render_pitcher_fs_tab(board=None):
 # - Adds context/export columns only.
 # - Uses pitcher handedness to choose opponent K% vs RHP/LHP when available.
 # =============================================================
-OPP_K_RANK_ENGINE_VERSION = "OPP_TEAM_K_RANK_3_3_MLB_OFFICIAL_KPCT_SOURCE_AUDIT_2026_06_25"
+OPP_K_RANK_ENGINE_VERSION = "OPP_TEAM_K_RANK_3_1_MLB_OFFICIAL_SAFE_2026_06_24"
 
 try:
     import datetime as _okr_dt
@@ -26510,9 +26509,6 @@ def _okr_cache_fetch_table(season=None):
     season = season or _okr_mlb_season()
     # sitCodes convention on MLB Stats API/BDFED: vr = batting vs RHP, vl = batting vs LHP.
     splits = {
-        # Overall = official MLB.com team hitting K% table, calculated as SO / PA when needed.
-        # This is the closest official MLB.com version of a "which teams strike out most" table.
-        "Overall": _okr_fetch_bdfed_split(season, None, False),
         "vs RHP": _okr_fetch_bdfed_split(season, "vr", False),
         "vs LHP": _okr_fetch_bdfed_split(season, "vl", False),
         "L30 vs RHP": _okr_fetch_bdfed_split(season, "vr", True),
@@ -26617,7 +26613,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
 
     opp_teams, p_teams, hands = [], [], []
     k_hand, rank_hand, label_hand, source_hand = [], [], [], []
-    k_overall, r_overall, k_rhp, r_rhp, k_lhp, r_lhp, k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], [], [], [], [], [], [], []
+    k_rhp, r_rhp, k_lhp, r_lhp, k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], [], [], [], [], []
     top5_note = []
 
     for _, row in d.iterrows():
@@ -26657,7 +26653,6 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         rank_hand.append(r_used if r_used is not None else "")
         label_hand.append(label)
         source_hand.append(src_used or "")
-        k_overall.append(rec.get("K% Overall", "")); r_overall.append(rec.get("K Rank Overall", ""))
         k_rhp.append(rec.get("K% vs RHP", "")); r_rhp.append(rec.get("K Rank vs RHP", ""))
         k_lhp.append(rec.get("K% vs LHP", "")); r_lhp.append(rec.get("K Rank vs LHP", ""))
         k_l30_rhp.append(rec.get("K% L30 vs RHP", "")); r_l30_rhp.append(rec.get("K Rank L30 vs RHP", ""))
@@ -26671,8 +26666,6 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     d["Opponent K Rank vs Pitcher Hand"] = rank_hand
     d["Opponent K Environment"] = label_hand
     d["Opponent K Rank Source"] = source_hand
-    d["Opp Overall K% Official"] = k_overall
-    d["Opp Overall K Rank Official"] = r_overall
     d["Opp K% vs RHP Official"] = k_rhp
     d["Opp K Rank vs RHP Official"] = r_rhp
     d["Opp K% vs LHP Official"] = k_lhp
@@ -26692,7 +26685,7 @@ def _okr_top5_test_table():
         table = _okr_fetch_team_k_table(_okr_mlb_season()) or {}
         rows = []
         for team, rec in table.items():
-            for split in ["Overall", "vs RHP", "vs LHP", "L30 vs RHP", "L30 vs LHP"]:
+            for split in ["vs RHP", "vs LHP", "L30 vs RHP", "L30 vs LHP"]:
                 rows.append({
                     "Split": split,
                     "Team": team,
@@ -26747,8 +26740,6 @@ def _okr_card_context_from_row(card_row, p=None):
         env = _first("Opponent K Environment")
         src = _first("Opponent K Rank Source") or ""
         # split details for display/audit
-        k_overall = _first("Opp Overall K% Official")
-        r_overall = _first("Opp Overall K Rank Official")
         k_rhp = _first("Opp K% vs RHP Official", "Opp K% vs RHP")
         r_rhp = _first("Opp K Rank vs RHP Official", "Opp K Rank vs RHP")
         k_lhp = _first("Opp K% vs LHP Official", "Opp K% vs LHP")
@@ -26766,8 +26757,6 @@ def _okr_card_context_from_row(card_row, p=None):
                 k_hand = k_hand or rec.get(f"K% {split}")
                 rank_hand = rank_hand or rec.get(f"K Rank {split}")
                 src = src or rec.get(f"K Source {split}") or "MLB official live card pull"
-                k_overall = k_overall or rec.get("K% Overall")
-                r_overall = r_overall or rec.get("K Rank Overall")
                 k_rhp = k_rhp or rec.get("K% vs RHP")
                 r_rhp = r_rhp or rec.get("K Rank vs RHP")
                 k_lhp = k_lhp or rec.get("K% vs LHP")
@@ -26797,8 +26786,7 @@ def _okr_card_context_from_row(card_row, p=None):
             "k_hand": _fmt_pct(k_hand),
             "rank_hand": _fmt_rank(rank_hand),
             "env": str(env),
-            "source": str(src or "MLB.com official team hitting stats — K% = SO / PA"),
-            "overall_line": f"Overall: {_fmt_pct(k_overall)} / {_fmt_rank(r_overall)}",
+            "source": str(src),
             "rhp_line": f"RHP: {_fmt_pct(k_rhp)} / {_fmt_rank(r_rhp)}",
             "lhp_line": f"LHP: {_fmt_pct(k_lhp)} / {_fmt_rank(r_lhp)}",
             "l30_rhp_line": f"L30 RHP: {_fmt_pct(k_l30_rhp)} / {_fmt_rank(r_l30_rhp)}",
@@ -26807,7 +26795,7 @@ def _okr_card_context_from_row(card_row, p=None):
     except Exception:
         return {
             "opp_team":"—", "pitcher_hand":"UNKNOWN", "k_hand":"—", "rank_hand":"—",
-            "env":"NO VERIFIED TEAM K RANK", "source":"", "overall_line":"Overall: — / —", "rhp_line":"RHP: — / —",
+            "env":"NO VERIFIED TEAM K RANK", "source":"", "rhp_line":"RHP: — / —",
             "lhp_line":"LHP: — / —", "l30_rhp_line":"L30 RHP: — / —", "l30_lhp_line":"L30 LHP: — / —"
         }
 
