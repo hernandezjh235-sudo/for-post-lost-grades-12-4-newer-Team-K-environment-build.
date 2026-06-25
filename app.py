@@ -84,6 +84,10 @@ GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
 SAVED_ODDS_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds_backup.json")
 SAVED_ODDS_LOCAL_FILE = "saved_manual_market_odds.json"
+# Persistent before-game projection board cache. This preserves the full player-card board
+# after app restart/close and after grading. It is separate from manual odds.
+SAVED_PROJECTION_BOARD_FILE = os.path.join(STORAGE_DIR, "saved_projection_board_latest.json")
+SAVED_PROJECTION_BOARD_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_projection_board_latest_backup.json")
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -9167,6 +9171,48 @@ def save_many_once(new_picks):
     return added
 
 
+def save_projection_board_snapshot(picks, dates=None, label="OFFICIAL_BEFORE_GAME_BOARD"):
+    """Persist the full projection board/card list exactly as it appeared before games.
+
+    This is intentionally separate from manual odds and grading logs. Grading can update
+    PICK_LOG/RESULT_LOG, but this file keeps the saved player-card board available
+    after app restart/close so you can reopen the app and still see the same projections.
+    """
+    clean = []
+    for p in picks or []:
+        if isinstance(p, dict):
+            q = dict(p)
+            q.setdefault("snapshot_type", label)
+            q.setdefault("official_snapshot_saved_at", now_iso())
+            clean.append(q)
+    payload = {
+        "saved_at": now_iso(),
+        "dates": list(dates or []),
+        "count": len(clean),
+        "label": label,
+        "picks": clean,
+    }
+    save_json(SAVED_PROJECTION_BOARD_FILE, payload)
+    save_json(SAVED_PROJECTION_BOARD_BACKUP_FILE, payload)
+    return len(clean)
+
+
+def load_projection_board_snapshot(dates=None):
+    """Load the latest saved projection board. Prefer matching date, but never lose it after grading."""
+    wanted = set(dates or [])
+    for path in [SAVED_PROJECTION_BOARD_FILE, SAVED_PROJECTION_BOARD_BACKUP_FILE]:
+        payload = load_json(path, {})
+        picks = payload.get("picks") if isinstance(payload, dict) else payload
+        if not isinstance(picks, list) or not picks:
+            continue
+        if wanted:
+            dated = [p for p in picks if str(p.get("date") or "") in wanted]
+            if dated:
+                return dated, payload
+        return picks, payload
+    return [], {}
+
+
 # =========================
 # VOLUME MISS LEARNING 2.0
 # =========================
@@ -10815,8 +10861,9 @@ if save_btn:
         st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")
     else:
         added = save_many_once(st.session_state.loaded_picks)
+        board_saved_count = save_projection_board_snapshot(st.session_state.loaded_picks, dates=dates)
         st.session_state.last_saved_count = added
-        st.success(f"Saved official before-game snapshot. Added {added} new rows.")
+        st.success(f"Saved official before-game snapshot. Added {added} new rows. Saved projection board/card cache: {board_saved_count} players.")
 
 
 # =========================
@@ -11027,11 +11074,18 @@ if st.session_state.get("loaded_picks"):
     board = st.session_state.loaded_picks
     board_status = "LIVE REFRESHED BOARD — NOT OFFICIAL UNLESS SAVED"
 else:
-    board = [p for p in saved if p.get("date") in dates]
+    # First load the preserved full projection-board cache. This is the board you saved
+    # before games, and it should still show after closing/reopening the app or after grading.
+    board, _saved_board_payload = load_projection_board_snapshot(dates)
+    if board:
+        board_status = f"SAVED PROJECTION BOARD/CARDS — {len(board)} PLAYERS"
+    else:
+        # Fallback to old PICK_LOG rows if no board-cache file exists yet.
+        board = [p for p in saved if p.get("date") in dates]
+        board_status = "SAVED OFFICIAL SNAPSHOTS FROM PICK_LOG"
     saved_rows_for_board = load_saved_manual_odds_rows()
     if saved_rows_for_board:
         board, _manual_saved_count = _manual_market_apply_to_picks(board, saved_rows_for_board)
-    board_status = "SAVED OFFICIAL SNAPSHOTS"
 
 # Saved Projection Board protection:
 # If you saved the before-game projection board, closed the app, and reopen later,
@@ -11041,7 +11095,7 @@ if board and not st.session_state.get("loaded_picks"):
     with st.sidebar:
         st.divider()
         st.header("Saved Projection Board")
-        st.caption("Saved before-game projections are loaded from PICK_LOG. This refresh updates live market odds only; it does not rerun or change K projections/IP/BF.")
+        st.caption("Saved before-game projection board/cards are loaded from the persistent board cache first, then PICK_LOG as fallback. This refresh updates live market odds only; it does not rerun or change K projections/IP/BF.")
         if st.button("🔄 Refresh SportsGameOdds odds on saved projection board", use_container_width=True):
             st.cache_data.clear()
             refreshed_board, live_count = _sportsbook_market_apply_to_picks(board)
