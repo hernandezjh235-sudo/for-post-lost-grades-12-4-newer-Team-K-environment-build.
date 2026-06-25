@@ -26811,6 +26811,449 @@ def _okr_card_context_from_row(card_row, p=None):
             "lhp_line":"LHP: — / —", "l30_rhp_line":"L30 RHP: — / —", "l30_lhp_line":"L30 LHP: — / —"
         }
 
+
+
+# =========================
+# HISTORICAL GRADES RESTORE + BACKUP SUITE PATCH
+# =========================
+HISTORICAL_GRADES_CSV_TEXT = r"""Date,Pitcher,Pick,Actual_K,Actual_IP,Result
+2026-06-15,Chase Burns,O 7.5,7,5.0,LOSS
+2026-06-15,MacKenzie Gore,O 5.5,10,7.0,WIN
+2026-06-15,Dustin May,O 4.5,9,9.0,WIN
+2026-06-15,Ryan Gusto,U 3.5,1,3.1,WIN
+2026-06-15,J.T. Ginn,U 4.5,3,6.0,WIN
+2026-06-15,Zack Wheeler,O 6.5,9,6.0,WIN
+2026-06-15,Shota Imanaga,U 6.5,3,5.2,WIN
+2026-06-15,Ryne Nelson,U 4.5,5,7.0,LOSS
+2026-06-15,Jared Jones,NL,4,4.0,NL
+2026-06-15,Nick Martinez,O 3.5,6,5.1,WIN
+2026-06-15,Eric Lauer,U 3.5,4,6.0,LOSS
+2026-06-15,Andrew Alvarez,U 4.5,5,4.0,LOSS
+2026-06-15,Mitch Spence,U 3.5,1,4.0,WIN
+2026-06-15,Michael Lorenzen,U 4.5,5,5.0,LOSS
+2026-06-15,Walbert Ureña,U 4.5,3,7.0,WIN
+2026-06-15,Tobias Myers,U 2.5,1,1.1,WIN
+2026-06-16,Framber Valdez,O 4.5,6,6.0,WIN
+2026-06-16,Hunter Brown,O 6.5,7,5.2,WIN
+2026-06-16,Michael King,O 4.5,5,4.1,WIN
+2026-06-16,Andre Pallante,O 3.5,6,7.0,WIN
+2026-06-16,Brandon Young,U 4.5,2,6.0,WIN
+2026-06-16,Logan Gilbert,O 6.5,10,7.0,WIN
+2026-06-16,Justin Wrobleski,U 4.5,5,6.0,LOSS
+2026-06-16,Drew Rasmussen,O 5.5,7,7.0,WIN
+2026-06-16,Kumar Rocker,U 4.5,4,3.1,WIN
+2026-06-16,Zebby Matthews,O 4.5,4,7.0,LOSS
+2026-06-16,Davis Martin,O 5.5,4,3.1,LOSS
+2026-06-16,Gerrit Cole,U 5.5,6,6.0,LOSS
+2026-06-16,Payton Tolle,O 4.5,6,5.0,WIN
+2026-06-16,Michael Wacha,O 4.5,3,6.0,LOSS
+2026-06-16,Foster Griffin,U 5.5,6,6.0,LOSS
+2026-06-16,Reid Detmers,O 5.5,6,7.0,WIN
+2026-06-16,Merrill Kelly,U 4.5,4,5.1,WIN
+2026-06-16,Jesús Luzardo,O 6.5,9,7.0,WIN
+2026-06-16,Tyler Phillips,U 3.5,4,4.0,LOSS
+2026-06-16,Brady Singer,U 4.5,5,5.0,LOSS
+2026-06-16,Kodai Senga,U 5.5,5,4.0,WIN
+2026-06-16,Robert Gasser,U 4.5,5,5.2,LOSS
+2026-06-16,Slade Cecconi,U 4.5,4,5.2,WIN
+2026-06-16,Edward Cabrera,U 5.5,3,4.1,WIN
+2026-06-16,Ryan Feltner,U 3.5,7,4.2,LOSS
+2026-06-16,Jack Perkins,U 4.5,6,5.0,LOSS
+2026-06-18,Tatsuya Imai,O 4.5,11,6.0,WIN
+2026-06-18,Cam Schlittler,O 6.5,13,6.0,WIN
+2026-06-18,Jacob Misiorowski,O 8.5,7,6.0,LOSS
+2026-06-18,Jacob deGrom,O 6.5,9,6.0,WIN
+2026-06-18,José Soriano,O 3.5,6,5.0,WIN
+2026-06-18,Landen Roupp,O 5.5,7,6.0,WIN
+2026-06-18,Roki Sasaki,U 5.5,6,5.2,LOSS
+2026-06-18,Jeffrey Springs,O 4.5,4,3.2,LOSS
+2026-06-18,Bryce Miller,O 4.5,7,5.0,WIN
+2026-06-18,Tarik Skubal,O 6.5,8,5.2,WIN
+2026-06-18,Trey Gibson,U 3.5,8,5.0,LOSS
+2026-06-18,Ben Brown,U 4.5,4,6.0,WIN
+2026-06-18,Kevin Gausman,O 5.5,3,2.0,LOSS
+2026-06-18,Griffin Jax,U 4.5,5,5.0,LOSS
+2026-06-18,Martín Pérez,O 3.5,5,6.0,WIN
+2026-06-18,Kyle Freeland,U 4.5,8,7.1,LOSS
+2026-06-18,Ranger Suarez,U 5.5,5,6.2,WIN
+2026-06-18,Bubba Chandler,U 4.5,1,6.0,WIN
+2026-06-18,Rhett Lowder,U 4.5,5,5.1,LOSS
+2026-06-18,Connor Prielipp,O 3.5,4,6.0,WIN
+2026-06-18,Michael Soroka,O 5.5,0,1.0,LOSS
+2026-06-18,Michael McGreevy,O 3.5,5,5.0,WIN
+2026-06-18,Seth Lugo,U 6.5,5,6.0,WIN
+2026-06-18,Randy Vásquez,O 3.5,6,3.1,WIN
+2026-06-26,Miles Mikolas,U 3.5,1,3.1,WIN
+2026-06-26,Aaron Nola,O 4.5,5,5.0,WIN
+2026-06-26,Matthew Liberatore,O 3.5,3,5.0,LOSS
+2026-06-26,Mitch Bratt,O 3.5,3,3.0,LOSS
+2026-06-26,Trey Gibson,U 4.5,5,4.0,LOSS
+2026-06-26,José Soriano,O 6.5,4,3.0,LOSS
+2026-06-26,Martín Pérez,U 4.5,4,4.0,WIN
+2026-06-26,JP Sears,O 3.5,5,5.2,WIN
+2026-06-26,Joe Ryan,O 5.5,9,6.0,WIN
+2026-06-26,Shohei Ohtani,O 6.5,8,6.0,WIN
+2026-06-26,Ryan Weathers,O 5.5,6,6.0,WIN
+2026-06-26,Tarik Skubal,O 6.5,9,6.0,WIN
+2026-06-26,Eury Pérez,O 4.5,1,4.2,LOSS
+2026-06-26,Jacob deGrom,O 6.5,8,6.0,WIN
+2026-06-26,Braxton Ashcraft,O 5.5,10,6.0,WIN
+2026-06-26,Bryan Woo,O 5.5,4,4.0,LOSS
+2026-06-26,Erick Fedde,O 3.5,2,4.0,LOSS
+2026-06-26,Tanner Bibee,U 5.5,3,6.0,WIN
+2026-06-26,Gage Jump,O 4.5,7,,WIN
+2026-06-26,Tyler Mahle,O 4.5,4,5.2,LOSS
+2026-06-26,Mike Burrows,O 3.5,3,6.0,LOSS
+2026-06-26,Trey Yesavage,U 5.5,5,5.2,WIN
+2026-06-26,Kyle Freeland,O 3.5,4,6.0,WIN
+2026-06-26,Ranger Suarez,U 4.5,9,6.0,LOSS
+2026-06-26,Rhett Lowder,O 3.5,5,,WIN
+2026-06-26,Shane Drohan,U 4.5,5,4.1,LOSS
+2026-06-26,Noah Cameron,O 4.5,5,5.0,WIN
+2026-06-26,Nolan McLean,O 5.5,8,,WIN
+2026-06-26,Javier Assad,U 3.5,5,,LOSS
+2026-06-26,Sean Manaea,O 3.5,4,,WIN
+"""
+HISTORICAL_GRADES_CSV_FILE = os.path.join(STORAGE_DIR, "historical_grades_backup.csv")
+HISTORICAL_IMPORT_MARKER_FILE = os.path.join(STORAGE_DIR, "historical_grades_import_marker.json")
+SAFE_BACKUP_DIR = os.path.join(STORAGE_DIR, "safe_backups")
+
+
+def _hgb_parse_pick_value(pick_text):
+    s = str(pick_text or "").strip().upper()
+    if s in ["", "NL", "NO LINE", "NO LINE "]:
+        return "NL", None
+    parts = s.replace("OVER", "O").replace("UNDER", "U").split()
+    side = None
+    line = None
+    if parts:
+        if parts[0].startswith("O"):
+            side = "OVER"
+        elif parts[0].startswith("U"):
+            side = "UNDER"
+    for tok in parts[1:]:
+        try:
+            line = float(tok)
+            break
+        except Exception:
+            pass
+    return side or s, line
+
+
+def _hgb_grade_key(date, pitcher, side, line):
+    try:
+        ln = "" if line is None else str(round(float(line), 2))
+    except Exception:
+        ln = str(line or "")
+    return "histgrade::" + "|".join([
+        str(date)[:10],
+        normalize_name(pitcher),
+        str(side or "").upper(),
+        ln,
+    ])
+
+
+def _hgb_result_key_from_row(row):
+    side = row.get("pick_side") or row.get("Pick Side") or row.get("side")
+    line = row.get("line") or row.get("Line")
+    return _hgb_grade_key(row.get("date") or row.get("Date"), row.get("pitcher") or row.get("Pitcher"), side, line)
+
+
+def parse_historical_grades_csv_text(csv_text):
+    import csv as _csv
+    rows = []
+    clean = "\n".join([ln for ln in str(csv_text or "").splitlines() if ln.strip()])
+    if not clean.strip():
+        return rows
+    reader = _csv.DictReader(io.StringIO(clean))
+    for r in reader:
+        date = str(r.get("Date") or r.get("date") or "").strip()[:10]
+        pitcher = str(r.get("Pitcher") or r.get("pitcher") or "").strip()
+        pick_text = str(r.get("Pick") or r.get("pick") or "").strip()
+        side, line = _hgb_parse_pick_value(pick_text)
+        actual = safe_float(r.get("Actual_K") or r.get("actual_k") or r.get("Actual K") or r.get("actual"), None)
+        actual_ip = safe_float(r.get("Actual_IP") or r.get("actual_ip") or r.get("Actual IP"), None)
+        result = str(r.get("Result") or r.get("result") or "").strip().upper()
+        if not date or not pitcher or not result:
+            continue
+        if result in ["NL", "NO LINE"] or side == "NL":
+            graded_result = "NO LINE"
+            win = None
+        else:
+            graded_result = "WIN" if result == "WIN" else "LOSS" if result == "LOSS" else result
+            win = True if graded_result == "WIN" else False if graded_result == "LOSS" else None
+        rows.append({
+            "date": date,
+            "pitcher": pitcher,
+            "market": "pitcher_ks",
+            "prop_type": "pitcher_ks",
+            "pick_side": side if side in ["OVER", "UNDER"] else side,
+            "line": line,
+            "actual": actual,
+            "actual_ip": actual_ip,
+            "graded": True,
+            "graded_at": now_iso(),
+            "graded_result": graded_result,
+            "win": win,
+            "source": "HISTORICAL_RECOVERED_CSV",
+            "import_source": "embedded_historical_grades_backup.csv",
+            "pick_id": _hgb_grade_key(date, pitcher, side, line),
+            "historical_grade_key": _hgb_grade_key(date, pitcher, side, line),
+        })
+    return rows
+
+
+def _hgb_find_matching_saved_pick(hist_row, picks):
+    hdate = str(hist_row.get("date") or "")[:10]
+    hp = normalize_name(hist_row.get("pitcher"))
+    hline = safe_float(hist_row.get("line"), None)
+    hside = str(hist_row.get("pick_side") or "").upper()
+    best = None
+    best_score = 0
+    for p in picks or []:
+        pdate = str(p.get("date") or p.get("game_date") or "")[:10]
+        pp = normalize_name(p.get("pitcher") or p.get("player"))
+        pside = str(p.get("pick_side") or p.get("Decision") or "").upper()
+        pline = safe_float(p.get("line") or p.get("final_line"), None)
+        if hdate and pdate and hdate != pdate:
+            continue
+        score = 0
+        if hp and pp and hp == pp:
+            score += 70
+        elif hp and pp and (hp in pp or pp in hp):
+            score += 55
+        if hline is not None and pline is not None and abs(hline - pline) < 0.01:
+            score += 15
+        if hside and pside and hside in pside:
+            score += 15
+        if score > best_score:
+            best = p
+            best_score = score
+    return best if best_score >= 70 else None
+
+
+def import_historical_grades_from_text(csv_text, force=False):
+    """Imports recovered historical grades into RESULT_LOG.
+    It never touches projections. If a matching before-snapshot exists, it merges
+    the actual/result into that full row; otherwise it creates a minimal learning row.
+    Dedupe protection prevents double imports.
+    """
+    hist_rows = parse_historical_grades_csv_text(csv_text)
+    if not hist_rows:
+        return {"status": "NO_ROWS", "imported": 0, "skipped": 0, "total_input": 0}
+    picks = load_json(PICK_LOG, [])
+    results = load_json(RESULT_LOG, [])
+    seen = set()
+    for r in results:
+        seen.add(_hgb_result_key_from_row(r))
+        try:
+            seen.add(_grade_result_key(r))
+        except Exception:
+            pass
+    imported = 0
+    skipped = 0
+    merged_from_snapshots = 0
+    for hr in hist_rows:
+        k = hr.get("historical_grade_key") or _hgb_result_key_from_row(hr)
+        if (not force) and k in seen:
+            skipped += 1
+            continue
+        base = _hgb_find_matching_saved_pick(hr, picks)
+        if isinstance(base, dict):
+            out = dict(base)
+            merged_from_snapshots += 1
+        else:
+            out = {}
+        out.update(hr)
+        # Keep projection error if the saved snapshot had projection fields.
+        proj = safe_float(out.get("projection") or out.get("final_projection"), None)
+        if proj is not None and out.get("actual") is not None:
+            out["final_projection"] = out.get("final_projection", proj)
+            out["final_projection_error"] = round(float(out.get("actual")) - proj, 2)
+        # Recompute win from actual when possible to protect typos.
+        line = safe_float(out.get("line"), None)
+        side = str(out.get("pick_side") or "").upper()
+        actual = safe_float(out.get("actual"), None)
+        if line is not None and actual is not None and side in ["OVER", "UNDER"]:
+            win = (actual > line) if side == "OVER" else (actual < line)
+            out["win"] = bool(win)
+            out["graded_result"] = "WIN" if win else "LOSS"
+        out["historical_imported_at"] = now_iso()
+        results.append(out)
+        seen.add(k)
+        try:
+            seen.add(_grade_result_key(out))
+        except Exception:
+            pass
+        imported += 1
+    save_json(RESULT_LOG, results[-10000:])
+    # Save a copy of the raw CSV in storage too.
+    try:
+        os.makedirs(os.path.dirname(HISTORICAL_GRADES_CSV_FILE), exist_ok=True)
+        with open(HISTORICAL_GRADES_CSV_FILE, "w") as f:
+            f.write(str(csv_text or ""))
+    except Exception:
+        pass
+    save_json(HISTORICAL_IMPORT_MARKER_FILE, {"imported_at": now_iso(), "imported": imported, "skipped": skipped, "total_input": len(hist_rows)})
+    try:
+        write_full_backup_bundle(reason="after_historical_import")
+    except Exception:
+        pass
+    return {"status": "OK", "imported": imported, "skipped": skipped, "total_input": len(hist_rows), "merged_from_saved_snapshots": merged_from_snapshots, "result_log_total": len(results)}
+
+
+def critical_backup_paths_hgb():
+    paths = []
+    for label, path in [
+        ("auto_pick_log.json", PICK_LOG),
+        ("auto_result_log.json", RESULT_LOG),
+        ("pitcher_learning.json", LEARN_FILE),
+        ("clv_tracker.json", CLV_FILE),
+        ("request_log.json", REQUEST_LOG_FILE),
+        ("signal_tracking.json", SIGNAL_TRACKING_FILE),
+        ("long_backtest_rows.json", LONG_BACKTEST_FILE),
+        ("line_history.json", LINE_HISTORY_FILE),
+        ("locked_lineup_cache.json", LINEUP_CACHE_FILE),
+        ("graded_feature_bank.json", GRADED_FEATURES_FILE),
+        ("saved_manual_market_odds.json", SAVED_ODDS_FILE),
+        ("historical_grades_backup.csv", HISTORICAL_GRADES_CSV_FILE),
+    ]:
+        paths.append((label, path))
+    for var_name, fname in [
+        ("VOLUME_MISS_LEARNING_FILE", "k_volume_miss_learning.json"),
+        ("MANAGER_PULL_LEARNING_FILE", "manager_pull_learning.json"),
+        ("MISS_REASON_FILE", "k_miss_reason_learning.json"),
+    ]:
+        try:
+            p = globals().get(var_name)
+            if p:
+                paths.append((fname, p))
+        except Exception:
+            pass
+    return paths
+
+
+def build_full_backup_bundle(reason="manual"):
+    files = {}
+    for label, path in critical_backup_paths_hgb():
+        try:
+            if path and os.path.exists(path):
+                if label.endswith(".csv"):
+                    with open(path, "r") as f:
+                        files[label] = {"_type": "csv", "text": f.read()}
+                else:
+                    with open(path, "r") as f:
+                        files[label] = json.load(f)
+            else:
+                files[label] = [] if label.endswith("_log.json") or "rows" in label or "tracking" in label else {}
+        except Exception as e:
+            files[label] = {"_backup_error": str(e)}
+    return {
+        "backup_version": "ONE_WAY_PICKZ_FULL_BACKUP_HISTORICAL_GRADES_V2",
+        "created_at": now_iso(),
+        "reason": reason,
+        "storage_dir": STORAGE_DIR,
+        "app_version": APP_VERSION,
+        "files": files,
+    }
+
+
+def write_full_backup_bundle(reason="auto"):
+    bundle = build_full_backup_bundle(reason=reason)
+    try:
+        os.makedirs(SAFE_BACKUP_DIR, exist_ok=True)
+        fname = f"one_way_pickz_full_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(reason)[:20].replace(' ','_')}.json"
+        path = os.path.join(SAFE_BACKUP_DIR, fname)
+        with open(path, "w") as f:
+            json.dump(bundle, f, indent=2)
+        return bundle, path
+    except Exception:
+        return bundle, None
+
+
+def restore_full_backup_bundle(bundle):
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("files"), dict):
+        return {"status": "BAD_BACKUP", "restored": 0}
+    path_map = dict(critical_backup_paths_hgb())
+    restored = []
+    for label, data in bundle.get("files", {}).items():
+        path = path_map.get(label)
+        if not path:
+            continue
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if isinstance(data, dict) and data.get("_type") == "csv":
+                with open(path, "w") as f:
+                    f.write(data.get("text", ""))
+            else:
+                save_json(path, data)
+            restored.append(label)
+        except Exception:
+            pass
+    return {"status": "OK", "restored": len(restored), "files": restored}
+
+
+def render_historical_grades_and_backup_suite():
+    st.markdown('<div class="section-title-pro">Historical Grade Restore + Backup Suite</div>', unsafe_allow_html=True)
+    st.caption("Use this to restore your recovered grades and protect everything with a downloadable backup.")
+    c1, c2, c3 = st.columns(3)
+    current_results = load_json(RESULT_LOG, [])
+    c1.metric("Current Result Log", len(current_results))
+    recovered_rows = parse_historical_grades_csv_text(HISTORICAL_GRADES_CSV_TEXT)
+    c2.metric("Embedded Recovered Grades", len([r for r in recovered_rows if r.get('graded_result') in ['WIN','LOSS']]))
+    marker = load_json(HISTORICAL_IMPORT_MARKER_FILE, {})
+    c3.metric("Last Import Added", marker.get("imported", 0) if isinstance(marker, dict) else 0)
+
+    if st.button("✅ Import Embedded Historical Grades Now", use_container_width=True):
+        diag = import_historical_grades_from_text(HISTORICAL_GRADES_CSV_TEXT, force=False)
+        st.success(f"Historical import complete: added {diag.get('imported', 0)}, skipped {diag.get('skipped', 0)} duplicates.")
+        st.write(diag)
+
+    uploaded_csv = st.file_uploader("Optional: upload more historical grades CSV", type=["csv"], key="hgb_more_grades_csv")
+    if uploaded_csv is not None:
+        csv_text = uploaded_csv.getvalue().decode("utf-8", errors="ignore")
+        st.write({"Rows detected": len(parse_historical_grades_csv_text(csv_text))})
+        if st.button("Import Uploaded Historical Grades", use_container_width=True):
+            diag = import_historical_grades_from_text(csv_text, force=False)
+            st.success(f"Uploaded import complete: added {diag.get('imported', 0)}, skipped {diag.get('skipped', 0)} duplicates.")
+            st.write(diag)
+
+    st.divider()
+    bundle = build_full_backup_bundle(reason="download_preview")
+    st.download_button(
+        "⬇️ Download FULL Backup JSON Now",
+        data=json.dumps(bundle, indent=2),
+        file_name=f"one_way_pickz_full_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    st.download_button(
+        "⬇️ Download Historical Grades CSV",
+        data=HISTORICAL_GRADES_CSV_TEXT,
+        file_name="historical_grades_backup.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    restore_file = st.file_uploader("Restore FULL Backup JSON", type=["json"], key="hgb_restore_json")
+    if restore_file is not None:
+        try:
+            restore_bundle = json.loads(restore_file.getvalue().decode("utf-8", errors="ignore"))
+            if st.button("RESTORE uploaded full backup", use_container_width=True):
+                diag = restore_full_backup_bundle(restore_bundle)
+                st.success(f"Restore complete: {diag.get('restored', 0)} files restored.")
+                st.write(diag)
+        except Exception as e:
+            st.error(f"Backup JSON could not be read: {e}")
+
+
+# Auto-import once on startup. Duplicate-safe. If the result log already has these rows, it skips them.
+try:
+    _hgb_marker = load_json(HISTORICAL_IMPORT_MARKER_FILE, {})
+    if not _hgb_marker:
+        import_historical_grades_from_text(HISTORICAL_GRADES_CSV_TEXT, force=False)
+except Exception:
+    pass
+
 # Wrap K projection table export/display without touching projection math.
 if "build_kproj_table" in globals():
     _prev_okr_build_kproj_table = build_kproj_table
@@ -27177,6 +27620,8 @@ with tab5:
 
 with tab6:
     st.markdown('<div class="section-title-pro">Settings / Saved Files</div>', unsafe_allow_html=True)
+    render_historical_grades_and_backup_suite()
+    st.divider()
     st.code(STORAGE_DIR)
     st.write("Pick Log:")
     st.code(PICK_LOG)
@@ -27220,16 +27665,24 @@ with tab6:
             save_json(REQUEST_LOG_FILE, [])
             st.warning("Request logs cleared.")
     with col_c:
+        clear_confirm = st.text_input("Type CLEAR to enable Clear ALL Logs", value="", key="clear_all_logs_confirm")
         if st.button("Clear ALL Logs"):
-            save_json(PICK_LOG, [])
-            save_json(RESULT_LOG, [])
-            save_json(LEARN_FILE, {})
-            save_json(CLV_FILE, {})
-            save_json(SIGNAL_TRACKING_FILE, [])
-            save_json(LONG_BACKTEST_FILE, [])
-            save_json(LINE_HISTORY_FILE, {})
-            save_json(LINEUP_CACHE_FILE, {})
-            st.error("All logs cleared.")
+            if clear_confirm.strip().upper() == "CLEAR":
+                try:
+                    write_full_backup_bundle(reason="before_clear_all_logs")
+                except Exception:
+                    pass
+                save_json(PICK_LOG, [])
+                save_json(RESULT_LOG, [])
+                save_json(LEARN_FILE, {})
+                save_json(CLV_FILE, {})
+                save_json(SIGNAL_TRACKING_FILE, [])
+                save_json(LONG_BACKTEST_FILE, [])
+                save_json(LINE_HISTORY_FILE, {})
+                save_json(LINEUP_CACHE_FILE, {})
+                st.error("All logs cleared after backup.")
+            else:
+                st.warning("Clear blocked. Type CLEAR first.")
 
 
 # =========================
