@@ -27411,4 +27411,3 @@ def ml_build_board(board):
     if not df.empty:
         df = df.sort_values('ML Edge %', ascending=False)
     return df
-
