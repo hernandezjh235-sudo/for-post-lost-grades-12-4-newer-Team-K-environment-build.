@@ -84,6 +84,15 @@ GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
 SAVED_ODDS_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds_backup.json")
 SAVED_ODDS_LOCAL_FILE = "saved_manual_market_odds.json"
+GRADED_HISTORY_CSV_NAME = "graded_history.csv"
+GRADED_HISTORY_LOCAL_CANDIDATES = [
+    os.path.join("learning_data", GRADED_HISTORY_CSV_NAME),
+    os.path.join(os.getcwd(), "learning_data", GRADED_HISTORY_CSV_NAME),
+]
+try:
+    GRADED_HISTORY_LOCAL_CANDIDATES.append(os.path.join(os.path.dirname(__file__), "learning_data", GRADED_HISTORY_CSV_NAME))
+except Exception:
+    pass
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -9312,6 +9321,202 @@ def _grade_result_key(row):
     if row.get("pick_id"):
         return f"pick_id::{row.get('pick_id')}"
     return "unknown"
+
+
+
+# =========================
+# RESTORED GRADED HISTORY LOADER
+# Version: RESTORE_GRADED_HISTORY_2026_06_25
+# Purpose:
+# - Load learning_data/graded_history.csv on startup.
+# - Merge the restored 96+ historical grades into RESULT_LOG.
+# - Keep normal Save/Grade workflow active for today's slate.
+# - Does NOT change projections, board math, decisions, odds, or filters.
+# =========================
+RESTORED_GRADED_HISTORY_VERSION = "RESTORE_GRADED_HISTORY_2026_06_25"
+
+def _restored_grade_parse_pick(pick_text):
+    """Parse strings like 'O 5.5' or 'U 4.5' into side + line."""
+    raw = str(pick_text or "").strip()
+    if not raw or raw.upper() in {"NL", "NO LINE", "NO_LINE", "PASS"}:
+        return None, None, raw.upper() if raw else ""
+    parts = raw.replace("OVER", "O").replace("UNDER", "U").split()
+    side_token = parts[0].upper() if parts else ""
+    side = "OVER" if side_token.startswith("O") else "UNDER" if side_token.startswith("U") else None
+    line = None
+    for tok in parts[1:]:
+        v = safe_float(tok, None)
+        if v is not None:
+            line = v
+            break
+    return side, line, raw
+
+def _restored_grade_find_file():
+    """Find learning_data/graded_history.csv in the repo/app directory."""
+    for p in GRADED_HISTORY_LOCAL_CANDIDATES:
+        try:
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+def _restored_grade_row_to_result(row):
+    """Convert the simple restored CSV row into the app's RESULT_LOG schema."""
+    if row is None:
+        return None
+    date = str(row.get("Date") or row.get("date") or "").strip()[:10]
+    pitcher = str(row.get("Pitcher") or row.get("pitcher") or row.get("Player") or "").strip()
+    side, line, raw_pick = _restored_grade_parse_pick(row.get("Pick") or row.get("pick") or row.get("Decision"))
+    actual_k = safe_float(row.get("Actual_K") or row.get("Actual K") or row.get("actual") or row.get("Actual Ks"), None)
+    actual_ip = safe_float(row.get("Actual_IP") or row.get("Actual IP") or row.get("actual_ip"), None)
+    result = str(row.get("Result") or row.get("graded_result") or "").strip().upper()
+    if not pitcher or not date:
+        return None
+    if result not in {"WIN", "LOSS", "NL", "NO LINE", "NO_LINE"}:
+        # Recompute if possible.
+        if actual_k is not None and line is not None and side in {"OVER", "UNDER"}:
+            result = "WIN" if ((actual_k > line) if side == "OVER" else (actual_k < line)) else "LOSS"
+        else:
+            result = "NO LINE"
+    graded_result = "NO LINE" if result in {"NL", "NO LINE", "NO_LINE"} else result
+    win = True if graded_result == "WIN" else False if graded_result == "LOSS" else None
+    out = {
+        "date": date,
+        "game_date": date,
+        "pitcher": pitcher,
+        "player": pitcher,
+        "market": "pitcher_ks",
+        "prop_type": "pitcher_ks",
+        "pick_side": side,
+        "line": line,
+        "final_line": line,
+        "Pick": raw_pick,
+        "actual": actual_k,
+        "actual_k": actual_k,
+        "actual_ip": actual_ip,
+        "graded": True,
+        "graded_at": date + "T23:59:00",
+        "graded_result": graded_result,
+        "win": win,
+        "grading_source": "RESTORED_GRADED_HISTORY_CSV",
+        "actual_result_source": "RESTORED_GRADED_HISTORY_CSV",
+        "restored_history_version": RESTORED_GRADED_HISTORY_VERSION,
+    }
+    # Helpful projection-safe learning labels. These are display/audit only if upstream fields are absent.
+    if actual_k is not None and line is not None and side in {"OVER", "UNDER"}:
+        out["actual_margin_vs_line"] = round((actual_k - line) if side == "OVER" else (line - actual_k), 2)
+    out["_restored_grade_key"] = _grade_result_key(out)
+    return out
+
+def load_restored_graded_history_df():
+    """Read the uploaded restored grades CSV. Safe: returns empty DataFrame when absent."""
+    try:
+        path = _restored_grade_find_file()
+        if not path:
+            return pd.DataFrame()
+        df = pd.read_csv(path)
+        try:
+            st.session_state["restored_graded_history_path"] = path
+            st.session_state["restored_graded_history_csv_rows"] = len(df)
+        except Exception:
+            pass
+        return df
+    except Exception as e:
+        try:
+            st.session_state["restored_graded_history_error"] = str(e)[:200]
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+def merge_restored_graded_history_into_result_log(force=False):
+    """Merge restored history into RESULT_LOG without overwriting today's grading workflow."""
+    try:
+        if st.session_state.get("restored_graded_history_loaded") and not force:
+            return st.session_state.get("restored_graded_history_status", {})
+    except Exception:
+        pass
+    status = {
+        "version": RESTORED_GRADED_HISTORY_VERSION,
+        "csv_rows": 0,
+        "converted_rows": 0,
+        "added_rows": 0,
+        "duplicates_skipped": 0,
+        "result_log_before": 0,
+        "result_log_after": 0,
+        "path": None,
+        "loaded": False,
+    }
+    try:
+        path = _restored_grade_find_file()
+        status["path"] = path
+        if not path:
+            try:
+                st.session_state["restored_graded_history_status"] = status
+                st.session_state["restored_graded_history_loaded"] = True
+            except Exception:
+                pass
+            return status
+        df = pd.read_csv(path)
+        status["csv_rows"] = len(df)
+        existing = load_json(RESULT_LOG, [])
+        if not isinstance(existing, list):
+            existing = []
+        status["result_log_before"] = len(existing)
+        seen = set()
+        clean_existing = []
+        for r in existing:
+            if not isinstance(r, dict):
+                continue
+            k = _grade_result_key(r)
+            if k not in seen:
+                clean_existing.append(r)
+                seen.add(k)
+        added = 0
+        dupes = 0
+        converted = 0
+        for _, row in df.iterrows():
+            rr = _restored_grade_row_to_result(row.to_dict())
+            if not rr:
+                continue
+            converted += 1
+            k = _grade_result_key(rr)
+            if k in seen:
+                dupes += 1
+                continue
+            clean_existing.append(rr)
+            seen.add(k)
+            added += 1
+        save_json(RESULT_LOG, clean_existing[-10000:])
+        status.update({
+            "converted_rows": converted,
+            "added_rows": added,
+            "duplicates_skipped": dupes,
+            "result_log_after": len(clean_existing[-10000:]),
+            "loaded": True,
+        })
+        try:
+            st.session_state["restored_graded_history_status"] = status
+            st.session_state["restored_graded_history_loaded"] = True
+            # Make Learning Lab immediately aware of the merged RESULT_LOG.
+            st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(clean_existing[-10000:])) if "_learning_lab_normalize_results_df" in globals() else pd.DataFrame(clean_existing[-10000:])
+        except Exception:
+            pass
+        return status
+    except Exception as e:
+        status["error"] = str(e)[:220]
+        try:
+            st.session_state["restored_graded_history_status"] = status
+            st.session_state["restored_graded_history_loaded"] = True
+        except Exception:
+            pass
+        return status
+
+try:
+    # Auto-restore on app startup. Safe to call repeatedly because it dedupes.
+    merge_restored_graded_history_into_result_log(force=False)
+except Exception:
+    pass
 
 def update_manager_pull_learning_after_grade(pick):
     """Collect manager/team pull behavior after grading.
@@ -19623,6 +19828,17 @@ def _learning_lab_get_history_df():
             df = _learning_lab_normalize_results_df(df)
             if not df.empty:
                 return df
+        # If restored historical grades CSV exists, merge it into RESULT_LOG then read it.
+        if "merge_restored_graded_history_into_result_log" in globals():
+            try:
+                merge_restored_graded_history_into_result_log(force=False)
+                results2 = load_json(RESULT_LOG, [])
+                if results2:
+                    df2 = _learning_lab_normalize_results_df(pd.DataFrame(results2))
+                    if not df2.empty:
+                        return df2
+            except Exception:
+                pass
         # If existing helper exists, try it.
         for fn in ["load_learning_history", "load_graded_history", "load_results_history"]:
             if fn in globals():
@@ -27453,6 +27669,16 @@ with tab5:
         else:
             st.warning("⚠️ Manual grading ran, but graded 0 rows. Check unmatched pitchers, columns, or saved snapshots.")
         st.write(diag_manual)
+
+    if "merge_restored_graded_history_into_result_log" in globals():
+        try:
+            hist_status = merge_restored_graded_history_into_result_log(force=False)
+            if hist_status.get("loaded"):
+                st.success(f"Restored graded history loaded: {hist_status.get('csv_rows', 0)} CSV rows | added {hist_status.get('added_rows', 0)} | skipped duplicates {hist_status.get('duplicates_skipped', 0)}")
+            elif hist_status.get("path") is None:
+                st.info("Restored graded history not found yet: add learning_data/graded_history.csv to start with historical grades.")
+        except Exception as _hist_e:
+            st.warning(f"Restored graded history check failed: {_hist_e}")
 
     results = load_json(RESULT_LOG, [])
     if results:
