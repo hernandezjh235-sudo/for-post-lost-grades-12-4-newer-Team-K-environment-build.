@@ -332,7 +332,7 @@ h1,h2,h3 {color:#fff;}
 .red-badge {background:#2b0000;border-color:rgba(255,75,75,.55);color:#ffc0c0;}
 .kpi-strip {display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:12px; margin:12px 0 18px 0;}
 .kpi-box {background:linear-gradient(145deg,#101010,#190000);border:1px solid rgba(255,70,70,.30);border-radius:18px;padding:14px;min-height:92px;}
-.mobile-decision-grid {display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:10px 0;}
+.mobile-decision-grid {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:10px 0;}
 .mobile-info-card {background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:12px;min-height:78px;}
 .kpi-label {font-size:12px;color:#aaa;font-weight:800;letter-spacing:.04em;text-transform:uppercase;}
 .kpi-value {font-size:26px;font-weight:900;color:#fff;margin-top:6px;}
@@ -12193,6 +12193,18 @@ def render_kproj_pitcher_card(p):
     no_vig_o_display = _card_pct(p.get('market_over_no_vig'))
     no_vig_u_display = _card_pct(p.get('market_under_no_vig'))
     no_vig_note_display = html.escape(str(p.get('market_no_vig_note') or 'No paired odds saved yet'))
+    # Opponent Team K Rank display uses official MLB rank columns from the one-row board row.
+    okr_ctx = _okr_card_context_from_row(card_row, p) if '_okr_card_context_from_row' in globals() else {}
+    okr_env_display = html.escape(str(okr_ctx.get('env', 'NO VERIFIED TEAM K RANK')))
+    okr_team_display = html.escape(str(okr_ctx.get('opp_team', '—')))
+    okr_hand_display = html.escape(str(okr_ctx.get('pitcher_hand', 'UNKNOWN')))
+    okr_k_hand_display = html.escape(str(okr_ctx.get('k_hand', '—')))
+    okr_rank_hand_display = html.escape(str(okr_ctx.get('rank_hand', '—')))
+    okr_source_display = html.escape(str(okr_ctx.get('source', ''))[:80])
+    okr_rhp_line = html.escape(str(okr_ctx.get('rhp_line', 'RHP: — / —')))
+    okr_lhp_line = html.escape(str(okr_ctx.get('lhp_line', 'LHP: — / —')))
+    okr_l30_rhp_line = html.escape(str(okr_ctx.get('l30_rhp_line', 'L30 RHP: — / —')))
+    okr_l30_lhp_line = html.escape(str(okr_ctx.get('l30_lhp_line', 'L30 LHP: — / —')))
     tier3 = build_decision_tier_3_0(p, d)
     decision_tier_display = html.escape(str(tier3.get('decision_tier_3_0') or 'TRACK ONLY'))
     decision_tier_note_display = html.escape(str(tier3.get('decision_tier_3_0_note') or 'Tier is display-only; core projection unchanged.'))
@@ -12229,6 +12241,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}</div></div>
         <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
@@ -12257,10 +12270,11 @@ def render_kproj_pitcher_card(p):
       </div>
       <div class="kpi-sub" style="margin-top:8px;line-height:1.35;">{p.get('market_note','')}<br>{p.get('line_history_note','')}<br>{p.get('sharp_warning_note','')}<br>{p.get('innings_outcome_note','')}</div>
       <div class="hr-soft"></div>
-      <div class="kpi-strip" style="grid-template-columns:repeat(5,minmax(0,1fr));">
+      <div class="kpi-strip" style="grid-template-columns:repeat(6,minmax(0,1fr));">
         <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
         <div class="kpi-box"><div class="kpi-label">Pitcher K%</div><div class="kpi-value">{pk*100:.1f}%</div><div class="kpi-sub">Season/recent blend</div></div>
         <div class="kpi-box"><div class="kpi-label">Opp K%</div><div class="kpi-value">{ok*100:.1f}%</div><div class="kpi-sub">Lineup/team matchup</div></div>
+        <div class="kpi-box"><div class="kpi-label">Team K Rank</div><div class="kpi-value" style="font-size:16px;">{okr_rank_hand_display}</div><div class="kpi-sub">{okr_team_display} vs {okr_hand_display}<br>{okr_k_hand_display}</div></div>
         <div class="kpi-box"><div class="kpi-label">Distribution</div><div class="kpi-value" style="font-size:17px;">{dist_display}</div><div class="kpi-sub">Floor | Median | Ceiling</div></div>
         <div class="kpi-box"><div class="kpi-label">Last 10 Starts</div>{recent_html}</div>
       </div>
@@ -27206,6 +27220,76 @@ def _okr_top5_test_table():
         return df[df["Rank"].isin([1,2,3,4,5])].sort_values(["Split", "Rank"])
     except Exception:
         return pd.DataFrame()
+
+
+
+# =============================================================
+# OPPONENT K RANK CARD DISPLAY 3.2 — UI ONLY
+# Adds a clean matchup panel to player cards. Does NOT change projections.
+# =============================================================
+def _okr_card_context_from_row(card_row, p=None):
+    """Return verified Opponent K Rank context for player-card display.
+    Prefers the official MLB rank columns created by Opponent Team K Rank Engine.
+    Falls back to existing app Opp K% only if official ranks are unavailable.
+    """
+    try:
+        row = card_row if isinstance(card_row, dict) else {}
+        p = p if isinstance(p, dict) else {}
+        def _first(*keys):
+            for k in keys:
+                v = row.get(k, None)
+                if v not in (None, "", "—"):
+                    return v
+                v = p.get(k, None)
+                if v not in (None, "", "—"):
+                    return v
+            return None
+        opp_team = _first("Opponent Team", "Opponent", "opp", "Opp") or "—"
+        p_hand = _first("Pitcher Hand", "Throws", "Pitcher Throws") or "UNKNOWN"
+        k_hand = _first("Opponent K% vs Pitcher Hand", "Matchup Hand K%")
+        rank_hand = _first("Opponent K Rank vs Pitcher Hand", "Opponent K Rank")
+        env = _first("Opponent K Environment")
+        src = _first("Opponent K Rank Source") or ""
+        # split details for display/audit
+        k_rhp = _first("Opp K% vs RHP Official", "Opp K% vs RHP")
+        r_rhp = _first("Opp K Rank vs RHP Official", "Opp K Rank vs RHP")
+        k_lhp = _first("Opp K% vs LHP Official", "Opp K% vs LHP")
+        r_lhp = _first("Opp K Rank vs LHP Official", "Opp K Rank vs LHP")
+        k_l30_rhp = _first("Opp L30 K% vs RHP Official")
+        r_l30_rhp = _first("Opp L30 K Rank vs RHP Official")
+        k_l30_lhp = _first("Opp L30 K% vs LHP Official")
+        r_l30_lhp = _first("Opp L30 K Rank vs LHP Official")
+        # fallback environment if official label missing
+        if not env:
+            env = _okr_environment_label(rank_hand, k_hand) if "_okr_environment_label" in globals() else "NO VERIFIED TEAM K RANK"
+        def _fmt_pct(v):
+            x = _okr_num(v, None) if "_okr_num" in globals() else safe_float(v, None)
+            if x is None:
+                return "—"
+            if abs(x) <= 1:
+                x *= 100.0
+            return f"{x:.1f}%"
+        def _fmt_rank(v):
+            x = _okr_num(v, None) if "_okr_num" in globals() else safe_float(v, None)
+            return "—" if x is None else f"#{int(x)}"
+        return {
+            "opp_team": str(opp_team),
+            "pitcher_hand": str(p_hand),
+            "k_hand": _fmt_pct(k_hand),
+            "rank_hand": _fmt_rank(rank_hand),
+            "env": str(env),
+            "source": str(src),
+            "rhp_line": f"RHP: {_fmt_pct(k_rhp)} / {_fmt_rank(r_rhp)}",
+            "lhp_line": f"LHP: {_fmt_pct(k_lhp)} / {_fmt_rank(r_lhp)}",
+            "l30_rhp_line": f"L30 RHP: {_fmt_pct(k_l30_rhp)} / {_fmt_rank(r_l30_rhp)}",
+            "l30_lhp_line": f"L30 LHP: {_fmt_pct(k_l30_lhp)} / {_fmt_rank(r_l30_lhp)}",
+        }
+    except Exception:
+        return {
+            "opp_team":"—", "pitcher_hand":"UNKNOWN", "k_hand":"—", "rank_hand":"—",
+            "env":"NO VERIFIED TEAM K RANK", "source":"", "rhp_line":"RHP: — / —",
+            "lhp_line":"LHP: — / —", "l30_rhp_line":"L30 RHP: — / —", "l30_lhp_line":"L30 LHP: — / —"
+        }
 
 # Wrap K projection table export/display without touching projection math.
 if "build_kproj_table" in globals():
