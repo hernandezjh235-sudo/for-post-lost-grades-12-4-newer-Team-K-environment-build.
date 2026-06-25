@@ -248,7 +248,7 @@ def get_secret(key, default=""):
 
 # SharpAPI is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
-ODDS_API_KEY = ""  # Disabled: old OddsAPI path is not active in get_sportsbook_k_data().
+ODDS_API_KEY = get_secret("ODDS_API_KEY", get_secret("THE_ODDS_API_KEY", ""))  # The Odds API live MLB pitcher-K props; market-only, never changes projections.
 SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
@@ -6572,13 +6572,32 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} sportsbook outcomes")
 
 def get_sportsbook_k_data(game_home, game_away, player_name):
-    """Return real sportsbook K odds from SharpAPI for market/sharp only.
+    """Return live sportsbook pitcher-K odds for Market/Sharp cards only.
+
+    Source priority:
+      1) The Odds API pitcher_strikeouts / pitcher_strikeouts_alternate
+      2) SharpAPI fallback if enabled
+      3) Manual odds fallback is merged later in make_projection()
 
     Projection independence rule: this source is never used to change pitcher skill,
     BF, IP, pitch count, lineups, sabermetrics, DIPS, or active Underdog line.
-    It only fills Market / Sharp / agreement cards.
+    It only fills Market / No-Vig / Sharp / agreement cards and export fields.
     """
-    return get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
+    oddsapi = get_oddsapi_all_pitcher_k_lines(player_name, game_home, game_away)
+    if str(oddsapi.get("status", "")).upper() == "FOUND" and oddsapi.get("rows"):
+        return oddsapi
+
+    sharp = get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
+    if str(sharp.get("status", "")).upper() == "FOUND" and sharp.get("rows"):
+        sharp["message"] = f"SharpAPI fallback used. OddsAPI: {oddsapi.get('status')} — {oddsapi.get('message')}"
+        return sharp
+
+    return source_result(
+        "Sportsbook",
+        "NO LIVE ODDS",
+        rows=[],
+        message=f"No live pitcher-K odds matched. OddsAPI: {oddsapi.get('status')} — {oddsapi.get('message')} | SharpAPI: {sharp.get('status')} — {sharp.get('message')}"
+    )
 
 def get_manual_market_k_data(player_name, active_line=None):
     """Manual sportsbook odds fallback for Market/Sharp cards only.
@@ -8908,6 +8927,11 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "odds": price,
         "price_is_real": bool(price_is_real),
         "price_source": price_source,
+        "live_odds_status": sportsbook_data.get("status"),
+        "live_odds_source": sportsbook_data.get("source", sportsbook_data.get("Source", "Sportsbook")),
+        "live_odds_message": sportsbook_data.get("message"),
+        "live_odds_line": sportsbook_data.get("line"),
+        "live_odds_rows_count": len(sportsbook_data.get("rows", []) or []),
         "market_over_odds": market_intel.get("market_over_odds") if "market_intel" in locals() else None,
         "market_under_odds": market_intel.get("market_under_odds") if "market_intel" in locals() else None,
         "market_over_implied": market_intel.get("market_over_implied") if "market_intel" in locals() else None,
@@ -10626,6 +10650,24 @@ with st.sidebar:
     st.divider()
     st.header("Manual Market Odds")
     st.caption("Refresh first. Then this build creates a pitcher/line table where you only enter Over/Under odds. Market odds never change K projection, BF/IP, pitch count, lineups, or Underdog line.")
+    st.divider()
+    st.header("Live Odds API")
+    st.caption("The Odds API is market-only. It can update Market / No-Vig / CLV reads, but it never changes K projection, BF, IP, pitch count, lineups, or the Underdog line.")
+    if ODDS_API_KEY:
+        st.success("ODDS_API_KEY detected")
+    else:
+        st.warning("No ODDS_API_KEY found. Add it in Streamlit Secrets to enable live odds.")
+    live_test_pitcher = st.text_input("Test live odds pitcher", value="", placeholder="Example: Tarik Skubal")
+    live_test_home = st.text_input("Test home team abbreviation", value="", placeholder="Example: DET")
+    live_test_away = st.text_input("Test away team abbreviation", value="", placeholder="Example: NYY")
+    if st.button("🧪 Test The Odds API Pitcher K Pull", use_container_width=True):
+        if not live_test_pitcher.strip():
+            st.warning("Enter a pitcher name first.")
+        else:
+            test_res = get_oddsapi_all_pitcher_k_lines(live_test_pitcher.strip(), live_test_home.strip() or None, live_test_away.strip() or None)
+            st.write({"status": test_res.get("status"), "line": test_res.get("line"), "message": test_res.get("message"), "rows": len(test_res.get("rows", []) or [])})
+            if test_res.get("rows"):
+                st.dataframe(pd.DataFrame(test_res.get("rows", []))[['Provider','Player','Matched Name','Line','Side','Price','Market','Event','Last Update']].head(40), use_container_width=True)
     if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
         st.cache_data.clear()
         st.session_state.loaded_picks = []
