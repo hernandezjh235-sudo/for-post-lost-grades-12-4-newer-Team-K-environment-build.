@@ -27175,6 +27175,151 @@ with tab5:
         st.caption(f"PICK_LOG: {diag.get('pick_log_path')}")
         st.caption(f"RESULT_LOG: {diag.get('result_log_path')}")
 
+
+    # =========================
+    # DIRECT CSV RECOVERY IMPORT
+    # =========================
+    def _direct_recovery_parse_pick_value(pick_value):
+        import re
+        s = str(pick_value or "").strip().upper()
+        if not s or s == "NL":
+            return None, None
+        side = "OVER" if s.startswith("O") else "UNDER" if s.startswith("U") else None
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        line = safe_float(m.group(1), None) if m else None
+        return side, line
+
+    def _direct_recovery_ip_value(v):
+        if v is None or str(v).strip() == "":
+            return None
+        s = str(v).strip()
+        try:
+            # preserve baseball IP text as numeric-ish value for display
+            return float(s)
+        except Exception:
+            return safe_float(v, None)
+
+    def _direct_recovery_import_manual_results(df, allow_overwrite=False):
+        """Import Date,Pitcher,Pick,Actual_K,Actual_IP,Result directly into RESULT_LOG.
+        This does NOT require saved before-game snapshots.
+        """
+        diag = {
+            "mode": "DIRECT_CSV_RECOVERY_NO_SNAPSHOTS_REQUIRED",
+            "manual_rows": 0,
+            "added": 0,
+            "skipped_duplicates": 0,
+            "bad_rows": 0,
+            "result_log_path": RESULT_LOG,
+            "bad_rows_sample": [],
+        }
+        if df is None or getattr(df, "empty", True):
+            return diag
+
+        diag["manual_rows"] = int(len(df))
+        result_log = load_json(RESULT_LOG, [])
+        if not isinstance(result_log, list):
+            result_log = []
+
+        existing_keys = set()
+        for old in result_log:
+            if isinstance(old, dict):
+                existing_keys.add(str(old.get("recovery_key") or old.get("pick_id") or ""))
+
+        for _, row in df.iterrows():
+            rd = row.to_dict()
+            pitcher = str(rd.get("Pitcher") or rd.get("pitcher") or rd.get("Player") or "").strip()
+            date = str(rd.get("Date") or rd.get("date") or "").strip()
+            pick_text = rd.get("Pick") if rd.get("Pick") is not None else rd.get("pick")
+            side, line = _direct_recovery_parse_pick_value(pick_text)
+
+            actual_k = safe_float(rd.get("Actual_K", rd.get("Actual K", rd.get("actual_k", rd.get("actual")))), None)
+            actual_ip = _direct_recovery_ip_value(rd.get("Actual_IP", rd.get("Actual IP", rd.get("actual_ip"))))
+            result_txt = str(rd.get("Result") or rd.get("result") or "").strip().upper()
+
+            if not pitcher or side is None or line is None or actual_k is None:
+                diag["bad_rows"] += 1
+                if len(diag["bad_rows_sample"]) < 12:
+                    diag["bad_rows_sample"].append({"Pitcher": pitcher, "Pick": str(pick_text), "Actual_K": str(actual_k)})
+                continue
+
+            if result_txt in ["WIN", "W", "✅"]:
+                graded_result = "WIN"
+                win = True
+            elif result_txt in ["LOSS", "LOSE", "L", "❌"]:
+                graded_result = "LOSS"
+                win = False
+            elif result_txt in ["PUSH", "VOID"]:
+                graded_result = result_txt
+                win = None
+            else:
+                win = bool(actual_k > line) if side == "OVER" else bool(actual_k < line)
+                graded_result = "WIN" if win else "LOSS"
+
+            recovery_key = f"RECOVERED|{date}|{normalize_name(pitcher)}|{side}|{line:.1f}"
+            if (not allow_overwrite) and recovery_key in existing_keys:
+                diag["skipped_duplicates"] += 1
+                continue
+
+            if allow_overwrite:
+                result_log = [
+                    r for r in result_log
+                    if str((r or {}).get("recovery_key") or (r or {}).get("pick_id") or "") != recovery_key
+                ]
+
+            # line as neutral projection placeholder because original projection is unavailable in this backup CSV
+            rec = {
+                "pick_id": recovery_key,
+                "recovery_key": recovery_key,
+                "recovered_from_manual_csv": True,
+                "source": "DIRECT_CSV_RECOVERY_IMPORT",
+                "line_source": "RECOVERED_CSV",
+                "date": date,
+                "graded_at": now_iso(),
+                "pitcher": pitcher,
+                "Pitcher": pitcher,
+                "pitcher_name": pitcher,
+                "pick_side": side,
+                "side": side,
+                "line": float(line),
+                "UD/Line": float(line),
+                "projection": float(line),
+                "K PROJ": float(line),
+                "abs_edge": 0.0,
+                "fair_probability": 0.50,
+                "projection_placeholder_note": "Recovered grade imported without original before-snapshot; line used as neutral projection placeholder.",
+                "actual": float(actual_k),
+                "actual_k": float(actual_k),
+                "actual_ip": actual_ip,
+                "Actual_K": float(actual_k),
+                "Actual_IP": actual_ip,
+                "graded_result": graded_result,
+                "Result": graded_result,
+                "win": win,
+            }
+            result_log.append(rec)
+            existing_keys.add(recovery_key)
+            diag["added"] += 1
+
+        save_json(RESULT_LOG, result_log)
+
+        # Save extra backups in repo-friendly folder if available.
+        try:
+            os.makedirs("learning_data", exist_ok=True)
+            pd.DataFrame(result_log).to_csv("learning_data/recovered_result_log_backup.csv", index=False)
+            with open("learning_data/auto_result_log_recovered_backup.json", "w") as f:
+                json.dump(result_log, f, indent=2)
+        except Exception:
+            pass
+
+        try:
+            write_safe_backup(reason="direct_csv_recovery_import")
+        except Exception:
+            pass
+
+        diag["total_result_log_rows"] = len(result_log)
+        return diag
+
+
     st.markdown('<div class="section-title-pro">Manual Actual Results Import — Secure Fallback</div>', unsafe_allow_html=True)
     st.caption("Use this if automatic MLB grading returns 0 or if you want to verify outcomes manually. Save the official snapshot before games, then after games paste/upload actual results and grade.")
     st.code("Pitcher,Actual K,Actual IP,Actual BF,Actual ER,Actual Hits,Actual BB,Actual Pitches\nGerrit Cole,6,6.0,24,2,5,2,96\nMichael Wacha,3,6.0,23,1,4,1,91", language="csv")
@@ -27203,11 +27348,14 @@ with tab5:
         st.write({"Manual rows detected": len(manual_df), "Columns": list(manual_df.columns)})
         st.dataframe(manual_df.head(25), use_container_width=True, hide_index=True)
     if st.button("🧾 GRADE FROM MANUAL ACTUAL RESULTS + UPDATE LEARNING", use_container_width=True):
-        diag_manual = grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=allow_manual_overwrite)
-        if diag_manual.get("graded", 0) > 0:
-            st.success(f"✅ Manual grading complete: graded {diag_manual.get('graded')} rows and updated Learning Lab files.")
+        # DIRECT RECOVERY IMPORT: works even when saved_snapshots = 0.
+        # This fixes the old behavior where 96 CSV rows could load but grade 0.
+        diag_manual = _direct_recovery_import_manual_results(manual_df, allow_overwrite=allow_manual_overwrite)
+        if diag_manual.get("added", 0) > 0:
+            st.success(f"✅ Direct CSV recovery complete: imported {diag_manual.get('added')} recovered grades into Learning History.")
+            st.info("Now refresh/open Learning Lab or Calibration tabs. Download a Full Backup after this imports.")
         else:
-            st.warning("⚠️ Manual grading ran, but graded 0 rows. Check unmatched pitchers, columns, or saved snapshots.")
+            st.warning("⚠️ Direct CSV recovery ran but added 0 rows. Check duplicate rows or bad CSV values.")
         st.write(diag_manual)
 
     results = load_json(RESULT_LOG, [])
