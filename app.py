@@ -9453,7 +9453,8 @@ def merge_restored_graded_history_into_result_log(force=False):
         if not path:
             try:
                 st.session_state["restored_graded_history_status"] = status
-                st.session_state["restored_graded_history_loaded"] = True
+                # Do NOT lock this as loaded when missing; repo files can appear after redeploy/session refresh.
+                st.session_state["restored_graded_history_loaded"] = False
             except Exception:
                 pass
             return status
@@ -19817,6 +19818,13 @@ def _learning_lab_get_history_df():
     # Read the same persistent RESULT_LOG used by Calibration Audit so Learning Lab
     # does not show WAITING when graded samples already exist.
     try:
+        # Always attempt restored CSV merge first so GitHub learning_data/graded_history.csv
+        # appears immediately in Learning Lab after deployment/restart.
+        if "merge_restored_graded_history_into_result_log" in globals():
+            try:
+                merge_restored_graded_history_into_result_log(force=True)
+            except Exception:
+                pass
         for key in ["graded_df", "graded_history", "learning_history", "after_games_df", "results_df"]:
             if key in st.session_state:
                 val = st.session_state.get(key)
@@ -19852,6 +19860,18 @@ def _learning_lab_get_history_df():
 def render_learning_lab_tab(board=None):
     st.markdown("### 🧪 Learning Lab")
     st.caption("Read-only calibration center. It does not change K Upside, Pitcher FS, Batter FS, Moneyline, or Baseball IQ picks/projections.")
+
+    # Visible restore status so you can confirm the 96 historical grades loaded.
+    try:
+        _hist_status = merge_restored_graded_history_into_result_log(force=True) if "merge_restored_graded_history_into_result_log" in globals() else {}
+        if _hist_status.get("loaded"):
+            st.success(f"✅ Restored graded history loaded: {_hist_status.get('csv_rows', 0)} CSV rows | total log {_hist_status.get('result_log_after', 0)}")
+        elif _hist_status.get("path") is None:
+            st.warning("⚠️ graded_history.csv not found. Expected: learning_data/graded_history.csv")
+        elif _hist_status.get("error"):
+            st.warning(f"⚠️ graded_history.csv load error: {_hist_status.get('error')}")
+    except Exception as _restore_status_e:
+        st.warning(f"⚠️ Restored graded history status check failed: {_restore_status_e}")
 
     df = _learning_lab_get_history_df()
 
