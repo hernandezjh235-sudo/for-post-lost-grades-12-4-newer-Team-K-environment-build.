@@ -12133,6 +12133,54 @@ def _lineup_pressure_summary(lineup_rows):
     avg = sum(k for _,k in vals)/len(vals)
     return f"Avg lineup K {avg:.1f}% • High-K bats {len(high)} • Low-K contact bats {len(low)}"
 
+
+
+# =============================================================
+# PLAYER CARD PICK SIDE DISPLAY FIX 1.0 — UI ONLY
+# Shows the model side on player cards even when the official filter says PASS.
+# This does NOT change projections, board decisions, exports, grading, or model math.
+# =============================================================
+def _pc_pick_side_display(decision_raw, projection=None, line=None, edge=None):
+    try:
+        dec = str(decision_raw or '').upper()
+        # no actionable line/data -> true pass
+        if 'NO LINE' in dec or 'NO_UD_LINE' in dec or 'NO DATA' in dec or 'NO_SIDE' in dec or 'NO SIDE' in dec:
+            return '🚫 PASS', 'NO LINE / NO DIRECTION'
+        e = safe_float(edge, None) if 'safe_float' in globals() else None
+        if e is None:
+            p = safe_float(projection, None) if 'safe_float' in globals() else None
+            ln = safe_float(line, None) if 'safe_float' in globals() else None
+            if p is not None and ln is not None:
+                e = round(float(p) - float(ln), 2)
+        side = None
+        if 'OVER' in dec:
+            side = 'OVER'
+        elif 'UNDER' in dec:
+            side = 'UNDER'
+        elif e is not None:
+            if e > 0.03:
+                side = 'OVER'
+            elif e < -0.03:
+                side = 'UNDER'
+        if not side:
+            return '🚫 PASS', 'NO DIRECTION'
+        reason = ''
+        for key in ['HIGH CONFLICT','TRUE EDGE THIN','MARKET DISAGREE','FILTER WARNING','LOW LEASH','ROLE RISK','BULK/LEASH','WARNING','CONFLICT']:
+            if key in dec:
+                reason = key
+                break
+        if 'PASS' in dec or 'TRACK' in dec or 'AVOID' in dec:
+            return f'⚠️ {side} LEAN', reason or 'FILTERED / NOT OFFICIAL'
+        if '🔥' in str(decision_raw) or 'ELITE EDGE' in dec or 'MARKET CONFIRMS' in dec:
+            return f'🔥 {side}', reason or 'OFFICIAL PLAY'
+        if 'LEAN' in dec or '⚠️' in str(decision_raw):
+            return f'⚠️ {side} LEAN', reason or 'LEAN'
+        if abs(float(e or 0)) >= 1.0:
+            return f'🔥 {side}', reason or 'OFFICIAL PLAY'
+        return f'⚠️ {side} LEAN', reason or 'LEAN'
+    except Exception:
+        return str(decision_raw or '🚫 PASS'), ''
+
 def render_kproj_pitcher_card(p):
     d = kproj_decision(p)
     dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
@@ -12276,6 +12324,15 @@ def render_kproj_pitcher_card(p):
     fi_avg_k_display = '—' if p.get('first_inning_avg_k') is None else f"{safe_float(p.get('first_inning_avg_k'),0):.2f}"
     fi_label_display = html.escape(str(p.get('first_inning_efficiency_label') or 'FI_TRACK_ONLY'))
     fi_conf_display = html.escape(str(p.get('first_inning_confidence') or 'DAY_1_TRACK_ONLY'))
+    # UI-only pick side: keep official/pass filters intact, but always reveal model side when line/projection has a direction.
+    card_decision_display, card_decision_reason = _pc_pick_side_display(
+        d.get('decision'),
+        projection=d.get('projection'),
+        line=d.get('line'),
+        edge=d.get('line_edge') if d.get('line_edge') not in (None, '', '—') else d.get('edge_display')
+    )
+    card_decision_display = html.escape(str(card_decision_display))
+    card_decision_reason_display = html.escape(str(card_decision_reason or ''))
     fi_note_display = html.escape(str(p.get('first_inning_note') or 'First inning layer tracking only; no projection impact.'))
     slate_q = st.session_state.get('slate_quality_info') or compute_slate_quality_score([p])
     slate_badge_text = f"{slate_q.get('emoji','⚪')} {slate_q.get('label','NO BOARD')} {slate_q.get('score',0)}/100"
@@ -12293,12 +12350,12 @@ def render_kproj_pitcher_card(p):
         <div><div class="small-muted">Final K Projection</div><div class="big-number green">{d['projection']}</div><div class="small-muted">{card_k_projection_source} | BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
         <div><div class="small-muted">Edge</div><div class="big-number green">{edge_display}</div><div class="small-muted">Under wins {under_max_display}</div></div>
-        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}<br>Tier 3.0: {decision_tier_display}</div></div>
+        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{card_decision_display}</div><div class="small-muted">Reason: {card_decision_reason_display}<br>Confidence {conf_display}<br>Tier 3.0: {decision_tier_display}</div></div>
       </div>
       <div class="hr-soft"></div>
       <div class="mobile-decision-grid">
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}<br>{no_vig_note_display}<br>Proj Side {p.get('projection_market_side', p.get('pick_side', '—'))}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}<br>{no_vig_note_display}<br>Proj Side {'OVER' if safe_float(d.get('line_edge'), 0) > 0 else 'UNDER' if safe_float(d.get('line_edge'), 0) < 0 else '—'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
