@@ -84,6 +84,15 @@ GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
 SAVED_ODDS_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds_backup.json")
 SAVED_ODDS_LOCAL_FILE = "saved_manual_market_odds.json"
+GRADED_HISTORY_CSV_NAME = "graded_history.csv"
+GRADED_HISTORY_LOCAL_CANDIDATES = [
+    os.path.join("learning_data", GRADED_HISTORY_CSV_NAME),
+    os.path.join(os.getcwd(), "learning_data", GRADED_HISTORY_CSV_NAME),
+]
+try:
+    GRADED_HISTORY_LOCAL_CANDIDATES.append(os.path.join(os.path.dirname(__file__), "learning_data", GRADED_HISTORY_CSV_NAME))
+except Exception:
+    pass
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -7585,6 +7594,55 @@ def reconcile_market_agreement_fields(p):
         p["market_agreement"] = "PARTIAL_MARKET"
     return p
 
+
+
+# =============================================================
+# MARKET AGREEMENT DISPLAY SYNC 3.4 — CARD/TABLE SAFETY PATCH
+# UI/export-only: syncs market agreement to final card projection vs line.
+# Does NOT change K projections, BF, IP, Monte Carlo, or grading.
+# =============================================================
+def _sync_market_with_card_decision(p, d=None):
+    try:
+        if not isinstance(p, dict):
+            return p
+        d = d or {}
+        proj = safe_float(d.get('projection'), safe_float(p.get('projection') or p.get('Final Projection') or p.get('K PROJ'), None))
+        line = safe_float(d.get('line'), safe_float(p.get('line') if p.get('line') is not None else p.get('UD/Line'), None))
+        if proj is None or line is None:
+            return p
+        model_side = 'OVER' if proj > line else 'UNDER' if proj < line else 'PUSH'
+        p['projection_market_side'] = model_side
+        # Keep no-vig odds as the market source when available.
+        over_nv = safe_float(p.get('market_over_no_vig'), None)
+        under_nv = safe_float(p.get('market_under_no_vig'), None)
+        over_px = safe_float(str(p.get('market_over_odds', '')).replace('+',''), None)
+        under_px = safe_float(str(p.get('market_under_odds', '')).replace('+',''), None)
+        if (over_nv is None or under_nv is None) and (over_px is not None and under_px is not None):
+            nv = no_vig_two_way(over_px, under_px)
+            over_nv = nv.get('over')
+            under_nv = nv.get('under')
+            p['market_vig'] = nv.get('vig')
+            p['market_over_no_vig'] = over_nv
+            p['market_under_no_vig'] = under_nv
+            p['market_over_implied'] = nv.get('over')
+            p['market_under_implied'] = nv.get('under')
+        if over_nv is None or under_nv is None:
+            return p
+        market_lean = 'OVER' if float(over_nv) >= float(under_nv) else 'UNDER'
+        strength = _market_strength_from_no_vig_probs(over_nv, under_nv) if '_market_strength_from_no_vig_probs' in globals() else 'LIGHT'
+        agreement = 'AGREE' if market_lean == model_side else 'DISAGREE' if model_side in ['OVER','UNDER'] else 'NO_MODEL_SIDE'
+        p['market_lean'] = market_lean
+        p['market_strength'] = strength
+        p['market_agreement'] = agreement
+        p['sharp_warning'] = 'MARKET_AGREE' if agreement == 'AGREE' else 'MARKET_DISAGREE' if agreement == 'DISAGREE' else p.get('sharp_warning','NONE')
+        p['market_no_vig_side_prob'] = over_nv if model_side == 'OVER' else under_nv if model_side == 'UNDER' else None
+        p['market_no_vig_note'] = f"No-vig O {_pct_display(over_nv)} | U {_pct_display(under_nv)} | Vig {_pct_display(p.get('market_vig'))}"
+        p['market_note'] = f"Market {market_lean} {strength}; projection_side={model_side}; agreement={agreement}; over={over_px}; under={under_px}"
+    except Exception:
+        pass
+    return p
+
+
 def build_market_odds_intelligence(priced_rows, active_line, model_side, fair_probability=None):
     """Read sportsbook prices for OVER/UNDER and grade market agreement.
 
@@ -9264,6 +9322,203 @@ def _grade_result_key(row):
         return f"pick_id::{row.get('pick_id')}"
     return "unknown"
 
+
+
+# =========================
+# RESTORED GRADED HISTORY LOADER
+# Version: RESTORE_GRADED_HISTORY_2026_06_25
+# Purpose:
+# - Load learning_data/graded_history.csv on startup.
+# - Merge the restored 96+ historical grades into RESULT_LOG.
+# - Keep normal Save/Grade workflow active for today's slate.
+# - Does NOT change projections, board math, decisions, odds, or filters.
+# =========================
+RESTORED_GRADED_HISTORY_VERSION = "RESTORE_GRADED_HISTORY_2026_06_25"
+
+def _restored_grade_parse_pick(pick_text):
+    """Parse strings like 'O 5.5' or 'U 4.5' into side + line."""
+    raw = str(pick_text or "").strip()
+    if not raw or raw.upper() in {"NL", "NO LINE", "NO_LINE", "PASS"}:
+        return None, None, raw.upper() if raw else ""
+    parts = raw.replace("OVER", "O").replace("UNDER", "U").split()
+    side_token = parts[0].upper() if parts else ""
+    side = "OVER" if side_token.startswith("O") else "UNDER" if side_token.startswith("U") else None
+    line = None
+    for tok in parts[1:]:
+        v = safe_float(tok, None)
+        if v is not None:
+            line = v
+            break
+    return side, line, raw
+
+def _restored_grade_find_file():
+    """Find learning_data/graded_history.csv in the repo/app directory."""
+    for p in GRADED_HISTORY_LOCAL_CANDIDATES:
+        try:
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+def _restored_grade_row_to_result(row):
+    """Convert the simple restored CSV row into the app's RESULT_LOG schema."""
+    if row is None:
+        return None
+    date = str(row.get("Date") or row.get("date") or "").strip()[:10]
+    pitcher = str(row.get("Pitcher") or row.get("pitcher") or row.get("Player") or "").strip()
+    side, line, raw_pick = _restored_grade_parse_pick(row.get("Pick") or row.get("pick") or row.get("Decision"))
+    actual_k = safe_float(row.get("Actual_K") or row.get("Actual K") or row.get("actual") or row.get("Actual Ks"), None)
+    actual_ip = safe_float(row.get("Actual_IP") or row.get("Actual IP") or row.get("actual_ip"), None)
+    result = str(row.get("Result") or row.get("graded_result") or "").strip().upper()
+    if not pitcher or not date:
+        return None
+    if result not in {"WIN", "LOSS", "NL", "NO LINE", "NO_LINE"}:
+        # Recompute if possible.
+        if actual_k is not None and line is not None and side in {"OVER", "UNDER"}:
+            result = "WIN" if ((actual_k > line) if side == "OVER" else (actual_k < line)) else "LOSS"
+        else:
+            result = "NO LINE"
+    graded_result = "NO LINE" if result in {"NL", "NO LINE", "NO_LINE"} else result
+    win = True if graded_result == "WIN" else False if graded_result == "LOSS" else None
+    out = {
+        "date": date,
+        "game_date": date,
+        "pitcher": pitcher,
+        "player": pitcher,
+        "market": "pitcher_ks",
+        "prop_type": "pitcher_ks",
+        "pick_side": side,
+        "line": line,
+        "final_line": line,
+        "Pick": raw_pick,
+        "actual": actual_k,
+        "actual_k": actual_k,
+        "actual_ip": actual_ip,
+        "graded": True,
+        "graded_at": date + "T23:59:00",
+        "graded_result": graded_result,
+        "win": win,
+        "grading_source": "RESTORED_GRADED_HISTORY_CSV",
+        "actual_result_source": "RESTORED_GRADED_HISTORY_CSV",
+        "restored_history_version": RESTORED_GRADED_HISTORY_VERSION,
+    }
+    # Helpful projection-safe learning labels. These are display/audit only if upstream fields are absent.
+    if actual_k is not None and line is not None and side in {"OVER", "UNDER"}:
+        out["actual_margin_vs_line"] = round((actual_k - line) if side == "OVER" else (line - actual_k), 2)
+    out["_restored_grade_key"] = _grade_result_key(out)
+    return out
+
+def load_restored_graded_history_df():
+    """Read the uploaded restored grades CSV. Safe: returns empty DataFrame when absent."""
+    try:
+        path = _restored_grade_find_file()
+        if not path:
+            return pd.DataFrame()
+        df = pd.read_csv(path)
+        try:
+            st.session_state["restored_graded_history_path"] = path
+            st.session_state["restored_graded_history_csv_rows"] = len(df)
+        except Exception:
+            pass
+        return df
+    except Exception as e:
+        try:
+            st.session_state["restored_graded_history_error"] = str(e)[:200]
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+def merge_restored_graded_history_into_result_log(force=False):
+    """Merge restored history into RESULT_LOG without overwriting today's grading workflow."""
+    try:
+        if st.session_state.get("restored_graded_history_loaded") and not force:
+            return st.session_state.get("restored_graded_history_status", {})
+    except Exception:
+        pass
+    status = {
+        "version": RESTORED_GRADED_HISTORY_VERSION,
+        "csv_rows": 0,
+        "converted_rows": 0,
+        "added_rows": 0,
+        "duplicates_skipped": 0,
+        "result_log_before": 0,
+        "result_log_after": 0,
+        "path": None,
+        "loaded": False,
+    }
+    try:
+        path = _restored_grade_find_file()
+        status["path"] = path
+        if not path:
+            try:
+                st.session_state["restored_graded_history_status"] = status
+                # Do NOT lock this as loaded when missing; repo files can appear after redeploy/session refresh.
+                st.session_state["restored_graded_history_loaded"] = False
+            except Exception:
+                pass
+            return status
+        df = pd.read_csv(path)
+        status["csv_rows"] = len(df)
+        existing = load_json(RESULT_LOG, [])
+        if not isinstance(existing, list):
+            existing = []
+        status["result_log_before"] = len(existing)
+        seen = set()
+        clean_existing = []
+        for r in existing:
+            if not isinstance(r, dict):
+                continue
+            k = _grade_result_key(r)
+            if k not in seen:
+                clean_existing.append(r)
+                seen.add(k)
+        added = 0
+        dupes = 0
+        converted = 0
+        for _, row in df.iterrows():
+            rr = _restored_grade_row_to_result(row.to_dict())
+            if not rr:
+                continue
+            converted += 1
+            k = _grade_result_key(rr)
+            if k in seen:
+                dupes += 1
+                continue
+            clean_existing.append(rr)
+            seen.add(k)
+            added += 1
+        save_json(RESULT_LOG, clean_existing[-10000:])
+        status.update({
+            "converted_rows": converted,
+            "added_rows": added,
+            "duplicates_skipped": dupes,
+            "result_log_after": len(clean_existing[-10000:]),
+            "loaded": True,
+        })
+        try:
+            st.session_state["restored_graded_history_status"] = status
+            st.session_state["restored_graded_history_loaded"] = True
+            # Make Learning Lab immediately aware of the merged RESULT_LOG.
+            st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(clean_existing[-10000:])) if "_learning_lab_normalize_results_df" in globals() else pd.DataFrame(clean_existing[-10000:])
+        except Exception:
+            pass
+        return status
+    except Exception as e:
+        status["error"] = str(e)[:220]
+        try:
+            st.session_state["restored_graded_history_status"] = status
+            st.session_state["restored_graded_history_loaded"] = True
+        except Exception:
+            pass
+        return status
+
+try:
+    # Auto-restore on app startup. Safe to call repeatedly because it dedupes.
+    merge_restored_graded_history_into_result_log(force=False)
+except Exception:
+    pass
+
 def update_manager_pull_learning_after_grade(pick):
     """Collect manager/team pull behavior after grading.
 
@@ -10168,18 +10423,18 @@ def official_card_k_projection(p):
         row = official_card_k_row(p)
         # FINAL CARD LOCK: the player card must display the LAST/FULLY FINAL output.
         # Do NOT let early/intermediate K PROJ or Official K PROJ override Line-Aware Smart.
-        for c in ["Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection"]:
+        for c in ["Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection"]:
             if row and row.get(c) not in (None, "", "—"):
                 v = safe_float(row.get(c), None)
                 if v is not None:
-                    return round(float(v), 2), "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
+                    return round(float(v), 2), "Matchup Intel Final" if c == "Matchup Intelligence Final K Projection" else "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
 
         # Fallback if one-row table cannot be built.
-        for c in ["Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection", "projection"]:
+        for c in ["Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection", "projection"]:
             if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
                 v = safe_float(p.get(c), None)
                 if v is not None:
-                    return round(float(v), 2), "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
+                    return round(float(v), 2), "Matchup Intel Final" if c == "Matchup Intelligence Final K Projection" else "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
 
         return ("—", "Unavailable")
     except Exception:
@@ -10230,6 +10485,7 @@ def render_pick_card(p):
         if abs(x) <= 1:
             x *= 100.0
         return f"{x:.1f}%"
+    p = _sync_market_with_card_decision(p, d) if '_sync_market_with_card_decision' in globals() else p
     market_o_display = p.get('market_over_odds', '—')
     market_u_display = p.get('market_under_odds', '—')
     fair_o_display = _card_pct(p.get('market_over_implied'))
@@ -12083,6 +12339,54 @@ def _lineup_pressure_summary(lineup_rows):
     avg = sum(k for _,k in vals)/len(vals)
     return f"Avg lineup K {avg:.1f}% • High-K bats {len(high)} • Low-K contact bats {len(low)}"
 
+
+
+# =============================================================
+# PLAYER CARD PICK SIDE DISPLAY FIX 1.0 — UI ONLY
+# Shows the model side on player cards even when the official filter says PASS.
+# This does NOT change projections, board decisions, exports, grading, or model math.
+# =============================================================
+def _pc_pick_side_display(decision_raw, projection=None, line=None, edge=None):
+    try:
+        dec = str(decision_raw or '').upper()
+        # no actionable line/data -> true pass
+        if 'NO LINE' in dec or 'NO_UD_LINE' in dec or 'NO DATA' in dec or 'NO_SIDE' in dec or 'NO SIDE' in dec:
+            return '🚫 PASS', 'NO LINE / NO DIRECTION'
+        e = safe_float(edge, None) if 'safe_float' in globals() else None
+        if e is None:
+            p = safe_float(projection, None) if 'safe_float' in globals() else None
+            ln = safe_float(line, None) if 'safe_float' in globals() else None
+            if p is not None and ln is not None:
+                e = round(float(p) - float(ln), 2)
+        side = None
+        if 'OVER' in dec:
+            side = 'OVER'
+        elif 'UNDER' in dec:
+            side = 'UNDER'
+        elif e is not None:
+            if e > 0.03:
+                side = 'OVER'
+            elif e < -0.03:
+                side = 'UNDER'
+        if not side:
+            return '🚫 PASS', 'NO DIRECTION'
+        reason = ''
+        for key in ['HIGH CONFLICT','TRUE EDGE THIN','MARKET DISAGREE','FILTER WARNING','LOW LEASH','ROLE RISK','BULK/LEASH','WARNING','CONFLICT']:
+            if key in dec:
+                reason = key
+                break
+        if 'PASS' in dec or 'TRACK' in dec or 'AVOID' in dec:
+            return f'⚠️ {side} LEAN', reason or 'FILTERED / NOT OFFICIAL'
+        if '🔥' in str(decision_raw) or 'ELITE EDGE' in dec or 'MARKET CONFIRMS' in dec:
+            return f'🔥 {side}', reason or 'OFFICIAL PLAY'
+        if 'LEAN' in dec or '⚠️' in str(decision_raw):
+            return f'⚠️ {side} LEAN', reason or 'LEAN'
+        if abs(float(e or 0)) >= 1.0:
+            return f'🔥 {side}', reason or 'OFFICIAL PLAY'
+        return f'⚠️ {side} LEAN', reason or 'LEAN'
+    except Exception:
+        return str(decision_raw or '🚫 PASS'), ''
+
 def render_kproj_pitcher_card(p):
     d = kproj_decision(p)
     dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
@@ -12131,13 +12435,16 @@ def render_kproj_pitcher_card(p):
                 d["lean_side"] = card_row.get("Model Lean")
             if card_row.get("Confidence %") not in (None, "", "—"):
                 d["confidence"] = (safe_float(card_row.get("Confidence %"), 0) or 0) / 100.0
-            if card_row.get("Line-Aware Smart Final K Projection") not in (None, "", "—"):
+            if card_row.get("Matchup Intelligence Final K Projection") not in (None, "", "—"):
+                card_k_projection = round(float(safe_float(card_row.get("Matchup Intelligence Final K Projection"), card_k_projection)), 2)
+                card_k_projection_source = "Matchup Intel Final"
+            elif card_row.get("Line-Aware Smart Final K Projection") not in (None, "", "—"):
                 card_k_projection = round(float(safe_float(card_row.get("Line-Aware Smart Final K Projection"), card_k_projection)), 2)
                 card_k_projection_source = "Line-Aware Smart Final"
             elif card_row.get("K PROJ") not in (None, "", "—"):
                 card_k_projection = round(float(safe_float(card_row.get("K PROJ"), card_k_projection)), 2)
             official_edge_value = None
-            for ec in ["Line-Aware Smart Edge", "Edge Gap", "Official K Edge", "WRS Edge", "TPS Edge"]:
+            for ec in ["Line-Aware Smart Edge", "Edge Gap", "Official K Edge", "Final K Edge", "WRS Edge", "TPS Edge"]:
                 if card_row.get(ec) not in (None, "", "—"):
                     official_edge_value = safe_float(card_row.get(ec), None)
                     break
@@ -12201,11 +12508,19 @@ def render_kproj_pitcher_card(p):
     okr_k_hand_display = html.escape(str(okr_ctx.get('k_hand', '—')))
     okr_rank_hand_display = html.escape(str(okr_ctx.get('rank_hand', '—')))
     okr_source_display = html.escape(str(okr_ctx.get('source', ''))[:80])
-    okr_overall_line = html.escape(str(okr_ctx.get('overall_line', 'Overall: — / —')))
     okr_rhp_line = html.escape(str(okr_ctx.get('rhp_line', 'RHP: — / —')))
     okr_lhp_line = html.escape(str(okr_ctx.get('lhp_line', 'LHP: — / —')))
     okr_l30_rhp_line = html.escape(str(okr_ctx.get('l30_rhp_line', 'L30 RHP: — / —')))
     okr_l30_lhp_line = html.escape(str(okr_ctx.get('l30_lhp_line', 'L30 LHP: — / —')))
+    okr_overall_line = html.escape(str(okr_ctx.get('overall_line', 'Team Batter K%: — / —')))
+    okr_overall_so_line = html.escape(str(okr_ctx.get('overall_so_line', 'Team Batter SO: — / —')))
+    okr_l30_overall_line = html.escape(str(okr_ctx.get('l30_overall_line', 'L30 Team K%: — / —')))
+    okr_l30_so_line = html.escape(str(okr_ctx.get('l30_so_line', 'L30 Team SO: — / —')))
+    okr_official_source_line = html.escape(str(okr_ctx.get('official_source_line', 'MLB.com official team hitting stats')))
+    pitcher_k_rank_display = html.escape(str(card_row.get('Pitcher K% Board Rank', '—') if isinstance(card_row, dict) else '—'))
+    pitcher_k_strength_display = html.escape(str(card_row.get('Pitcher K% Strength Label', '—') if isinstance(card_row, dict) else '—'))
+    pitcher_k_rank_source_display = html.escape(str(card_row.get('Pitcher K% Rank Source', 'Current projection board') if isinstance(card_row, dict) else 'Current projection board'))
+    team_k_read_display = html.escape(str(card_row.get('Team K Read', '') if isinstance(card_row, dict) else ''))
     tier3 = build_decision_tier_3_0(p, d)
     decision_tier_display = html.escape(str(tier3.get('decision_tier_3_0') or 'TRACK ONLY'))
     decision_tier_note_display = html.escape(str(tier3.get('decision_tier_3_0_note') or 'Tier is display-only; core projection unchanged.'))
@@ -12215,6 +12530,15 @@ def render_kproj_pitcher_card(p):
     fi_avg_k_display = '—' if p.get('first_inning_avg_k') is None else f"{safe_float(p.get('first_inning_avg_k'),0):.2f}"
     fi_label_display = html.escape(str(p.get('first_inning_efficiency_label') or 'FI_TRACK_ONLY'))
     fi_conf_display = html.escape(str(p.get('first_inning_confidence') or 'DAY_1_TRACK_ONLY'))
+    # UI-only pick side: keep official/pass filters intact, but always reveal model side when line/projection has a direction.
+    card_decision_display, card_decision_reason = _pc_pick_side_display(
+        d.get('decision'),
+        projection=d.get('projection'),
+        line=d.get('line'),
+        edge=d.get('line_edge') if d.get('line_edge') not in (None, '', '—') else d.get('edge_display')
+    )
+    card_decision_display = html.escape(str(card_decision_display))
+    card_decision_reason_display = html.escape(str(card_decision_reason or ''))
     fi_note_display = html.escape(str(p.get('first_inning_note') or 'First inning layer tracking only; no projection impact.'))
     slate_q = st.session_state.get('slate_quality_info') or compute_slate_quality_score([p])
     slate_badge_text = f"{slate_q.get('emoji','⚪')} {slate_q.get('label','NO BOARD')} {slate_q.get('score',0)}/100"
@@ -12232,17 +12556,18 @@ def render_kproj_pitcher_card(p):
         <div><div class="small-muted">Final K Projection</div><div class="big-number green">{d['projection']}</div><div class="small-muted">{card_k_projection_source} | BF {bf:.1f} | IP {p.get('projected_ip', '—')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
         <div><div class="small-muted">Edge</div><div class="big-number green">{edge_display}</div><div class="small-muted">Under wins {under_max_display}</div></div>
-        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}<br>Tier 3.0: {decision_tier_display}</div></div>
+        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{card_decision_display}</div><div class="small-muted">Reason: {card_decision_reason_display}<br>Confidence {conf_display}<br>Tier 3.0: {decision_tier_display}</div></div>
       </div>
       <div class="hr-soft"></div>
       <div class="mobile-decision-grid">
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}<br>{no_vig_note_display}<br>Proj Side {p.get('projection_market_side', p.get('pick_side', '—'))}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market / No-Vig</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}<br>No-Vig O {no_vig_o_display} | U {no_vig_u_display}<br>{no_vig_note_display}<br>Proj Side {'OVER' if safe_float(d.get('line_edge'), 0) > 0 else 'UNDER' if safe_float(d.get('line_edge'), 0) < 0 else '—'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_overall_line}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}<br>Source: MLB.com official K% (SO/PA)</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Pitcher K% Strength</div><div class="kpi-value" style="font-size:15px;">{pitcher_k_strength_display}</div><div class="kpi-sub">Pitcher K% {pk*100:.1f}% | Board Rank {pitcher_k_rank_display}<br>{pitcher_k_rank_source_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_overall_line}<br>{okr_overall_so_line}<br>{okr_l30_overall_line}<br>{okr_l30_so_line}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}<br>{team_k_read_display}<br>Source: {okr_official_source_line}<br>MI Nudge: {card_row.get("Matchup Intel K Nudge", "—") if isinstance(card_row, dict) else "—"} K | {card_row.get("Matchup Intel Label", "—") if isinstance(card_row, dict) else "—"}</div></div>
         <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
@@ -12271,11 +12596,12 @@ def render_kproj_pitcher_card(p):
       </div>
       <div class="kpi-sub" style="margin-top:8px;line-height:1.35;">{p.get('market_note','')}<br>{p.get('line_history_note','')}<br>{p.get('sharp_warning_note','')}<br>{p.get('innings_outcome_note','')}</div>
       <div class="hr-soft"></div>
-      <div class="kpi-strip" style="grid-template-columns:repeat(6,minmax(0,1fr));">
+      <div class="kpi-strip" style="grid-template-columns:repeat(7,minmax(0,1fr));">
         <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
         <div class="kpi-box"><div class="kpi-label">Pitcher K%</div><div class="kpi-value">{pk*100:.1f}%</div><div class="kpi-sub">Season/recent blend</div></div>
+        <div class="kpi-box"><div class="kpi-label">Pitcher K Rank</div><div class="kpi-value" style="font-size:16px;">{pitcher_k_rank_display}</div><div class="kpi-sub">{pitcher_k_strength_display}</div></div>
         <div class="kpi-box"><div class="kpi-label">Opp K%</div><div class="kpi-value">{ok*100:.1f}%</div><div class="kpi-sub">Lineup/team matchup</div></div>
-        <div class="kpi-box"><div class="kpi-label">Team K Rank</div><div class="kpi-value" style="font-size:16px;">{okr_rank_hand_display}</div><div class="kpi-sub">{okr_team_display} vs {okr_hand_display}<br>{okr_k_hand_display}<br>MLB.com Official</div></div>
+        <div class="kpi-box"><div class="kpi-label">Team K Rank</div><div class="kpi-value" style="font-size:16px;">{okr_rank_hand_display}</div><div class="kpi-sub">{okr_team_display} vs {okr_hand_display}<br>{okr_k_hand_display}</div></div>
         <div class="kpi-box"><div class="kpi-label">Distribution</div><div class="kpi-value" style="font-size:17px;">{dist_display}</div><div class="kpi-sub">Floor | Median | Ceiling</div></div>
         <div class="kpi-box"><div class="kpi-label">Last 10 Starts</div>{recent_html}</div>
       </div>
@@ -12397,6 +12723,7 @@ def build_kproj_table(board):
         d = kproj_decision(p)
         dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
         tier3 = build_decision_tier_3_0(p, d)
+        p = _sync_market_with_card_decision(p, d) if '_sync_market_with_card_decision' in globals() else p
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
@@ -12703,7 +13030,7 @@ def render_kproj_tab(board):
     # Shows the verified Top-5 lists from the same MLB official pull used by the card boxes.
     try:
         with st.expander("Opponent Team K Rank Audit — Top 5 by split", expanded=False):
-            st.caption("Pulled from MLB.com official team hitting stats backend. K% is SO / PA. Rank #1 = highest team K%. This is an audit panel only. StatMuse raw SO vs starters is a reference check, not the app's main source.")
+            st.caption("Pulled from MLB.com official team hitting stats backend / MLB.com team stats. Rank #1 = highest team K%. K%=SO/PA; SO Rank=raw team strikeouts. Audit panel only.")
             ktop = _okr_top5_test_table() if '_okr_top5_test_table' in globals() else pd.DataFrame()
             if isinstance(ktop, pd.DataFrame) and not ktop.empty:
                 st.dataframe(ktop, use_container_width=True, hide_index=True)
@@ -19491,6 +19818,13 @@ def _learning_lab_get_history_df():
     # Read the same persistent RESULT_LOG used by Calibration Audit so Learning Lab
     # does not show WAITING when graded samples already exist.
     try:
+        # Always attempt restored CSV merge first so GitHub learning_data/graded_history.csv
+        # appears immediately in Learning Lab after deployment/restart.
+        if "merge_restored_graded_history_into_result_log" in globals():
+            try:
+                merge_restored_graded_history_into_result_log(force=True)
+            except Exception:
+                pass
         for key in ["graded_df", "graded_history", "learning_history", "after_games_df", "results_df"]:
             if key in st.session_state:
                 val = st.session_state.get(key)
@@ -19502,6 +19836,17 @@ def _learning_lab_get_history_df():
             df = _learning_lab_normalize_results_df(df)
             if not df.empty:
                 return df
+        # If restored historical grades CSV exists, merge it into RESULT_LOG then read it.
+        if "merge_restored_graded_history_into_result_log" in globals():
+            try:
+                merge_restored_graded_history_into_result_log(force=False)
+                results2 = load_json(RESULT_LOG, [])
+                if results2:
+                    df2 = _learning_lab_normalize_results_df(pd.DataFrame(results2))
+                    if not df2.empty:
+                        return df2
+            except Exception:
+                pass
         # If existing helper exists, try it.
         for fn in ["load_learning_history", "load_graded_history", "load_results_history"]:
             if fn in globals():
@@ -19515,6 +19860,18 @@ def _learning_lab_get_history_df():
 def render_learning_lab_tab(board=None):
     st.markdown("### 🧪 Learning Lab")
     st.caption("Read-only calibration center. It does not change K Upside, Pitcher FS, Batter FS, Moneyline, or Baseball IQ picks/projections.")
+
+    # Visible restore status so you can confirm the 96 historical grades loaded.
+    try:
+        _hist_status = merge_restored_graded_history_into_result_log(force=True) if "merge_restored_graded_history_into_result_log" in globals() else {}
+        if _hist_status.get("loaded"):
+            st.success(f"✅ Restored graded history loaded: {_hist_status.get('csv_rows', 0)} CSV rows | total log {_hist_status.get('result_log_after', 0)}")
+        elif _hist_status.get("path") is None:
+            st.warning("⚠️ graded_history.csv not found. Expected: learning_data/graded_history.csv")
+        elif _hist_status.get("error"):
+            st.warning(f"⚠️ graded_history.csv load error: {_hist_status.get('error')}")
+    except Exception as _restore_status_e:
+        st.warning(f"⚠️ Restored graded history status check failed: {_restore_status_e}")
 
     df = _learning_lab_get_history_df()
 
@@ -26328,7 +26685,7 @@ def render_pitcher_fs_tab(board=None):
 # - Adds context/export columns only.
 # - Uses pitcher handedness to choose opponent K% vs RHP/LHP when available.
 # =============================================================
-OPP_K_RANK_ENGINE_VERSION = "OPP_TEAM_K_RANK_3_3_MLB_OFFICIAL_KPCT_SOURCE_AUDIT_2026_06_25"
+OPP_K_RANK_ENGINE_VERSION = "OPP_TEAM_K_RANK_3_3_MLB_OFFICIAL_BATTER_K_AND_PITCHER_STRENGTH_2026_06_25"
 
 try:
     import datetime as _okr_dt
@@ -26492,15 +26849,26 @@ def _okr_fetch_bdfed_split(season, sit_code=None, last30=False):
 
 
 def _okr_rank_rows(rows, split_key_name):
-    # Higher K% = better K environment for pitcher; rank 1 is highest team strikeout rate.
-    rows = [dict(r) for r in rows or [] if r.get("Team") and _okr_num(r.get("K%"), None) is not None]
-    rows.sort(key=lambda x: x.get("K%", 0), reverse=True)
+    """Rank official MLB team batter strikeout environment.
+
+    Rank 1 is most strikeout-prone. Keep both K% rank and raw SO rank:
+    K% rank = SO / PA, best for projections; raw SO rank = StatMuse-style check.
+    """
+    base_rows = [dict(r) for r in rows or [] if r.get("Team") and _okr_num(r.get("K%"), None) is not None]
+    rows_k = sorted(base_rows, key=lambda x: x.get("K%", 0), reverse=True)
+    rows_so = sorted([r for r in base_rows if _okr_num(r.get("SO"), None) is not None], key=lambda x: _okr_num(x.get("SO"), 0), reverse=True)
+    so_rank_map = {_okr_abbr(r.get("Team")): i for i, r in enumerate(rows_so, start=1)}
     out = {}
-    for i, r in enumerate(rows, start=1):
+    for i, r in enumerate(rows_k, start=1):
         ab = _okr_abbr(r.get("Team"))
+        so_val = _okr_num(r.get("SO"), None)
+        pa_val = _okr_num(r.get("PA"), None)
         out[ab] = {
             f"K% {split_key_name}": round(float(r.get("K%", 0)) * 100, 1),
             f"K Rank {split_key_name}": i,
+            f"SO {split_key_name}": int(so_val) if so_val is not None else "",
+            f"PA {split_key_name}": int(pa_val) if pa_val is not None else "",
+            f"SO Rank {split_key_name}": so_rank_map.get(ab, ""),
             f"K Source {split_key_name}": r.get("Source", ""),
         }
     return out
@@ -26510,11 +26878,10 @@ def _okr_cache_fetch_table(season=None):
     season = season or _okr_mlb_season()
     # sitCodes convention on MLB Stats API/BDFED: vr = batting vs RHP, vl = batting vs LHP.
     splits = {
-        # Overall = official MLB.com team hitting K% table, calculated as SO / PA when needed.
-        # This is the closest official MLB.com version of a "which teams strike out most" table.
         "Overall": _okr_fetch_bdfed_split(season, None, False),
         "vs RHP": _okr_fetch_bdfed_split(season, "vr", False),
         "vs LHP": _okr_fetch_bdfed_split(season, "vl", False),
+        "L30 Overall": _okr_fetch_bdfed_split(season, None, True),
         "L30 vs RHP": _okr_fetch_bdfed_split(season, "vr", True),
         "L30 vs LHP": _okr_fetch_bdfed_split(season, "vl", True),
     }
@@ -26596,6 +26963,129 @@ def _okr_environment_label(rank, k_pct):
     return "🟡 NEUTRAL K MATCHUP"
 
 
+def _okr_pitcher_strength_label(rank, k_pct):
+    """Display-only pitcher K-strength label from the current projection board.
+    Rank #1 = highest pitcher strikeout percentage on the current board.
+    """
+    r = _okr_num(rank, None)
+    k = _okr_num(k_pct, None)
+    if k is not None and abs(k) <= 1:
+        k *= 100.0
+    if r is None and k is None:
+        return "PITCHER K% UNKNOWN"
+    if (r is not None and r <= 5) or (k is not None and k >= 28.0):
+        return "🔥 ELITE PITCHER K%"
+    if (r is not None and r <= 10) or (k is not None and k >= 25.0):
+        return "🟢 STRONG PITCHER K%"
+    if k is not None and k <= 18.5:
+        return "🟠 LOW PITCHER K%"
+    return "🟡 AVERAGE PITCHER K%"
+
+
+
+
+def _okr_mi_blended_k_pct(rec, hand):
+    """Verified MLB team K% blend for small projection nudge.
+
+    Returns percent units (e.g. 24.7), not decimal.
+    Blend: 70% season split vs pitcher hand, 20% last-30 split vs pitcher hand,
+    10% overall season. If a piece is missing, weights renormalize.
+    """
+    try:
+        hand = str(hand or '').upper()
+        split = 'vs LHP' if hand == 'LHP' else 'vs RHP' if hand == 'RHP' else None
+        pieces = []
+        if split:
+            pieces.append((_okr_num((rec or {}).get(f'K% {split}'), None), 0.70, f'season {split}'))
+            pieces.append((_okr_num((rec or {}).get(f'K% L30 {split}'), None), 0.20, f'L30 {split}'))
+        pieces.append((_okr_num((rec or {}).get('K% Overall'), None), 0.10, 'season overall'))
+        vals = [(v,w,n) for v,w,n in pieces if v is not None]
+        if not vals:
+            return None, 'NO_VERIFIED_K_BLEND'
+        total_w = sum(w for _,w,_ in vals) or 1.0
+        blend = sum(v*w for v,w,_ in vals) / total_w
+        note = ' + '.join([f'{int(round((w/total_w)*100))}% {n}' for _,w,n in vals])
+        return round(float(blend), 2), note
+    except Exception:
+        return None, 'K_BLEND_ERROR'
+
+
+def _okr_mi_projection_nudge(row, rec, hand):
+    """Small mathematically grounded matchup nudge from official MLB team K%.
+
+    The nudge is BF * (verified_team_K% - existing_model_opp_K%) * weight,
+    capped at +/-0.35 K so it cannot overpower the core model.
+    """
+    try:
+        verified_k, blend_note = _okr_mi_blended_k_pct(rec, hand)
+        if verified_k is None:
+            return 0.0, 'MI_NO_VERIFIED_TEAM_K', '', verified_k
+        current_k = _okr_num(row.get('Opp K%'), None)
+        if current_k is None:
+            current_k = _okr_num(row.get('Opponent K% vs Pitcher Hand'), None)
+        if current_k is None:
+            current_k = 22.2
+            current_note = 'league_avg_fallback'
+        else:
+            if abs(current_k) <= 1:
+                current_k *= 100.0
+            current_note = 'existing_opp_k'
+        bf = _okr_num(row.get('Exp BF'), None)
+        if bf is None:
+            bf = _okr_num(row.get('BF-K Expected BF 2.1'), None)
+        if bf is None:
+            bf = 22.0
+            bf_note = 'bf_fallback_22'
+        else:
+            bf_note = 'exp_bf'
+        raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
+        # Small weight protects the 18-11 core engine: 45% of raw K opportunity delta.
+        weighted = raw * 0.45
+        capped = max(-0.35, min(0.35, weighted))
+        if capped >= 0.25:
+            label = 'MI_ELITE_K_ENV_PLUS'
+        elif capped >= 0.08:
+            label = 'MI_K_ENV_PLUS'
+        elif capped <= -0.25:
+            label = 'MI_ELITE_CONTACT_TAX'
+        elif capped <= -0.08:
+            label = 'MI_CONTACT_TAX'
+        else:
+            label = 'MI_NEUTRAL'
+        reason = f'official MLB team K blend {verified_k:.2f}% ({blend_note}) vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; raw {raw:+.2f}K * 0.45 capped +/-0.35 = {capped:+.2f}K'
+        return round(float(capped), 2), label, reason, verified_k
+    except Exception as e:
+        return 0.0, 'MI_ERROR', str(e), None
+
+
+def _okr_mi_decision_from_proj(proj, line, old_decision):
+    """Keep filters conservative; only refresh non-pass directional decisions."""
+    try:
+        old = str(old_decision or '')
+        if 'NO LINE' in old.upper() or 'NO_UD_LINE' in old.upper():
+            return old_decision
+        p = _okr_num(proj, None); l = _okr_num(line, None)
+        if p is None or l is None:
+            return old_decision
+        edge = p - l
+        if 'PASS' in old.upper():
+            if edge >= 1.00:
+                return '🚫 PASS — OVER LEAN CONFIRMED BY TEAM K'
+            if edge <= -1.00:
+                return '🚫 PASS — UNDER LEAN CONFIRMED BY TEAM K'
+            return old_decision
+        if edge >= 1.00:
+            return '🔥 OVER'
+        if edge > 0.15:
+            return '⚠️ OVER LEAN'
+        if edge <= -1.00:
+            return '🔥 UNDER'
+        if edge < -0.15:
+            return '⚠️ UNDER LEAN'
+        return '🚫 PASS — TRUE EDGE THIN'
+    except Exception:
+        return old_decision
+
 def _okr_apply_team_k_ranks_to_df(df, board=None):
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
@@ -26617,7 +27107,9 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
 
     opp_teams, p_teams, hands = [], [], []
     k_hand, rank_hand, label_hand, source_hand = [], [], [], []
-    k_overall, r_overall, k_rhp, r_rhp, k_lhp, r_lhp, k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], [], [], [], [], [], [], []
+    k_rhp, r_rhp, k_lhp, r_lhp, k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], [], [], [], [], []
+    k_overall, r_overall, so_overall, so_rank_overall, pa_overall = [], [], [], [], []
+    k_l30_overall, r_l30_overall, so_l30_overall, so_rank_l30_overall, pa_l30_overall = [], [], [], [], []
     top5_note = []
 
     for _, row in d.iterrows():
@@ -26657,12 +27149,15 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         rank_hand.append(r_used if r_used is not None else "")
         label_hand.append(label)
         source_hand.append(src_used or "")
-        k_overall.append(rec.get("K% Overall", "")); r_overall.append(rec.get("K Rank Overall", ""))
         k_rhp.append(rec.get("K% vs RHP", "")); r_rhp.append(rec.get("K Rank vs RHP", ""))
         k_lhp.append(rec.get("K% vs LHP", "")); r_lhp.append(rec.get("K Rank vs LHP", ""))
         k_l30_rhp.append(rec.get("K% L30 vs RHP", "")); r_l30_rhp.append(rec.get("K Rank L30 vs RHP", ""))
         k_l30_lhp.append(rec.get("K% L30 vs LHP", "")); r_l30_lhp.append(rec.get("K Rank L30 vs LHP", ""))
-        top5_note.append("TOP-5 K ENV" if _okr_num(r_used, 99) <= 5 else "")
+        k_overall.append(rec.get("K% Overall", "")); r_overall.append(rec.get("K Rank Overall", ""))
+        so_overall.append(rec.get("SO Overall", "")); so_rank_overall.append(rec.get("SO Rank Overall", "")); pa_overall.append(rec.get("PA Overall", ""))
+        k_l30_overall.append(rec.get("K% L30 Overall", "")); r_l30_overall.append(rec.get("K Rank L30 Overall", ""))
+        so_l30_overall.append(rec.get("SO L30 Overall", "")); so_rank_l30_overall.append(rec.get("SO Rank L30 Overall", "")); pa_l30_overall.append(rec.get("PA L30 Overall", ""))
+        top5_note.append("TOP-5 K ENV" if _okr_num(r_used, 99) <= 5 or _okr_num(rec.get("K Rank Overall"), 99) <= 5 or _okr_num(rec.get("SO Rank Overall"), 99) <= 5 else "")
 
     d["Opponent Team"] = opp_teams
     d["Pitcher Team"] = p_teams
@@ -26671,8 +27166,6 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     d["Opponent K Rank vs Pitcher Hand"] = rank_hand
     d["Opponent K Environment"] = label_hand
     d["Opponent K Rank Source"] = source_hand
-    d["Opp Overall K% Official"] = k_overall
-    d["Opp Overall K Rank Official"] = r_overall
     d["Opp K% vs RHP Official"] = k_rhp
     d["Opp K Rank vs RHP Official"] = r_rhp
     d["Opp K% vs LHP Official"] = k_lhp
@@ -26681,7 +27174,87 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     d["Opp L30 K Rank vs RHP Official"] = r_l30_rhp
     d["Opp L30 K% vs LHP Official"] = k_l30_lhp
     d["Opp L30 K Rank vs LHP Official"] = r_l30_lhp
+    d["Team Batter K% Overall Official"] = k_overall
+    d["Team Batter K% Rank Overall Official"] = r_overall
+    d["Team Batter SO Overall Official"] = so_overall
+    d["Team Batter SO Rank Overall Official"] = so_rank_overall
+    d["Team Batter PA Overall Official"] = pa_overall
+    d["Team Batter K% L30 Overall Official"] = k_l30_overall
+    d["Team Batter K% Rank L30 Overall Official"] = r_l30_overall
+    d["Team Batter SO L30 Overall Official"] = so_l30_overall
+    d["Team Batter SO Rank L30 Overall Official"] = so_rank_l30_overall
+    d["Team Batter PA L30 Overall Official"] = pa_l30_overall
+    d["Team Batter K Rank Source"] = "MLB.com official team hitting stats | K%=SO/PA | SO rank=raw strikeouts"
+    d["Team Batter K Rank Source URL"] = "https://www.mlb.com/stats/team"
     d["Opponent K Top-5 Note"] = top5_note
+
+    # Pitcher K% strength rank: display/export only, no projection change.
+    try:
+        pk_vals = []
+        for idx, r in d.iterrows():
+            v = _okr_num(r.get("Pitcher K%"), None)
+            if v is not None and abs(v) <= 1:
+                v *= 100.0
+            pk_vals.append((idx, v))
+        ranked_pk = sorted([(idx, v) for idx, v in pk_vals if v is not None], key=lambda x: x[1], reverse=True)
+        pk_rank_map = {idx: rank for rank, (idx, v) in enumerate(ranked_pk, start=1)}
+        d["Pitcher K% Board Rank"] = [pk_rank_map.get(idx, "") for idx in d.index]
+        d["Pitcher K% Strength Label"] = [_okr_pitcher_strength_label(pk_rank_map.get(idx, None), _okr_num(d.loc[idx].get("Pitcher K%"), None)) for idx in d.index]
+        d["Pitcher K% Rank Source"] = "Current projection board | rank #1 = highest Pitcher K%"
+    except Exception:
+        d["Pitcher K% Board Rank"] = ""
+        d["Pitcher K% Strength Label"] = "PITCHER K% UNKNOWN"
+        d["Pitcher K% Rank Source"] = "Unavailable"
+
+    # One clean combo label for quick read; still display-only.
+    try:
+        d["Team K Read"] = d.apply(lambda r: f"{r.get('Opponent Team','—')} vs {r.get('Pitcher Hand','—')}: {r.get('Opponent K% vs Pitcher Hand','—')}% / #{r.get('Opponent K Rank vs Pitcher Hand','—')} | Overall K% #{r.get('Team Batter K% Rank Overall Official','—')} | SO Rank #{r.get('Team Batter SO Rank Overall Official','—')}", axis=1)
+    except Exception:
+        d["Team K Read"] = ""
+
+    # Matchup Intelligence Projection Nudge 1.0 — small weight only.
+    # Uses verified MLB team K% vs handedness and L30 split; caps at +/-0.35 K.
+    try:
+        mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified = [], [], [], [], [], []
+        for idx, row in d.iterrows():
+            rd = row.to_dict()
+            opp = _okr_abbr(rd.get("Opponent Team"))
+            hand = str(rd.get("Pitcher Hand") or "UNKNOWN")
+            rec = table.get(opp, {}) if opp else {}
+            base = _okr_num(rd.get("Line-Aware Smart Final K Projection"), None)
+            if base is None:
+                base = _okr_num(rd.get("K PROJ"), None)
+            adj, lab, why, verified = _okr_mi_projection_nudge(rd, rec, hand)
+            final = base if base is None else round(max(0.0, float(base) + float(adj)), 2)
+            mi_pre.append("" if base is None else round(float(base), 2))
+            mi_adj.append(adj); mi_final.append("" if final is None else final); mi_label.append(lab); mi_reason.append(why); mi_verified.append("" if verified is None else round(float(verified), 2))
+        d["Pre-Matchup Intel K Projection"] = mi_pre
+        d["Matchup Intel K Nudge"] = mi_adj
+        d["Matchup Intel Label"] = mi_label
+        d["Matchup Intel Reason"] = mi_reason
+        d["Matchup Intel Verified Team K%"] = mi_verified
+        d["Matchup Intelligence Final K Projection"] = mi_final
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_SMALL_WEIGHT_0_45_CAP_0_35_2026_06_25"
+        # Promote this as the final display/export projection, but record the pre-value above.
+        for c in ["K PROJ", "Line-Aware Smart Final K Projection", "Final K Projection"]:
+            if c in d.columns:
+                d[c] = [f if f not in [None, ""] else o for f, o in zip(mi_final, d[c].tolist())]
+        # Refresh edges from updated final projection.
+        if "UD/Line" in d.columns:
+            new_edges = []
+            for f, ln in zip(mi_final, d["UD/Line"].tolist()):
+                fv = _okr_num(f, None); lv = _okr_num(ln, None)
+                new_edges.append("" if fv is None or lv is None else round(fv - lv, 2))
+            for ec in ["Line-Aware Smart Edge", "Edge Gap", "Official K Edge", "Final K Edge"]:
+                if ec in d.columns:
+                    d[ec] = new_edges
+            if "Line-Aware Smart Decision" in d.columns:
+                d["Line-Aware Smart Decision"] = [_okr_mi_decision_from_proj(f, ln, old) for f, ln, old in zip(mi_final, d["UD/Line"].tolist(), d["Line-Aware Smart Decision"].tolist())]
+            if "Decision" in d.columns:
+                d["Decision"] = [_okr_mi_decision_from_proj(f, ln, old) for f, ln, old in zip(mi_final, d["UD/Line"].tolist(), d["Decision"].tolist())]
+    except Exception as _mi_e:
+        d["Matchup Intelligence Version"] = f"MATCHUP_INTEL_ERROR:{_mi_e}"
+
     d["Opponent K Rank Engine Version"] = OPP_K_RANK_ENGINE_VERSION
     return d
 
@@ -26692,18 +27265,21 @@ def _okr_top5_test_table():
         table = _okr_fetch_team_k_table(_okr_mlb_season()) or {}
         rows = []
         for team, rec in table.items():
-            for split in ["Overall", "vs RHP", "vs LHP", "L30 vs RHP", "L30 vs LHP"]:
+            for split in ["Overall", "vs RHP", "vs LHP", "L30 Overall", "L30 vs RHP", "L30 vs LHP"]:
                 rows.append({
                     "Split": split,
                     "Team": team,
                     "K%": rec.get(f"K% {split}"),
-                    "Rank": rec.get(f"K Rank {split}"),
+                    "K% Rank": rec.get(f"K Rank {split}"),
+                    "SO": rec.get(f"SO {split}"),
+                    "SO Rank": rec.get(f"SO Rank {split}"),
                     "Source": rec.get(f"K Source {split}"),
                 })
         df = pd.DataFrame(rows)
         if df.empty:
             return df
-        return df[df["Rank"].isin([1,2,3,4,5])].sort_values(["Split", "Rank"])
+        mask = df["K% Rank"].isin([1,2,3,4,5]) | df["SO Rank"].isin([1,2,3,4,5])
+        return df[mask].sort_values(["Split", "K% Rank", "SO Rank"])
     except Exception:
         return pd.DataFrame()
 
@@ -26747,8 +27323,6 @@ def _okr_card_context_from_row(card_row, p=None):
         env = _first("Opponent K Environment")
         src = _first("Opponent K Rank Source") or ""
         # split details for display/audit
-        k_overall = _first("Opp Overall K% Official")
-        r_overall = _first("Opp Overall K Rank Official")
         k_rhp = _first("Opp K% vs RHP Official", "Opp K% vs RHP")
         r_rhp = _first("Opp K Rank vs RHP Official", "Opp K Rank vs RHP")
         k_lhp = _first("Opp K% vs LHP Official", "Opp K% vs LHP")
@@ -26757,6 +27331,14 @@ def _okr_card_context_from_row(card_row, p=None):
         r_l30_rhp = _first("Opp L30 K Rank vs RHP Official")
         k_l30_lhp = _first("Opp L30 K% vs LHP Official")
         r_l30_lhp = _first("Opp L30 K Rank vs LHP Official")
+        k_overall = _first("Team Batter K% Overall Official")
+        r_overall = _first("Team Batter K% Rank Overall Official")
+        so_overall = _first("Team Batter SO Overall Official")
+        so_rank_overall = _first("Team Batter SO Rank Overall Official")
+        k_l30_overall = _first("Team Batter K% L30 Overall Official")
+        r_l30_overall = _first("Team Batter K% Rank L30 Overall Official")
+        so_l30_overall = _first("Team Batter SO L30 Overall Official")
+        so_rank_l30_overall = _first("Team Batter SO Rank L30 Overall Official")
         # If official columns are missing on the row, compute directly from official MLB table using p opponent + hand.
         if (not k_hand or not rank_hand) and opp_team not in (None, "", "—") and p_hand in ("RHP", "LHP"):
             try:
@@ -26766,8 +27348,6 @@ def _okr_card_context_from_row(card_row, p=None):
                 k_hand = k_hand or rec.get(f"K% {split}")
                 rank_hand = rank_hand or rec.get(f"K Rank {split}")
                 src = src or rec.get(f"K Source {split}") or "MLB official live card pull"
-                k_overall = k_overall or rec.get("K% Overall")
-                r_overall = r_overall or rec.get("K Rank Overall")
                 k_rhp = k_rhp or rec.get("K% vs RHP")
                 r_rhp = r_rhp or rec.get("K Rank vs RHP")
                 k_lhp = k_lhp or rec.get("K% vs LHP")
@@ -26776,6 +27356,14 @@ def _okr_card_context_from_row(card_row, p=None):
                 r_l30_rhp = r_l30_rhp or rec.get("K Rank L30 vs RHP")
                 k_l30_lhp = k_l30_lhp or rec.get("K% L30 vs LHP")
                 r_l30_lhp = r_l30_lhp or rec.get("K Rank L30 vs LHP")
+                k_overall = k_overall or rec.get("K% Overall")
+                r_overall = r_overall or rec.get("K Rank Overall")
+                so_overall = so_overall or rec.get("SO Overall")
+                so_rank_overall = so_rank_overall or rec.get("SO Rank Overall")
+                k_l30_overall = k_l30_overall or rec.get("K% L30 Overall")
+                r_l30_overall = r_l30_overall or rec.get("K Rank L30 Overall")
+                so_l30_overall = so_l30_overall or rec.get("SO L30 Overall")
+                so_rank_l30_overall = so_rank_l30_overall or rec.get("SO Rank L30 Overall")
             except Exception:
                 pass
         # fallback environment if official label missing
@@ -26797,18 +27385,22 @@ def _okr_card_context_from_row(card_row, p=None):
             "k_hand": _fmt_pct(k_hand),
             "rank_hand": _fmt_rank(rank_hand),
             "env": str(env),
-            "source": str(src or "MLB.com official team hitting stats — K% = SO / PA"),
-            "overall_line": f"Overall: {_fmt_pct(k_overall)} / {_fmt_rank(r_overall)}",
+            "source": str(src),
             "rhp_line": f"RHP: {_fmt_pct(k_rhp)} / {_fmt_rank(r_rhp)}",
             "lhp_line": f"LHP: {_fmt_pct(k_lhp)} / {_fmt_rank(r_lhp)}",
             "l30_rhp_line": f"L30 RHP: {_fmt_pct(k_l30_rhp)} / {_fmt_rank(r_l30_rhp)}",
             "l30_lhp_line": f"L30 LHP: {_fmt_pct(k_l30_lhp)} / {_fmt_rank(r_l30_lhp)}",
+            "overall_line": f"Team Batter K%: {_fmt_pct(k_overall)} / {_fmt_rank(r_overall)}",
+            "overall_so_line": f"Team Batter SO: {('—' if _okr_num(so_overall, None) is None else int(_okr_num(so_overall, 0)))} / {_fmt_rank(so_rank_overall)}",
+            "l30_overall_line": f"L30 Team K%: {_fmt_pct(k_l30_overall)} / {_fmt_rank(r_l30_overall)}",
+            "l30_so_line": f"L30 Team SO: {('—' if _okr_num(so_l30_overall, None) is None else int(_okr_num(so_l30_overall, 0)))} / {_fmt_rank(so_rank_l30_overall)}",
+            "official_source_line": "MLB.com official team hitting stats | K%=SO/PA | SO rank=raw team strikeouts",
         }
     except Exception:
         return {
             "opp_team":"—", "pitcher_hand":"UNKNOWN", "k_hand":"—", "rank_hand":"—",
-            "env":"NO VERIFIED TEAM K RANK", "source":"", "overall_line":"Overall: — / —", "rhp_line":"RHP: — / —",
-            "lhp_line":"LHP: — / —", "l30_rhp_line":"L30 RHP: — / —", "l30_lhp_line":"L30 LHP: — / —"
+            "env":"NO VERIFIED TEAM K RANK", "source":"", "rhp_line":"RHP: — / —",
+            "lhp_line":"LHP: — / —", "l30_rhp_line":"L30 RHP: — / —", "l30_lhp_line":"L30 LHP: — / —", "overall_line":"Team Batter K%: — / —", "overall_so_line":"Team Batter SO: — / —", "l30_overall_line":"L30 Team K%: — / —", "l30_so_line":"L30 Team SO: — / —", "official_source_line":"MLB.com official team hitting stats"
         }
 
 # Wrap K projection table export/display without touching projection math.
@@ -27097,6 +27689,16 @@ with tab5:
         else:
             st.warning("⚠️ Manual grading ran, but graded 0 rows. Check unmatched pitchers, columns, or saved snapshots.")
         st.write(diag_manual)
+
+    if "merge_restored_graded_history_into_result_log" in globals():
+        try:
+            hist_status = merge_restored_graded_history_into_result_log(force=False)
+            if hist_status.get("loaded"):
+                st.success(f"Restored graded history loaded: {hist_status.get('csv_rows', 0)} CSV rows | added {hist_status.get('added_rows', 0)} | skipped duplicates {hist_status.get('duplicates_skipped', 0)}")
+            elif hist_status.get("path") is None:
+                st.info("Restored graded history not found yet: add learning_data/graded_history.csv to start with historical grades.")
+        except Exception as _hist_e:
+            st.warning(f"Restored graded history check failed: {_hist_e}")
 
     results = load_json(RESULT_LOG, [])
     if results:
