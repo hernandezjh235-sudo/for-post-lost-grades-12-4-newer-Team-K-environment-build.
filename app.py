@@ -28695,9 +28695,523 @@ if callable(_prev_beta_ip_build_pitcher_fs_board):
         return df
 
 
-tab_kproj, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# BETA TESTER PROP TABS: PITCHING OUTS + EARNED RUNS ALLOWED
+# Safe beta-only tabs. Does NOT alter K projection math, K Upside decisions,
+# moneyline, or fantasy scoring. These tabs use the beta IP/volume engine and
+# pull live Underdog lines independently when available.
+# =========================
+BETA_TESTER_PITCHER_VOLUME_PROPS_VERSION = "BETA_IP_OUTS_ER_PROPS_1_0_2026_07_01"
+
+
+def _btp_num(x, default=None):
+    try:
+        if x is None or x == "" or str(x).upper() in ["NAN", "NONE", "—"]:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _btp_attrs(obj):
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    a = obj.get("attributes")
+    if isinstance(a, dict):
+        out.update(a)
+    for k, v in obj.items():
+        if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+            out[k] = v
+    return out
+
+
+def _btp_collect_objects(data):
+    objs = []
+    def walk(x, parent_key=""):
+        if isinstance(x, dict):
+            y = dict(x)
+            if parent_key and "_parent_key" not in y:
+                y["_parent_key"] = parent_key
+            objs.append(y)
+            for k, v in x.items():
+                walk(v, k)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item, parent_key)
+    walk(data)
+    return objs
+
+
+def _btp_obj_id(obj):
+    if not isinstance(obj, dict):
+        return None
+    val = obj.get("id") or _btp_attrs(obj).get("id")
+    return str(val) if val not in [None, ""] else None
+
+
+def _btp_obj_type(obj, fallback=""):
+    return str(obj.get("type") or fallback or "").lower().replace("-", "_") if isinstance(obj, dict) else ""
+
+
+def _btp_rel_id(obj, rel_names):
+    if not isinstance(obj, dict):
+        return None
+    rels = obj.get("relationships") or {}
+    for name in rel_names:
+        candidates = [name, name.replace("_", "-"), name.replace("_", "")]
+        for cname in candidates:
+            if cname not in rels:
+                continue
+            node = rels.get(cname)
+            data = node.get("data") if isinstance(node, dict) else node
+            if isinstance(data, dict):
+                rid = data.get("id")
+                if rid not in [None, ""]:
+                    return str(rid)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("id") not in [None, ""]:
+                        return str(item.get("id"))
+    return None
+
+
+def _btp_text_from(*objs):
+    keys = [
+        "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
+        "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
+        "market_name", "sport", "league", "sport_name", "league_name", "position", "description",
+        "over_under", "over_under_title", "scoring_type", "projection_type", "short_name", "abbreviation", "abbr_name",
+    ]
+    parts = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        a = _btp_attrs(obj)
+        for k in keys:
+            v = a.get(k)
+            if isinstance(v, dict):
+                for kk in keys:
+                    if v.get(kk) not in [None, ""]:
+                        parts.append(str(v.get(kk)))
+            elif v not in [None, ""]:
+                parts.append(str(v))
+    return " | ".join(parts)
+
+
+def _btp_market_keywords(market_key):
+    k = str(market_key or "").lower()
+    if k in ["outs", "pitching_outs", "outs_recorded"]:
+        return ["outs recorded", "pitching outs", "recorded outs", "outs"]
+    if k in ["earned_runs", "earned_runs_allowed", "er"]:
+        return ["earned runs allowed", "earned runs", "er allowed"]
+    return [k]
+
+
+def _btp_market_label(market_key):
+    k = str(market_key or "").lower()
+    if k in ["outs", "pitching_outs", "outs_recorded"]:
+        return "Pitching Outs"
+    if k in ["earned_runs", "earned_runs_allowed", "er"]:
+        return "Earned Runs Allowed"
+    return str(market_key)
+
+
+def _btp_market_blob_ok(blob, market_key):
+    b = str(blob or "").lower()
+    if is_bad_sport_text(b):
+        return False
+    # Hard block different pitcher markets so Hits/Walks/Strikeouts do not leak into Outs/ER tabs.
+    if market_key in ["outs", "pitching_outs", "outs_recorded"]:
+        if any(x in b for x in ["strikeout", "strikeouts", "earned runs", "hits allowed", "walks allowed", "fantasy"]):
+            return False
+    if market_key in ["earned_runs", "earned_runs_allowed", "er"]:
+        if any(x in b for x in ["strikeout", "strikeouts", "outs recorded", "pitching outs", "hits allowed", "walks allowed", "fantasy"]):
+            return False
+    return any(x in b for x in _btp_market_keywords(market_key))
+
+
+def _btp_valid_line(line, market_key):
+    v = _btp_num(line, None)
+    if v is None:
+        return None
+    k = str(market_key or "").lower()
+    if k in ["outs", "pitching_outs", "outs_recorded"]:
+        # Underdog pitching-outs lines usually live from 8.5 to 21.5.
+        if 6.5 <= v <= 22.5:
+            return float(v)
+        return None
+    if k in ["earned_runs", "earned_runs_allowed", "er"]:
+        # Earned-runs allowed lines usually live from 0.5 to 5.5.
+        if 0.5 <= v <= 7.5:
+            return float(v)
+        return None
+    return float(v)
+
+
+def _btp_line_from_obj(market_key, *objs):
+    safe_keys = ["stat_value", "line_score", "over_under_line", "target_value"]
+    for obj in objs:
+        a = _btp_attrs(obj)
+        for kk in safe_keys:
+            val = _btp_valid_line(a.get(kk), market_key)
+            if val is not None:
+                return val, f"{kk} from Underdog"
+    # Text fallback: only half-lines for ER/Outs, prevents pulling scores/percentages.
+    try:
+        text = " | ".join(_btp_text_from(o) for o in objs)
+        nums = re.findall(r"(?<!\d)(\d{1,2}\.5)(?!\d)", text)
+        for n in nums:
+            val = _btp_valid_line(n, market_key)
+            if val is not None:
+                return val, "half-line from Underdog text"
+    except Exception:
+        pass
+    return None, "no valid line"
+
+
+def _btp_player_name_from(player_obj=None, app_obj=None, line_obj=None, ou_obj=None):
+    candidates = []
+    for obj in [player_obj, app_obj, line_obj, ou_obj]:
+        a = _btp_attrs(obj)
+        candidates.extend([
+            a.get("display_name"), a.get("full_name"), a.get("name"), a.get("player_name"),
+            a.get("short_name"), a.get("abbreviation"), a.get("abbr_name"), a.get("title"),
+            (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip(),
+        ])
+    for c in candidates:
+        if c and normalize_name(c):
+            return str(c)
+    return ""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_underdog_pitcher_volume_prop_line(player_name, market_key):
+    """Beta-only live Underdog parser for pitcher Outs / ER Allowed lines.
+
+    This is intentionally separate from get_underdog_k_data so K lines and K projections
+    cannot be changed by testing other pitcher markets.
+    """
+    accepted = []
+    target_norm = normalize_name(player_name)
+    last_msg = ""
+    LINE_TYPES = {"over_under_line", "over_under_lines"}
+    OU_TYPES = {"over_under", "over_unders"}
+    APP_TYPES = {"appearance", "appearances"}
+    PLAYER_TYPES = {"player", "players"}
+
+    def score_name(actual, evidence):
+        sc = max(name_score(player_name, actual), name_score(player_name, evidence))
+        parts = target_norm.split()
+        if len(parts) >= 2:
+            initial, last = parts[0][:1], parts[-1]
+            ev = normalize_name(evidence)
+            if last in ev and initial in ev:
+                sc = max(sc, 0.88)
+        if target_norm and target_norm in normalize_name(evidence):
+            sc = max(sc, 0.94)
+        return sc
+
+    def active_ok(*objs):
+        status_blob = " ".join(
+            str(_btp_attrs(o).get(k, ""))
+            for o in objs if isinstance(o, dict)
+            for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]
+        ).lower()
+        return not any(x in status_blob for x in ["suspended", "removed", "hidden", "inactive", "closed", "disabled"])
+
+    def add_row(line, score, matched, evidence, note, path, mode):
+        accepted.append({
+            "Source": "Underdog", "Provider": "Underdog", "Player": player_name,
+            "Matched Name": matched or evidence[:120], "Match Score": round(float(score), 3),
+            "Market": _btp_market_label(market_key), "Side": "OVER/UNDER", "Line": float(line),
+            "Price": None, "Line Evidence": note, "Parser Mode": mode, "Underdog Path": path,
+        })
+
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            last_msg = f"No JSON from {url}"
+            continue
+        objects = _btp_collect_objects(data)
+        by_id = { _btp_obj_id(o): o for o in objects if _btp_obj_id(o) }
+        over_unders, appearances, players, line_candidates = {}, {}, {}, []
+        for obj in objects:
+            typ = _btp_obj_type(obj, obj.get("_parent_key", ""))
+            oid = _btp_obj_id(obj)
+            if oid:
+                if typ in OU_TYPES or typ == "over_under": over_unders[oid] = obj
+                if typ in APP_TYPES or typ == "appearance": appearances[oid] = obj
+                if typ in PLAYER_TYPES or typ == "player": players[oid] = obj
+            if typ in LINE_TYPES or "over_under_line" in typ:
+                line_candidates.append(obj)
+            else:
+                a = _btp_attrs(obj)
+                if any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value"]):
+                    line_candidates.append(obj)
+        def get_by_id(x):
+            return by_id.get(str(x)) if x not in [None, ""] else None
+
+        for line_obj in line_candidates:
+            ou_id = _btp_rel_id(line_obj, ["over_under", "overUnders", "over_under_id", "over"])
+            ou_obj = over_unders.get(str(ou_id)) or get_by_id(ou_id)
+            app_id = _btp_rel_id(line_obj, ["appearance", "appearances", "appearance_id"])
+            if not app_id and isinstance(ou_obj, dict):
+                app_id = _btp_rel_id(ou_obj, ["appearance", "appearances", "appearance_id"])
+            app_obj = appearances.get(str(app_id)) or get_by_id(app_id)
+            player_id = _btp_rel_id(line_obj, ["player", "players", "player_id"])
+            if not player_id and isinstance(ou_obj, dict):
+                player_id = _btp_rel_id(ou_obj, ["player", "players", "player_id"])
+            if not player_id and isinstance(app_obj, dict):
+                player_id = _btp_rel_id(app_obj, ["player", "players", "player_id"])
+            player_obj = players.get(str(player_id)) or get_by_id(player_id)
+            evidence = _btp_text_from(line_obj, ou_obj, app_obj, player_obj)
+            if not _btp_market_blob_ok(evidence, market_key):
+                continue
+            actual = _btp_player_name_from(player_obj, app_obj, line_obj, ou_obj)
+            score = score_name(actual, evidence)
+            if score < 0.82:
+                continue
+            line, note = _btp_line_from_obj(market_key, line_obj, ou_obj)
+            if line is None or not active_ok(line_obj, ou_obj):
+                continue
+            add_row(line, score, actual, evidence, note, f"line:{_btp_obj_id(line_obj)} -> over_under:{ou_id} -> appearance:{app_id} -> player:{player_id}", "relationship")
+
+        # Loose recursive fallback, still market + player + line gated.
+        for obj in objects:
+            try:
+                blob = json.dumps(obj, default=str)
+            except Exception:
+                blob = str(obj)
+            if not _btp_market_blob_ok(blob, market_key):
+                continue
+            score = score_name("", blob)
+            if score < 0.82:
+                continue
+            line, note = _btp_line_from_obj(market_key, obj)
+            if line is None or not active_ok(obj):
+                continue
+            add_row(line, score, player_name, blob[:200], note, f"fallback:{_btp_obj_id(obj) or len(accepted)}", "recursive fallback")
+
+        if accepted:
+            break
+
+    if not accepted:
+        return source_result("Underdog", "NO MATCH", rows=[], message=last_msg or f"No active Underdog {_btp_market_label(market_key)} line matched")
+
+    # Dedup and choose the primary line: relationship > half-point > name score.
+    dedup = {}
+    for r in accepted:
+        key = (r.get("Underdog Path"), r.get("Line"), r.get("Parser Mode"))
+        if key not in dedup or _btp_num(r.get("Match Score"), 0) > _btp_num(dedup[key].get("Match Score"), 0):
+            dedup[key] = r
+    rows = list(dedup.values())
+    def rank(r):
+        rel = 1 if r.get("Parser Mode") == "relationship" else 0
+        half = 1 if abs((_btp_num(r.get("Line"), 0) or 0) % 1 - 0.5) < 1e-6 else 0
+        return (rel, half, round(_btp_num(r.get("Match Score"), 0) or 0, 2), _btp_num(r.get("Line"), 0) or 0)
+    best = sorted(rows, key=rank, reverse=True)[0]
+    return source_result("Underdog", "FOUND", line=float(best.get("Line")), rows=sorted(rows, key=lambda r: (-_btp_num(r.get("Match Score"),0), _btp_num(r.get("Line"),99))), message=f"Live Underdog {_btp_market_label(market_key)} matched: {float(best.get('Line')):.1f}")
+
+
+def _btp_pitcher_ip_projection(p):
+    # Prefer beta IP, then volume module projected IP, then K decision IP floor as fallback.
+    vals = [p.get("beta_ip_projection"), p.get("projected_ip"), p.get("IP Projection"), p.get("ip_proj")]
+    try:
+        kd = kproj_decision(p)
+        vals.extend([kd.get("ip_floor"), p.get("ip_floor")])
+    except Exception:
+        vals.append(p.get("ip_floor"))
+    for v in vals:
+        n = _btp_num(v, None)
+        if n is not None and 0.1 <= n <= 9.0:
+            return float(n)
+    bf = _btp_num(p.get("expected_bf"), None)
+    if bf:
+        return float(clamp(bf / 4.25, 1.0, 8.0))
+    return None
+
+
+def _btp_recent_er_estimate(p):
+    vals = []
+    for key in ["recent_er_allowed", "l5_er", "L5 ER", "avg_er", "ER Avg", "earned_runs_recent"]:
+        n = _btp_num(p.get(key), None)
+        if n is not None:
+            vals.append(n)
+    # Try recent rows if the board carries them.
+    rows = p.get("recent_rows") or p.get("game_logs") or p.get("logs") or []
+    if isinstance(rows, list):
+        er_vals = []
+        for r in rows[:5]:
+            if isinstance(r, dict):
+                er = _btp_num(r.get("ER", r.get("earnedRuns", r.get("earned_runs"))), None)
+                if er is not None:
+                    er_vals.append(er)
+        if er_vals:
+            vals.append(float(np.mean(er_vals)))
+    return float(np.mean(vals)) if vals else None
+
+
+def _btp_project_earned_runs_allowed(p):
+    ip = _btp_pitcher_ip_projection(p) or 5.0
+    era = None
+    for key in ["ERA", "era", "pitcher_era", "season_era", "SP ERA"]:
+        era = _btp_num(p.get(key), None)
+        if era is not None and 0 <= era <= 15:
+            break
+    if era is None:
+        # Back-calculate from broad indicators when ERA key is unavailable.
+        fip = _btp_num(p.get("FIP", p.get("fip", None)), None)
+        era = fip if fip is not None and 0 <= fip <= 15 else 4.20
+    recent_er = _btp_recent_er_estimate(p)
+    season_er_for_ip = (era / 9.0) * ip
+    er_base = _btp_weighted([season_er_for_ip, recent_er], [0.62, 0.38]) if '_bt_weighted' in globals() else None
+    if er_base is None:
+        er_base = season_er_for_ip
+    # Opponent/run-environment soft adjustment. Conservative by design.
+    opp_k = _btp_num(p.get("opp_k"), None)
+    opp_contact_adj = 1.0
+    if opp_k is not None:
+        if opp_k < 0.19: opp_contact_adj += 0.08
+        elif opp_k > 0.25: opp_contact_adj -= 0.06
+    park = _btp_num(p.get("park_run_factor", p.get("run_factor", None)), None)
+    park_adj = float(clamp(park, 0.88, 1.15)) if park is not None and 0.5 <= park <= 1.5 else 1.0
+    proj = float(clamp(er_base * opp_contact_adj * park_adj, 0.15, 7.50))
+    return round(proj, 2)
+
+
+def _btp_decision(proj, line, lower_good=False):
+    proj = _btp_num(proj, None); line = _btp_num(line, None)
+    if proj is None or line is None:
+        return "NO UD LINE", None, "—"
+    edge = proj - line
+    if lower_good:
+        # ER Allowed: UNDER when projected ER is below line.
+        side = "UNDER" if proj < line else "OVER"
+        confidence = min(88, 50 + abs(edge) * 18)
+    else:
+        side = "OVER" if proj > line else "UNDER"
+        confidence = min(88, 50 + abs(edge) * 9)
+    icon = "🔥" if abs(edge) >= (1.0 if not lower_good else 0.65) else "⚠️"
+    return f"{icon} {side}", round(edge, 2), f"{confidence:.0f}%"
+
+
+def _btp_build_outs_rows(board):
+    rows = []
+    seen = set()
+    for p in board or []:
+        name = str(p.get("pitcher") or p.get("Pitcher") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ip = _btp_pitcher_ip_projection(p)
+        outs_proj = _btp_num(p.get("outs_projection"), None)
+        if outs_proj is None and ip is not None:
+            outs_proj = round(ip * 3.0, 1)
+        ud = get_underdog_pitcher_volume_prop_line(name, "outs")
+        line = _btp_num(ud.get("line"), None) if isinstance(ud, dict) else None
+        decision, edge, conf = _btp_decision(outs_proj, line, lower_good=False)
+        rows.append({
+            "Pitcher": name, "Matchup": p.get("matchup"), "Projected IP": round(ip, 2) if ip is not None else None,
+            "Outs Projection": outs_proj, "UD Outs Line": line if line is not None else "NO LINE",
+            "Decision": decision, "Edge": edge, "Confidence": conf, "Line Source": "Underdog" if line is not None else "NO UD LINE",
+            "Beta Version": BETA_TESTER_PITCHER_VOLUME_PROPS_VERSION,
+        })
+    return pd.DataFrame(rows)
+
+
+def _btp_build_er_rows(board):
+    rows = []
+    seen = set()
+    for p in board or []:
+        name = str(p.get("pitcher") or p.get("Pitcher") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ip = _btp_pitcher_ip_projection(p)
+        er_proj = _btp_project_earned_runs_allowed(p)
+        ud = get_underdog_pitcher_volume_prop_line(name, "earned_runs")
+        line = _btp_num(ud.get("line"), None) if isinstance(ud, dict) else None
+        decision, edge, conf = _btp_decision(er_proj, line, lower_good=True)
+        rows.append({
+            "Pitcher": name, "Matchup": p.get("matchup"), "Projected IP": round(ip, 2) if ip is not None else None,
+            "ER Allowed Projection": er_proj, "UD ER Line": line if line is not None else "NO LINE",
+            "Decision": decision, "Edge": edge, "Confidence": conf, "Line Source": "Underdog" if line is not None else "NO UD LINE",
+            "Beta Version": BETA_TESTER_PITCHER_VOLUME_PROPS_VERSION,
+        })
+    return pd.DataFrame(rows)
+
+
+def _btp_copy_slate(df, market="Outs"):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return ""
+    lines = []
+    line_col = "UD Outs Line" if market == "Outs" else "UD ER Line"
+    proj_col = "Outs Projection" if market == "Outs" else "ER Allowed Projection"
+    for matchup, g in df.groupby("Matchup", sort=False):
+        block = []
+        for _, r in g.iterrows():
+            line = r.get(line_col)
+            if str(line).upper() in ["NO LINE", "NO UD LINE", "NAN", "NONE", ""]:
+                continue
+            dec = str(r.get("Decision") or "").replace("🔥 ", "🔥 ").replace("⚠️ ", "⚠️ ")
+            proj = r.get(proj_col)
+            label = "Outs" if market == "Outs" else "ER"
+            block.append(f"• {r.get('Pitcher')} — {dec} {line} — {proj} {label} — IP {r.get('Projected IP')}")
+        if block:
+            lines.append(str(matchup)); lines.extend(block); lines.append("")
+    return "\n".join(lines).strip()
+
+
+def render_pitching_outs_beta_tab(board):
+    st.markdown('<div class="section-title-pro">Beta Tester — Pitching Outs</div>', unsafe_allow_html=True)
+    st.caption("Separate beta tab. Pulls live Underdog pitching-outs lines when available. Uses beta IP/Outs engine only; K Upside projections are untouched.")
+    if not board:
+        st.info("Refresh the live board first.")
+        return
+    df = _btp_build_outs_rows(board)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", len(df))
+    c2.metric("UD Lines", int((df.get("Line Source") == "Underdog").sum()) if not df.empty else 0)
+    c3.metric("Over Outs", int(df.get("Decision", pd.Series(dtype=str)).astype(str).str.contains("OVER").sum()) if not df.empty else 0)
+    c4.metric("Under Outs", int(df.get("Decision", pd.Series(dtype=str)).astype(str).str.contains("UNDER").sum()) if not df.empty else 0)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    slate = _btp_copy_slate(df, "Outs")
+    st.subheader("Copy/Paste Outs Slate")
+    if slate:
+        st.text_area("Pitching Outs slate", slate, height=320)
+        st.download_button("Download outs slate .txt", slate, file_name="one_way_pickz_beta_pitching_outs_slate.txt", mime="text/plain")
+    else:
+        st.info("No Underdog pitching-outs lines matched yet.")
+
+
+def render_earned_runs_allowed_beta_tab(board):
+    st.markdown('<div class="section-title-pro">Beta Tester — Earned Runs Allowed</div>', unsafe_allow_html=True)
+    st.caption("Separate beta tab. Pulls live Underdog earned-runs-allowed lines when available. Uses projected IP + ERA/recent ER/run environment. K Upside projections are untouched.")
+    if not board:
+        st.info("Refresh the live board first.")
+        return
+    df = _btp_build_er_rows(board)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", len(df))
+    c2.metric("UD Lines", int((df.get("Line Source") == "Underdog").sum()) if not df.empty else 0)
+    c3.metric("ER Overs", int(df.get("Decision", pd.Series(dtype=str)).astype(str).str.contains("OVER").sum()) if not df.empty else 0)
+    c4.metric("ER Unders", int(df.get("Decision", pd.Series(dtype=str)).astype(str).str.contains("UNDER").sum()) if not df.empty else 0)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    slate = _btp_copy_slate(df, "ER")
+    st.subheader("Copy/Paste ER Allowed Slate")
+    if slate:
+        st.text_area("Earned Runs Allowed slate", slate, height=320)
+        st.download_button("Download ER allowed slate .txt", slate, file_name="one_way_pickz_beta_er_allowed_slate.txt", mime="text/plain")
+    else:
+        st.info("No Underdog earned-runs-allowed lines matched yet.")
+
+tab_kproj, tab_pitcher_fs, tab_pitching_outs_beta, tab_er_allowed_beta, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
+    "BETA OUTS",
+    "BETA ER ALLOWED",
     "MONEYLINE EDGE",
     "🧠 BASEBALL IQ",
     "🧠 30D LEARNING IQ",
@@ -28715,6 +29229,12 @@ with tab_kproj:
 
 with tab_pitcher_fs:
     render_pitcher_fs_tab(board)
+
+with tab_pitching_outs_beta:
+    render_pitching_outs_beta_tab(board)
+
+with tab_er_allowed_beta:
+    render_earned_runs_allowed_beta_tab(board)
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
