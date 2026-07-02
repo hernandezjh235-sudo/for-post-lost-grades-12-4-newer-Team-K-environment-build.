@@ -29123,13 +29123,6 @@ def render_beta_pitching_outs_tab(board):
     if s2.button("✅ Grade Saved Outs Picks", key="grade_beta_outs_board"):
         res = _beta_grade_saved_board(df, "OUTS")
         st.info(res.get("message"))
-    s1, s2 = st.columns(2)
-    if s1.button("💾 Save ER Official Board", key="save_beta_er_board"):
-        ok, msg = _beta_save_official_board(df, "ER")
-        (st.success if ok else st.warning)(msg)
-    if s2.button("✅ Grade Saved ER Picks", key="grade_beta_er_board"):
-        res = _beta_grade_saved_board(df, "ER")
-        st.info(res.get("message"))
     a,b,c = st.columns(3)
     a.metric("Rows", len(df))
     b.metric("UD Outs Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
@@ -29140,29 +29133,8 @@ def render_beta_pitching_outs_tab(board):
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-def render_beta_er_allowed_tab(board):
-    st.markdown('<div class="section-title-pro">⚾ Earned Runs Allowed BETA</div>', unsafe_allow_html=True)
-    st.caption("Tester only. Pulls Underdog ER Allowed lines when available. Uses beta IP + run damage proxies. K engine untouched.")
-    df = _beta_projection_rows(board, "ER")
-    if df.empty:
-        st.info("No beta ER rows yet. Refresh the board first.")
-        return
-    s1, s2 = st.columns(2)
-    if s1.button("💾 Save ER Official Board", key="save_beta_er_board_tab"):
-        ok, msg = _beta_save_official_board(df, "ER")
-        (st.success if ok else st.warning)(msg)
-    if s2.button("✅ Grade Saved ER Picks", key="grade_beta_er_board_tab"):
-        res = _beta_grade_saved_board(df, "ER")
-        st.info(res.get("message"))
-    a,b,c = st.columns(3)
-    a.metric("Rows", len(df))
-    b.metric("UD ER Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
-    c.metric("Avg ER Proj", round(pd.to_numeric(df.get("Beta Projection"), errors="coerce").mean(), 2) if "Beta Projection" in df.columns else 0)
-    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Line Status","Line Match Debug","K PROJ (unchanged)"] if c in df.columns]
-    st.dataframe(df[cols], use_container_width=True, hide_index=True)
-    with st.expander("ER / IP Debug", expanded=False):
-        st.dataframe(df, use_container_width=True, hide_index=True)
 
+# ER Allowed Beta removed by request. Pitching Outs Beta and K Upside remain untouched.
 
 def render_beta_ip_debug_tab(board):
     st.markdown('<div class="section-title-pro">🧪 IP Engine Debug BETA</div>', unsafe_allow_html=True)
@@ -29187,10 +29159,9 @@ def render_beta_ip_debug_tab(board):
 
 
 
-tab_kproj, tab_beta_outs, tab_beta_er, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
-    "⚾ ER ALLOWED BETA",
     "🧪 IP DEBUG BETA",
     "PITCHER FS",
     "MONEYLINE EDGE",
@@ -29210,9 +29181,6 @@ with tab_kproj:
 
 with tab_beta_outs:
     render_beta_pitching_outs_tab(board)
-
-with tab_beta_er:
-    render_beta_er_allowed_tab(board)
 
 with tab_beta_ip_debug:
     render_beta_ip_debug_tab(board)
