@@ -28469,7 +28469,7 @@ def render_moneyline_edge_tab(board, dates=None):
 # - Does NOT overwrite K PROJ, projection, Decision, Line-Aware Smart fields, or grading.
 # - Uses existing board rows as input and creates separate beta columns for testing.
 # =========================
-BETA_IP_OUTS_ER_VERSION = "BETA_IP_OUTS_ER_TABS_2026_07_01"
+BETA_IP_OUTS_ER_VERSION = "BETA_OUTS_ONLY_V5_K_VOL_CONF_2026_07"
 
 
 def _beta_num(x, default=0.0):
@@ -28615,6 +28615,9 @@ def _beta_recent_outs_profile(row):
         "deep_rate_l10": rate(outs, lambda x: x >= 18, 10),
         "six_plus_rate_l10": rate(outs, lambda x: x >= 18, 10),
         "over_18_rate_l10": rate(outs, lambda x: x >= 19, 10),
+        "outs_std_l10": None if len(outs[:10]) < 2 else float(np.std(outs[:10], ddof=0)),
+        "ip_std_l10": None if len(ips[:10]) < 2 else float(np.std(ips[:10], ddof=0)),
+        "pitch_std_l10": None if len(pitches[:10]) < 2 else float(np.std(pitches[:10], ddof=0)),
     }
     if ips and ers:
         n = min(len(ips), len(ers), 10)
@@ -28632,6 +28635,329 @@ def _beta_recent_outs_profile(row):
         out["pitches_per_bf_l5"] = None
     return out
 
+
+
+# =========================
+# BETA OUTS v3 — Unified Workload Engine
+# =========================
+# Tester-only helpers. These do NOT overwrite production K projections.
+# Goal: learn from wins/losses, tighten borderline plays, and feed a cleaner
+# workload/BF view back into the beta board for K audit.
+BETA_OUTS_V3_VERSION = "BETA_OUTS_V4_VOL_K_CONVERSION_2026_07"
+BETA_OUTS_PASS_EDGE = 1.00          # < 1 out edge = pass/track
+BETA_OUTS_STRONG_EDGE = 2.25        # strong play threshold
+BETA_OUTS_LEASH_RISK_EDGE = 2.00    # extra caution on unders when recent leash is strong
+BETA_OUTS_PULL_RISK_EDGE = 2.00     # extra caution on overs when hook risk is high
+
+
+def _beta_outs_learning_adjustment(player_name=None):
+    """Small beta-only workload calibration from previously graded Outs rows.
+
+    Uses beta_outs_result_log.csv if it exists. Returns OUTS adjustment, capped.
+    This lets the beta learn from both wins and losses without touching K learning.
+    """
+    try:
+        path = _beta_market_dir() / "beta_outs_result_log.csv"
+        if not path.exists():
+            return 0.0, "outs learning warmup"
+        df = pd.read_csv(path)
+        if df.empty or "Actual Value" not in df.columns or "Beta Projection" not in df.columns:
+            return 0.0, "outs learning no usable rows"
+        df["Actual Value"] = pd.to_numeric(df["Actual Value"], errors="coerce")
+        df["Beta Projection"] = pd.to_numeric(df["Beta Projection"], errors="coerce")
+        df = df[df["Actual Value"].notna() & df["Beta Projection"].notna()].copy()
+        if df.empty:
+            return 0.0, "outs learning no numeric rows"
+        df["err"] = df["Actual Value"] - df["Beta Projection"]
+        global_adj = float(df.tail(150)["err"].mean()) if len(df) >= 8 else 0.0
+        global_adj = _beta_cap(global_adj * 0.22, -0.55, 0.55)
+        player_adj = 0.0
+        if player_name and "Pitcher" in df.columns:
+            nm = normalize_name(player_name)
+            sub = df[df["Pitcher"].astype(str).map(normalize_name) == nm].tail(12)
+            if len(sub) >= 3:
+                player_adj = _beta_cap(float(sub["err"].mean()) * 0.38, -0.75, 0.75)
+        adj = _beta_cap(global_adj + player_adj, -0.90, 0.90)
+        return float(adj), f"outs learning adj {adj:+.2f} outs | n={len(df)}"
+    except Exception as e:
+        return 0.0, f"outs learning skipped: {e}"
+
+
+def _beta_quality_flags(row, rp, pitch_l3, hook_rate, deep_rate, early_exit, starter, role):
+    flags = []
+    sample = int(rp.get("sample") or 0)
+    if sample < 4:
+        flags.append("LOW_SAMPLE")
+    if starter < 68 or role < 62:
+        flags.append("ROLE_RISK")
+    if hook_rate >= 0.45:
+        flags.append("RECENT_HOOK_RISK")
+    if early_exit >= 62:
+        flags.append("EARLY_PULL_RISK")
+    if pitch_l3 < 74:
+        flags.append("PITCH_LIMIT_RISK")
+    if deep_rate >= 0.60 and pitch_l3 >= 88:
+        flags.append("DEEP_LEASH_SUPPORT")
+    label = str(_beta_first(row, ["Leash Label", "Volume Safety Label", "Pull", "Role Label", "manager_hook_status"], "")).upper()
+    if any(x in label for x in ["OPENER", "BULK", "RELIEF"]):
+        flags.append("NON_TRADITIONAL_ROLE")
+    return flags
+
+
+def _beta_outs_final_decision(proj, line, ip_info):
+    """Beta decision gate: reduce forced borderline picks.
+
+    This is where the model learns from the losses: many losses were thin unders
+    or overs with pull risk. We pass those instead of forcing a side.
+    """
+    line = _beta_num(line, None)
+    proj = _beta_num(proj, None)
+    if line is None or proj is None:
+        return "NO LINE", None, None, "No UD line"
+    edge = round(proj - line, 2)
+    abs_edge = abs(edge)
+    raw_side = "OVER" if edge > 0 else "UNDER"
+    flags = [str(x).upper() for x in (ip_info.get("Beta Flags") or [])]
+    med = _beta_num(ip_info.get("Recent Outs Median"), None)
+    l5 = _beta_num(ip_info.get("Recent Outs L5"), None)
+    deep = _beta_num(ip_info.get("Deep Start Rate"), 0.0) or 0.0
+    hook = _beta_num(ip_info.get("Recent Hook Rate"), 0.0) or 0.0
+    conf = _beta_num(ip_info.get("Beta IP Confidence"), 50.0) or 50.0
+
+    if abs_edge < BETA_OUTS_PASS_EDGE:
+        return "PASS", edge, None, "Thin edge under 1.0 out"
+
+    # Loss-focused under safety: if recent distribution supports clearing the line,
+    # don't force an under unless the projection edge is truly strong.
+    if raw_side == "UNDER":
+        recent_supports_over = False
+        if med is not None and med >= line:
+            recent_supports_over = True
+        if l5 is not None and l5 >= line:
+            recent_supports_over = True
+        if deep >= 60:
+            recent_supports_over = True
+        if recent_supports_over and abs_edge < BETA_OUTS_LEASH_RISK_EDGE:
+            return "PASS", edge, None, "Under blocked: recent/deep leash supports over"
+
+    # Loss-focused over safety: overs need enough cushion when hook/role risk exists.
+    if raw_side == "OVER":
+        pull_risk = (hook >= 40) or ("RECENT_HOOK_RISK" in flags) or ("EARLY_PULL_RISK" in flags) or ("ROLE_RISK" in flags) or conf < 45
+        if pull_risk and abs_edge < BETA_OUTS_PULL_RISK_EDGE:
+            return "PASS", edge, None, "Over blocked: pull/role risk with thin cushion"
+
+    if abs_edge >= BETA_OUTS_STRONG_EDGE and conf >= 55:
+        lean = "STRONG " + raw_side
+    else:
+        lean = raw_side
+    prob = _beta_prob_from_gap(abs_edge, 1.65)
+    return lean, edge, prob, "Playable"
+
+
+
+def _beta_pct_to_decimal(v, default=None):
+    x = _beta_num(v, default)
+    if x is None:
+        return default
+    if x > 1:
+        x = x / 100.0
+    return _beta_cap(x, 0.05, 0.45)
+
+
+def _beta_lineup_batter_k(row):
+    """Average batter matchup K% from existing lineup rows when available.
+
+    Reads the same batter-level data already built for the K engine. Tester-only.
+    """
+    try:
+        rows = None
+        if isinstance(row, dict):
+            rows = row.get("lineup_rows") or row.get("Lineup Rows") or row.get("batter_rows")
+        vals = []
+        if isinstance(rows, list):
+            for r in rows[:9]:
+                if not isinstance(r, dict):
+                    continue
+                v = None
+                for k in ["Used K%", "Per-Batter K%", "K%", "Batter K%", "Split K%", "Season K%"]:
+                    if r.get(k) not in (None, "", "—"):
+                        v = r.get(k); break
+                dv = _beta_pct_to_decimal(v, None)
+                if dv is not None:
+                    vals.append(dv)
+        if vals:
+            return float(np.mean(vals)), f"batter avg n={len(vals)}"
+    except Exception:
+        pass
+    direct = _beta_pct_to_decimal(_beta_first(row, ["Lineup K%", "Lineup Avg K%", "Confirmed Lineup K%", "Batter Matchup K%", "Projected Lineup K%"], None), None)
+    if direct is not None:
+        return direct, "lineup aggregate"
+    return None, "no batter lineup k"
+
+
+def _beta_opponent_k_profile(row):
+    """Blend season, hand-split, last-30 and batter-level K environment.
+
+    This verifies the beta audit is reading the inputs you asked about:
+    - Team K% season/overall
+    - Team K% vs pitcher hand
+    - Team K% last 30 days vs pitcher hand
+    - Batter matchup K% from lineup rows when present
+    """
+    hand = str(_beta_first(row, ["Pitcher Hand", "hand", "Throws", "pitcher_hand"], "RHP")).upper()
+    is_lhp = hand.startswith("L") or hand == "LHP"
+
+    season = _beta_pct_to_decimal(_beta_first(row, [
+        "Opp Overall K% Official", "Opp Overall K%", "Opponent Overall K%", "Opponent K%",
+        "Opp K%", "Team K%", "Lineup K%"
+    ], None), None)
+
+    hand_split = _beta_pct_to_decimal(_beta_first(row, [
+        "Opponent K% vs Pitcher Hand", "Opp K% vs Pitcher Hand", "Opponent K vs Hand"
+    ], None), None)
+    if hand_split is None:
+        hand_split = _beta_pct_to_decimal(_beta_first(row, [
+            "Opp K% vs LHP Official", "Opp K% vs LHP", "Opponent K% vs LHP"
+        ] if is_lhp else [
+            "Opp K% vs RHP Official", "Opp K% vs RHP", "Opponent K% vs RHP"
+        ], None), None)
+
+    last30 = _beta_pct_to_decimal(_beta_first(row, [
+        "Opponent Last 30 K%", "Opp Last 30 K%", "Opp L30 K%", "Last 30 K%"
+    ], None), None)
+    if last30 is None:
+        last30 = _beta_pct_to_decimal(_beta_first(row, [
+            "Opp L30 K% vs LHP Official", "Opp L30 K% vs LHP", "Opponent L30 K% vs LHP"
+        ] if is_lhp else [
+            "Opp L30 K% vs RHP Official", "Opp L30 K% vs RHP", "Opponent L30 K% vs RHP"
+        ], None), None)
+
+    batter, batter_src = _beta_lineup_batter_k(row)
+
+    parts = []
+    def add(label, val, weight):
+        if val is not None:
+            parts.append((label, val, weight))
+    add("season", season, 0.30)
+    add("hand", hand_split, 0.35)
+    add("last30", last30, 0.20)
+    add("batter", batter, 0.15)
+    if not parts:
+        return {"env_k": LEAGUE_AVG_K, "season": None, "hand": None, "last30": None, "batter": None, "note": "fallback league avg"}
+    tw = sum(w for _, _, w in parts) or 1.0
+    env = sum(v*w for _, v, w in parts) / tw
+    note = ", ".join([f"{lab} {val*100:.1f}%" for lab, val, _ in parts])
+    if batter is not None:
+        note += f" ({batter_src})"
+    return {"env_k": float(_beta_cap(env, 0.12, 0.34)), "season": season, "hand": hand_split, "last30": last30, "batter": batter, "note": note}
+
+
+def _beta_ip_volatility_score(rp, row=None):
+    """0-100 score where higher = more stable/predictable IP workload."""
+    sample = int(rp.get("sample") or 0)
+    outs_std = _beta_num(rp.get("outs_std_l10"), None)
+    ip_std = _beta_num(rp.get("ip_std_l10"), None)
+    pitch_std = _beta_num(rp.get("pitch_std_l10"), None)
+    hook = _beta_num(rp.get("hook_rate_l10"), 0.25) or 0.25
+    deep = _beta_num(rp.get("deep_rate_l10"), 0.45) or 0.45
+    score = 74.0
+    if sample < 4:
+        score -= 18
+    elif sample < 7:
+        score -= 7
+    if outs_std is not None:
+        score -= _beta_cap((outs_std - 2.6) * 5.2, -6, 22)
+    if ip_std is not None:
+        score -= _beta_cap((ip_std - 0.85) * 13.0, -5, 20)
+    if pitch_std is not None:
+        score -= _beta_cap((pitch_std - 11.0) * 0.75, -4, 14)
+    score -= _beta_cap((hook - 0.25) * 32, -5, 18)
+    score += _beta_cap((deep - 0.45) * 14, -5, 8)
+    role = _beta_num(_beta_first(row or {}, ["Role Score", "role_score"], 70), 70)
+    starter = _beta_num(_beta_first(row or {}, ["Starter Score", "starter_score"], 80), 80)
+    score += _beta_cap((role - 70) * 0.12, -5, 5)
+    score += _beta_cap((starter - 80) * 0.10, -4, 4)
+    score = round(_beta_cap(score, 10, 95), 0)
+    if score >= 78:
+        label = "LOW_VOL_STABLE"
+    elif score >= 60:
+        label = "MEDIUM_VOL"
+    elif score >= 45:
+        label = "HIGH_VOL_CAUTION"
+    else:
+        label = "EXTREME_VOL_PASS_LEAN"
+    return score, label
+
+
+def _beta_strikeout_conversion_score(row, ip_info=None):
+    """Tester-only K conversion quality score using pitcher skill + K environment.
+
+    This does not overwrite production K PROJ. It gives the beta a cleaner audit
+    of whether projected workload is likely to convert into strikeouts.
+    """
+    pk = _beta_pct_to_decimal(_beta_first(row, ["Pitcher K%", "pitcher_k_pct", "Pitcher K Rate", "K%"], None), None)
+    k9 = _beta_num(_beta_first(row, ["K/9", "Pitcher K/9", "K9"], None), None)
+    csw = _beta_pct_to_decimal(_beta_first(row, ["T12 CSW%", "CSW%", "Pitcher CSW%"], None), None)
+    swstr = _beta_pct_to_decimal(_beta_first(row, ["T12 SwStr%", "SwStr%", "Swinging Strike%"], None), None)
+    putaway = _beta_pct_to_decimal(_beta_first(row, ["Putaway/Whiff", "PutAway%", "Whiff%", "Whiff"], None), None)
+    env = _beta_opponent_k_profile(row)
+    env_k = env.get("env_k") or LEAGUE_AVG_K
+
+    score = 50.0
+    if pk is not None:
+        score += (pk - LEAGUE_AVG_K) * 155
+    if k9 is not None:
+        score += (k9 - 8.2) * 2.1
+    if csw is not None:
+        score += (csw - 0.285) * 70
+    if swstr is not None:
+        score += (swstr - 0.112) * 92
+    if putaway is not None:
+        score += (putaway - 0.250) * 42
+    score += (env_k - LEAGUE_AVG_K) * 115
+    score = round(_beta_cap(score, 15, 95), 0)
+    if score >= 74:
+        label = "ELITE_K_CONVERSION"
+    elif score >= 62:
+        label = "GOOD_K_CONVERSION"
+    elif score >= 48:
+        label = "AVG_K_CONVERSION"
+    else:
+        label = "LOW_K_CONVERSION"
+    return score, label, env
+
+def _beta_shared_k_workload_projection(row, ip_info):
+    """Beta-only K audit projection using shared workload + richer K environment.
+
+    Does NOT replace production K PROJ. It only shows what the K projection would
+    look like if the beta workload engine fed a blended pitcher/team/batter K conversion layer.
+    """
+    try:
+        beta_bf = _beta_num(ip_info.get("Beta BF"), None)
+        if beta_bf is None:
+            beta_bf = _beta_num(ip_info.get("Beta IP"), 5.0) * 4.25
+
+        pk = _beta_pct_to_decimal(_beta_first(row, ["Pitcher K%", "pitcher_k_pct", "Pitcher K Rate", "K%"], None), None)
+        if pk is None:
+            kproj = _beta_num(_beta_first(row, ["Line-Aware Smart Final K Projection", "K PROJ", "projection", "Projection"], None), None)
+            old_bf = _beta_num(_beta_first(row, ["Exp BF", "Expected BF", "Projected BF", "BF", "expected_bf"], None), None)
+            if kproj is not None and old_bf and old_bf > 0:
+                pk = kproj / old_bf
+        if pk is None:
+            pk = LEAGUE_AVG_K
+        pk = _beta_cap(pk, 0.08, 0.45)
+
+        conv_score, conv_label, env = _beta_strikeout_conversion_score(row, ip_info)
+        env_k = env.get("env_k") or LEAGUE_AVG_K
+
+        # Log5-ish blend between pitcher skill and opponent/batter K environment.
+        # This is intentionally capped and beta-only.
+        log5_rate = calculate_log5_k_rate(pk, env_k, LEAGUE_AVG_K) if "calculate_log5_k_rate" in globals() else (pk * 0.62 + env_k * 0.38)
+        conv_factor = 1.0 + _beta_cap((conv_score - 50.0) / 600.0, -0.045, 0.065)
+        beta_k = beta_bf * log5_rate * conv_factor
+        return round(_beta_cap(beta_k, 0.2, 15.0), 2)
+    except Exception:
+        return None
 
 def _beta_dynamic_ip(row):
     """Tester-only IP/Outs model v2. Does not write back or change K projections.
@@ -28746,8 +29072,29 @@ def _beta_dynamic_ip(row):
     if any(x in role_label for x in ["OPENER", "BULK", "RELIEF", "EARLY_PULL_HIGH", "STRICT_HOOK"]):
         beta_ip = min(beta_ip, base_ip + 0.10)
 
+    # v3 loss/win learning layer: small capped adjustment from graded Outs results.
+    player_name = _beta_first(row, ["pitcher", "Pitcher", "Player", "name"], "")
+    learn_adj_outs, learn_note = _beta_outs_learning_adjustment(player_name)
+    beta_ip += (learn_adj_outs / 3.0)
+
+    # v3 guardrail: high recent deep-start profile should not be crushed below its median
+    # unless role/hook risk is real. This targets losses like unders on durable arms.
+    if rp.get("sample", 0) >= 5 and hook_rate <= 0.35 and deep_rate >= 0.55 and pitch_l3 >= 86:
+        med_outs = _beta_num(rp.get("outs_med_l10"), None)
+        if med_outs is not None:
+            beta_ip = max(beta_ip, (med_outs / 3.0) - 0.20)
+
+    # v3 guardrail: low-sample / high-hook / bad-efficiency arms need extra caution on overs.
+    flags = _beta_quality_flags(row, rp, pitch_l3, hook_rate, deep_rate, early_exit, starter, role)
+    if any(f in flags for f in ["LOW_SAMPLE", "ROLE_RISK", "RECENT_HOOK_RISK", "EARLY_PULL_RISK", "NON_TRADITIONAL_ROLE"]):
+        if _beta_num(rp.get("outs_l5"), None) is not None:
+            beta_ip = min(beta_ip, ((_beta_num(rp.get("outs_l5"), base_outs) + base_outs) / 2.0) / 3.0 + 0.20)
+
     beta_ip = round(_beta_cap(beta_ip, 1.0, 7.4), 2)
     outs = round(beta_ip * 3.0, 1)
+    beta_bf = round(_beta_cap((beta_ip * 3.0) + _beta_cap(opp_obp * 9.0, 2.1, 3.7) + _beta_cap(bb9 / 2.2, 0.7, 2.1), 8.0, 34.0), 1)
+
+    ip_vol_score, ip_vol_label = _beta_ip_volatility_score(rp, row)
 
     conf = 50
     conf += _beta_cap((starter - 75) * 0.22, -7, 8)
@@ -28760,18 +29107,31 @@ def _beta_dynamic_ip(row):
         conf += 5
     conf = round(_beta_cap(conf, 20, 90), 0)
 
+    # Confidence penalty for flags after the final guardrails.
+    if "LOW_SAMPLE" in flags:
+        conf -= 6
+    if "ROLE_RISK" in flags or "NON_TRADITIONAL_ROLE" in flags:
+        conf -= 7
+    if "DEEP_LEASH_SUPPORT" in flags:
+        conf += 4
+    conf = round(_beta_cap(conf, 20, 92), 0)
+
     note_parts = [
         f"PC L3 {pitch_l3:.1f}/L5 {pitch_l5:.1f}",
         f"Outs L5 {(_beta_num(rp.get('outs_l5'), 0) or 0):.1f}",
+        f"Med {(_beta_num(rp.get('outs_med_l10'), 0) or 0):.1f}",
         f"Deep {deep_rate:.0%}",
         f"Hook {hook_rate:.0%}",
         f"P/IP {ppi:.1f}" if ppi is not None else "P/IP —",
         f"Opp BB {opp_bb*100:.1f}%",
+        learn_note,
+        ",".join(flags) if flags else "NO_MAJOR_FLAGS",
     ]
     return {
         "Original IP": round(base_ip, 2),
         "Beta IP": beta_ip,
         "Beta Outs": outs,
+        "Beta BF": beta_bf,
         "Beta IP Delta": round(beta_ip - base_ip, 2),
         "Beta IP Confidence": conf,
         "Pitch Count Trend": round(float(pitch_l3 - pitch_l10), 1) if pitch_l10 is not None else None,
@@ -28780,7 +29140,11 @@ def _beta_dynamic_ip(row):
         "Recent Hook Rate": None if rp.get("hook_rate_l10") is None else round(float(rp.get("hook_rate_l10")) * 100, 1),
         "Deep Start Rate": None if rp.get("deep_rate_l10") is None else round(float(rp.get("deep_rate_l10")) * 100, 1),
         "Pitch Efficiency P/IP": None if ppi is None else round(float(ppi), 1),
-        "Beta IP Note": " | ".join(note_parts),
+        "IP Volatility Score": ip_vol_score,
+        "IP Volatility Label": ip_vol_label,
+        "Beta Flags": flags,
+        "Learning Adjustment Outs": round(float(learn_adj_outs), 2),
+        "Beta IP Note": " | ".join([str(x) for x in note_parts if x not in [None, ""]]),
     }
 
 
@@ -29178,9 +29542,7 @@ def _beta_projection_rows(board, market_kind="OUTS"):
             k_proj = _beta_num(_beta_first(p, ["Line-Aware Smart Final K Projection", "K PROJ", "projection", "Projection"], None), None)
             if market_kind == "OUTS":
                 proj = ip_info["Beta Outs"]
-                side = _beta_side_from_proj(proj, line, True)
-                gap = None if line is None else round(proj - float(line), 2)
-                prob = None if line is None else (_beta_prob_from_gap(gap, 1.7) if side == "OVER" else _beta_prob_from_gap(-gap, 1.7))
+                side, gap, prob, decision_note = _beta_outs_final_decision(proj, line, ip_info)
             else:
                 # ER projection tester. Based on beta IP + ERA/damage proxies + game environment.
                 era = _beta_num(_beta_first(p, ["ERA", "Pitcher ERA", "Season ERA", "era"], 4.20), 4.20)
@@ -29195,6 +29557,9 @@ def _beta_projection_rows(board, market_kind="OUTS"):
                 side = _beta_side_from_proj(proj, line, True)
                 gap = None if line is None else round(proj - float(line), 2)
                 prob = None if line is None else (_beta_prob_from_gap(gap, 0.75) if side == "OVER" else _beta_prob_from_gap(-gap, 0.75))
+                decision_note = "ER beta removed / legacy"
+            shared_k = _beta_shared_k_workload_projection(p, ip_info) if market_kind == "OUTS" else None
+            conv_score, conv_label, k_env = _beta_strikeout_conversion_score(p, ip_info) if market_kind == "OUTS" else (None, None, {})
             rows.append({
                 "Pitcher": name,
                 "Matchup": matchup,
@@ -29204,14 +29569,23 @@ def _beta_projection_rows(board, market_kind="OUTS"):
                 "Beta Lean": side,
                 "Beta Edge": gap if gap is not None else "—",
                 "Beta Hit %": prob if prob is not None else "—",
+                "Decision Note": decision_note,
                 "K PROJ (unchanged)": k_proj if k_proj is not None else "—",
+                "Shared Workload K Audit": shared_k if shared_k is not None else "—",
+                "K Conversion Score": conv_score if conv_score is not None else "—",
+                "K Conversion Label": conv_label if conv_label is not None else "—",
+                "K Env Blend %": round(float(k_env.get("env_k", 0))*100, 1) if isinstance(k_env, dict) and k_env.get("env_k") is not None else "—",
+                "K Env Details": k_env.get("note", "—") if isinstance(k_env, dict) else "—",
                 "Original IP": ip_info["Original IP"],
                 "Beta IP": ip_info["Beta IP"],
                 "Beta Outs": ip_info["Beta Outs"],
+                "Beta BF": ip_info.get("Beta BF", "—"),
                 "IP Delta": ip_info["Beta IP Delta"],
                 "IP Confidence": ip_info["Beta IP Confidence"],
                 "Line Status": line_info.get("status"),
                 "Line Match Debug": line_info.get("debug_lines") or line_info.get("message"),
+                "Beta Flags": ", ".join(ip_info.get("Beta Flags", [])) if isinstance(ip_info.get("Beta Flags", []), list) else ip_info.get("Beta Flags", ""),
+                "Learning Adjustment Outs": ip_info.get("Learning Adjustment Outs", 0),
                 "Version": BETA_IP_OUTS_ER_VERSION,
                 "IP Debug": ip_info["Beta IP Note"],
             })
@@ -29322,7 +29696,7 @@ def render_beta_pitching_outs_tab(board):
     a.metric("Rows", len(df))
     b.metric("UD Outs Lines", int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0)
     c.metric("Avg IP Δ", round(pd.to_numeric(df.get("IP Delta"), errors="coerce").mean(), 2) if "IP Delta" in df.columns else 0)
-    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Original IP","Beta IP","Beta Outs","IP Confidence","Recent Outs L5","Recent Outs Median","Pitch Count Trend","Pitch Efficiency P/IP","Recent Hook Rate","Deep Start Rate","Line Status","Line Match Debug","K PROJ (unchanged)"] if c in df.columns]
+    cols = [c for c in ["Pitcher","Matchup","UD Line","Beta Projection","Beta Lean","Beta Edge","Beta Hit %","Decision Note","Original IP","Beta IP","Beta Outs","Beta BF","IP Confidence","Recent Outs L5","Recent Outs Median","Pitch Count Trend","Pitch Efficiency P/IP","IP Volatility Score","IP Volatility Label","Recent Hook Rate","Deep Start Rate","Beta Flags","Learning Adjustment Outs","Line Status","Line Match Debug","K PROJ (unchanged)","Shared Workload K Audit","K Conversion Score","K Conversion Label","K Env Blend %","K Env Details"] if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
     with st.expander("IP Engine Debug", expanded=False):
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -29343,6 +29717,7 @@ def render_beta_ip_debug_tab(board):
             "Matchup": p.get("matchup") or p.get("Matchup") or "",
             **info,
             "K PROJ (unchanged)": _beta_first(p, ["Line-Aware Smart Final K Projection", "K PROJ", "projection", "Projection"], "—"),
+            "Shared Workload K Audit": _beta_shared_k_workload_projection(p, info),
             "Decision (unchanged)": _beta_first(p, ["Line-Aware Smart Decision", "Decision", "Model Lean"], "—"),
             "Version": BETA_IP_OUTS_ER_VERSION,
         })
@@ -29353,9 +29728,169 @@ def render_beta_ip_debug_tab(board):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+# =========================
+# BETA TESTER — K V5 SHARED WORKLOAD / VOLATILITY / CONFIDENCE
+# =========================
+# This beta layer DOES NOT overwrite production K PROJ or K Upside math.
+# It creates side-by-side tester columns using the new shared workload engine.
+BETA_K_V5_VERSION = "BETA_K_V5_SHARED_WORKLOAD_VOL_CONF_2026_07"
 
-tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+def _beta_k_line(row):
+    return _beta_num(_beta_first(row, ["UD/Line", "line", "Line", "K Line", "Underdog Line", "underdog_line"], None), None)
+
+def _beta_k_current_projection(row):
+    return _beta_num(_beta_first(row, ["Line-Aware Smart Final K Projection", "K PROJ", "projection", "Projection", "Median"], None), None)
+
+def _beta_k_v5_decision(proj, line, confidence, flags=None):
+    if line is None or proj is None:
+        return "NO LINE", None, "NO_LINE"
+    edge = round(float(proj) - float(line), 2)
+    abs_edge = abs(edge)
+    flags = flags or []
+    risk_flags = [f for f in flags if f in ["LOW_SAMPLE", "ROLE_RISK", "RECENT_HOOK_RISK", "EARLY_PULL_RISK", "NON_TRADITIONAL_ROLE", "HIGH_IP_VOLATILITY"]]
+    if abs_edge < 0.45:
+        return "⏸️ PASS — THIN EDGE", edge, "edge < 0.45 K"
+    if confidence < 52:
+        return "⏸️ PASS — LOW CONF", edge, f"confidence {confidence:.0f}"
+    if risk_flags and abs_edge < 0.85:
+        return "⏸️ PASS — WORKLOAD RISK", edge, ",".join(risk_flags)
+    side = "OVER" if edge > 0 else "UNDER"
+    if abs_edge >= 1.35 and confidence >= 66 and not risk_flags:
+        return f"🔥 {side}", edge, "strong beta edge + confidence"
+    if abs_edge >= 0.85 and confidence >= 58:
+        return f"⚠️ {side} LEAN", edge, "playable beta lean"
+    return f"⏸️ PASS — {side} LEAN ONLY", edge, "lean but not enough confirmation"
+
+def _beta_k_v5_projection(row):
+    """Side-by-side K tester projection.
+
+    Uses:
+    - beta workload/IP/BF
+    - IP volatility adjustment to the projection
+    - strikeout conversion score
+    - season/vs-hand/L30/batter K environment audit already built in V4
+    - confidence penalty for volatility/role risk
+
+    It intentionally returns new fields only and does not write to K PROJ.
+    """
+    try:
+        ip_info = _beta_dynamic_ip(row)
+        current_k = _beta_k_current_projection(row)
+        beta_base = _beta_shared_k_workload_projection(row, ip_info)
+        if beta_base is None:
+            beta_base = current_k
+        if beta_base is None:
+            return {}
+        conv_score, conv_label, k_env = _beta_strikeout_conversion_score(row, ip_info)
+        conv_score = _beta_num(conv_score, 50.0)
+        ip_conf = _beta_num(ip_info.get("Beta IP Confidence"), 50.0)
+        ip_vol = _beta_num(ip_info.get("IP Volatility Score"), 50.0)
+        flags_raw = ip_info.get("Beta Flags", [])
+        flags = flags_raw if isinstance(flags_raw, list) else [str(flags_raw)] if flags_raw else []
+
+        # #4: put volatility into the beta projection, not just the label.
+        # High volatility shrinks the K projection slightly because opportunity is less stable.
+        # Low volatility + deep leash support gives a small boost.
+        vol_adj = 1.0
+        if ip_vol >= 75:
+            vol_adj -= 0.075
+            flags.append("HIGH_IP_VOLATILITY")
+        elif ip_vol >= 65:
+            vol_adj -= 0.045
+        elif ip_vol <= 35 and "DEEP_LEASH_SUPPORT" in flags:
+            vol_adj += 0.025
+        elif ip_vol <= 42:
+            vol_adj += 0.010
+
+        # Workload risk guardrails from losses: do not let thin overs ride through bad role/hook flags.
+        if any(f in flags for f in ["ROLE_RISK", "RECENT_HOOK_RISK", "EARLY_PULL_RISK", "NON_TRADITIONAL_ROLE"]):
+            vol_adj -= 0.025
+        if "DEEP_LEASH_SUPPORT" in flags:
+            vol_adj += 0.012
+        vol_adj = _beta_cap(vol_adj, 0.88, 1.04)
+
+        beta_k = round(_beta_cap(float(beta_base) * vol_adj, 0.2, 15.0), 2)
+
+        line = _beta_k_line(row)
+        edge = None if line is None else round(beta_k - float(line), 2)
+
+        # #5: confidence penalty layer. This is separate from projection math.
+        conf = 50.0
+        if edge is not None:
+            conf += _beta_cap(abs(edge) * 11.5, 0, 22)
+        conf += _beta_cap((ip_conf - 50.0) * 0.42, -12, 15)
+        conf += _beta_cap((conv_score - 50.0) * 0.35, -10, 13)
+        conf -= _beta_cap((ip_vol - 50.0) * 0.45, -5, 18)
+        if any(f in flags for f in ["LOW_SAMPLE"]): conf -= 7
+        if any(f in flags for f in ["ROLE_RISK", "NON_TRADITIONAL_ROLE"]): conf -= 9
+        if any(f in flags for f in ["RECENT_HOOK_RISK", "EARLY_PULL_RISK"]): conf -= 8
+        if "DEEP_LEASH_SUPPORT" in flags: conf += 5
+        conf = round(_beta_cap(conf, 20, 92), 0)
+
+        decision, final_edge, reason = _beta_k_v5_decision(beta_k, line, conf, flags)
+        env_note = k_env.get("note", "—") if isinstance(k_env, dict) else "—"
+        env_pct = round(float(k_env.get("env_k", 0))*100, 1) if isinstance(k_env, dict) and k_env.get("env_k") is not None else "—"
+        return {
+            "Pitcher": _beta_first(row, ["pitcher", "Pitcher", "Player", "name"], "UNKNOWN"),
+            "Matchup": _beta_first(row, ["matchup", "Matchup"], ""),
+            "K Line": line if line is not None else "—",
+            "Current K PROJ": current_k if current_k is not None else "—",
+            "Beta K V5": beta_k,
+            "Beta K Edge": final_edge if final_edge is not None else "—",
+            "Beta K Decision": decision,
+            "Beta K Confidence": conf,
+            "Decision Reason": reason,
+            "Original IP": ip_info.get("Original IP"),
+            "Beta IP": ip_info.get("Beta IP"),
+            "Beta BF": ip_info.get("Beta BF"),
+            "IP Confidence": ip_info.get("Beta IP Confidence"),
+            "IP Volatility Score": ip_info.get("IP Volatility Score"),
+            "IP Volatility Label": ip_info.get("IP Volatility Label"),
+            "Volatility Projection Adj": round((vol_adj - 1.0) * 100, 1),
+            "K Conversion Score": conv_score,
+            "K Conversion Label": conv_label,
+            "K Env Blend %": env_pct,
+            "K Env Details": env_note,
+            "Beta Flags": ", ".join(sorted(set(flags))) if flags else "",
+            "Version": BETA_K_V5_VERSION,
+        }
+    except Exception as e:
+        return {"Pitcher": _beta_first(row, ["pitcher", "Pitcher"], "UNKNOWN"), "Error": str(e), "Version": BETA_K_V5_VERSION}
+
+def _beta_k_v5_rows(board):
+    rows = []
+    for p in board or []:
+        rows.append(_beta_k_v5_projection(p))
+    return pd.DataFrame(rows)
+
+def render_beta_k_v5_tab(board):
+    st.markdown('<div class="section-title-pro">⚾ K BETA V5 — Shared Workload Tester</div>', unsafe_allow_html=True)
+    st.caption("Tester only. Uses beta IP/BF + volatility + K conversion confidence. Production K PROJ / Upside is not overwritten.")
+    df = _beta_k_v5_rows(board)
+    if df.empty:
+        st.info("No beta K rows yet. Refresh the board first.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rows", len(df))
+    if "Beta K Confidence" in df.columns:
+        c2.metric("Avg Confidence", f"{pd.to_numeric(df['Beta K Confidence'], errors='coerce').mean():.0f}")
+    if "Beta K Decision" in df.columns:
+        playable = df[~df["Beta K Decision"].astype(str).str.contains("PASS|NO LINE", na=False)]
+        c3.metric("Playable Beta Leans", len(playable))
+    show_cols = [c for c in [
+        "Pitcher","Matchup","K Line","Current K PROJ","Beta K V5","Beta K Edge","Beta K Decision","Beta K Confidence","Decision Reason",
+        "Original IP","Beta IP","Beta BF","IP Confidence","IP Volatility Score","IP Volatility Label","Volatility Projection Adj",
+        "K Conversion Score","K Conversion Label","K Env Blend %","K Env Details","Beta Flags","Version"
+    ] if c in df.columns]
+    st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+    with st.expander("Full Beta K V5 Audit", expanded=False):
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+
+tab_kproj, tab_beta_k_v5, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
+    "⚾ K BETA V5",
     "🎯 OUTS BETA",
     "🧪 IP DEBUG BETA",
     "PITCHER FS",
@@ -29373,6 +29908,9 @@ tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_
 
 with tab_kproj:
     render_kproj_tab(board)
+
+with tab_beta_k_v5:
+    render_beta_k_v5_tab(board)
 
 with tab_beta_outs:
     render_beta_pitching_outs_tab(board)
