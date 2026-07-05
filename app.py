@@ -16,12 +16,12 @@ import unicodedata
 import html
 import hashlib
 import requests
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
-from pathlib import Path
 
 APP_VERSION = "ONE WAY PICKZ v11.17 VERIFIED LEARNING BUILD + ACTIVE MANAGER/RUN SUPPRESSION + STABLE PROJECTIONS + CARD + BASEBALL IQ FULL SYNC + FINAL SLATE COPY"
 # =========================
@@ -85,12 +85,6 @@ GRADED_FEATURES_FILE = os.path.join(STORAGE_DIR, "graded_feature_bank.json")
 SAVED_ODDS_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds.json")
 SAVED_ODDS_BACKUP_FILE = os.path.join(STORAGE_DIR, "saved_manual_market_odds_backup.json")
 SAVED_ODDS_LOCAL_FILE = "saved_manual_market_odds.json"
-
-# Pitching Outs tester/grade logs (kept isolated from K model and Pitching Outs math)
-OUTS_PICK_LOG = os.path.join(STORAGE_DIR, "pitching_outs_pick_log.json")
-OUTS_RESULT_LOG = os.path.join(STORAGE_DIR, "pitching_outs_result_log.json")
-PITCHING_OUTS_PICK_LOG = OUTS_PICK_LOG
-PITCHING_OUTS_RESULT_LOG = OUTS_RESULT_LOG
 GRADED_HISTORY_CSV_NAME = "graded_history.csv"
 GRADED_HISTORY_LOCAL_CANDIDATES = [
     os.path.join("learning_data", GRADED_HISTORY_CSV_NAME),
@@ -100,6 +94,22 @@ try:
     GRADED_HISTORY_LOCAL_CANDIDATES.append(os.path.join(os.path.dirname(__file__), "learning_data", GRADED_HISTORY_CSV_NAME))
 except Exception:
     pass
+
+# =========================
+# DURABLE OFFICIAL BOARD STORAGE
+# =========================
+# Date-stamped saved-board files prevent Streamlit/Railway restarts from wiping
+# the board you need to grade later. These are also backed up to GitHub.
+OFFICIAL_BOARD_LOCAL_DIR = os.path.join("learning_data", "official_boards")
+OFFICIAL_BOARD_LATEST_PATH = os.path.join(OFFICIAL_BOARD_LOCAL_DIR, "official_board_latest.json")
+
+def official_board_path_for_date(date_str):
+    safe = str(date_str or "unknown")[:10]
+    return os.path.join(OFFICIAL_BOARD_LOCAL_DIR, f"official_board_{safe}.json")
+
+def official_board_remote_path_for_date(date_str):
+    safe = str(date_str or "unknown")[:10]
+    return f"learning_data/official_boards/official_board_{safe}.json"
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
@@ -419,11 +429,147 @@ def load_json(path, default):
 
 def save_json(path, data):
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
     except Exception:
         pass
+
+def _date_from_pick_for_board(p):
+    if not isinstance(p, dict):
+        return None
+    d = str(p.get("date") or p.get("game_date") or "")[:10]
+    if d:
+        return d
+    gt = str(p.get("game_time") or p.get("gameDate") or "")[:10]
+    return gt or None
+
+def save_official_board_date_snapshots(picks, reason="save_official"):
+    """Save date-stamped official boards so Grade can recover after restarts.
+
+    Writes:
+    - learning_data/official_boards/official_board_YYYY-MM-DD.json
+    - learning_data/official_boards/official_board_latest.json
+    """
+    try:
+        os.makedirs(OFFICIAL_BOARD_LOCAL_DIR, exist_ok=True)
+        grouped = {}
+        for p in picks or []:
+            d = _date_from_pick_for_board(p)
+            if not d:
+                continue
+            grouped.setdefault(d, []).append(p)
+        written = []
+        for d, rows in grouped.items():
+            payload = {
+                "saved_at": now_iso(),
+                "reason": reason,
+                "date": d,
+                "row_count": len(rows),
+                "rows": rows,
+            }
+            path = official_board_path_for_date(d)
+            save_json(path, payload)
+            written.append(path)
+        latest_payload = {
+            "saved_at": now_iso(),
+            "reason": reason,
+            "dates": sorted(grouped.keys()),
+            "row_count": sum(len(v) for v in grouped.values()),
+            "rows": list(picks or []),
+        }
+        save_json(OFFICIAL_BOARD_LATEST_PATH, latest_payload)
+        return {"ok": True, "dates": sorted(grouped.keys()), "row_count": latest_payload["row_count"], "files": written}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:180], "dates": [], "row_count": 0, "files": []}
+
+def _read_official_board_payload_local(date_str):
+    try:
+        path = official_board_path_for_date(date_str)
+        payload = load_json(path, None)
+        if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+            return payload
+        if isinstance(payload, list):
+            return {"date": date_str, "rows": payload, "source": "local_list"}
+    except Exception:
+        pass
+    return None
+
+def _github_fetch_json_file(remote_path):
+    """Fetch JSON backup directly from GitHub if local/Railway disk is empty."""
+    try:
+        token, repo, branch = _github_backup_config()
+        if not token or not repo:
+            return None
+        import base64
+        headers = _github_backup_headers(token)
+        url = f"https://api.github.com/repos/{repo}/contents/{remote_path}"
+        r = requests.get(url, headers=headers, params={"ref": branch}, timeout=20)
+        if r.status_code != 200:
+            return None
+        j = r.json() or {}
+        content = j.get("content") or ""
+        if not content:
+            return None
+        raw = base64.b64decode(content.replace("\n", "")).decode("utf-8")
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def load_official_board_rows_for_dates(date_list):
+    """Load saved official board rows for selected date(s), local first, GitHub fallback second."""
+    rows = []
+    details = []
+    seen = set()
+    for d in date_list or []:
+        payload = _read_official_board_payload_local(d)
+        source = "local"
+        if payload is None:
+            payload = _github_fetch_json_file(official_board_remote_path_for_date(d))
+            source = "github"
+        date_rows = payload.get("rows", []) if isinstance(payload, dict) else []
+        if isinstance(date_rows, list) and date_rows:
+            details.append({"date": d, "source": source, "rows": len(date_rows)})
+            for p in date_rows:
+                if not isinstance(p, dict):
+                    continue
+                k = p.get("pick_id") or f"{_date_from_pick_for_board(p)}|{p.get('pitcher')}|{p.get('line')}|{p.get('pick_side')}"
+                if k in seen:
+                    continue
+                seen.add(k)
+                rows.append(p)
+        else:
+            details.append({"date": d, "source": "missing", "rows": 0})
+    return rows, details
+
+def ensure_pick_log_has_saved_official_boards(date_list):
+    """Hydrate PICK_LOG from date-stamped boards before display/grading.
+
+    This fixes the issue where Railway/session restarts clear st.session_state or local pick_log,
+    while the official board still exists in learning_data/official_boards or GitHub.
+    """
+    try:
+        picks = load_json(PICK_LOG, [])
+        existing_ids = set(p.get("pick_id") for p in picks if isinstance(p, dict) and p.get("pick_id"))
+        has_selected = any(_date_from_pick_for_board(p) in set(date_list or []) for p in picks if isinstance(p, dict))
+        loaded_rows, details = load_official_board_rows_for_dates(date_list)
+        added = 0
+        if loaded_rows:
+            for p in loaded_rows:
+                pid = p.get("pick_id")
+                if pid and pid in existing_ids:
+                    continue
+                picks.append(p)
+                if pid:
+                    existing_ids.add(pid)
+                added += 1
+            if added:
+                save_json(PICK_LOG, picks[-10000:])
+        return {"added": added, "had_selected": has_selected, "details": details, "rows_loaded": len(loaded_rows)}
+    except Exception as e:
+        return {"added": 0, "had_selected": False, "details": [], "rows_loaded": 0, "error": str(e)[:180]}
 
 # =========================
 # GITHUB BACKUP — SAFE AUTO PUSH AFTER SAVE/GRADE
@@ -572,6 +718,16 @@ def _github_backup_payload_files():
             b = _github_backup_file_bytes(csv_path)
             if b is not None:
                 files.append((f"learning_data/{csv_path.name}", b))
+    except Exception:
+        pass
+
+    # Back up date-stamped official boards and other JSON files under learning_data.
+    try:
+        for json_path in Path("learning_data").rglob("*.json"):
+            b = _github_backup_file_bytes(json_path)
+            if b is not None:
+                remote = str(json_path).replace(os.sep, "/")
+                files.append((remote, b))
     except Exception:
         pass
 
@@ -9345,6 +9501,7 @@ def save_many_once(new_picks):
     picks = load_json(PICK_LOG, [])
     ids = set([p.get("pick_id") for p in picks])
     added = 0
+    newly_saved = []
     for p in new_picks:
         if p.get("pick_id") not in ids:
             official = dict(p)
@@ -9359,10 +9516,22 @@ def save_many_once(new_picks):
             official["projection_drift_label"] = projection_drift_label(official.get("opening_projection"), official.get("final_projection"))
             official["official_quality_gate"] = "PASS" if official.get("data_score", 0) >= MIN_OFFICIAL_SAVE_SCORE else "LOW_DATA_REVIEW"
             picks.append(official)
+            newly_saved.append(official)
             log_long_backtest_row(official)
             ids.add(p.get("pick_id"))
             added += 1
     save_json(PICK_LOG, picks[-10000:])
+    # Durable board snapshot for grading after browser close / Railway restart / redeploy.
+    # Saves the full selected board by date even if every pick was already in PICK_LOG.
+    try:
+        snapshot_source = newly_saved if newly_saved else list(new_picks or [])
+        snap = save_official_board_date_snapshots(snapshot_source, reason="save_official_k_board")
+        try:
+            st.session_state["official_board_last_snapshot"] = snap
+        except Exception:
+            pass
+    except Exception:
+        pass
     try:
         github_backup_now('save_official_k_board')
     except Exception:
@@ -10061,6 +10230,12 @@ def grade_finished_games_with_diagnostics():
     Same grading flow as grade_finished_games(), but returns useful counts
     so the UI does not just show 0 with no explanation.
     """
+    # First recover date-stamped saved boards in case Railway restarted and PICK_LOG is empty.
+    try:
+        _hydrate_dates = globals().get("dates", [])
+        _hydrate_info = ensure_pick_log_has_saved_official_boards(_hydrate_dates)
+    except Exception:
+        _hydrate_info = {"added": 0, "details": []}
     before_picks = load_json(PICK_LOG, [])
     before_results = load_json(RESULT_LOG, [])
 
@@ -10085,6 +10260,8 @@ def grade_finished_games_with_diagnostics():
         "results_before": len(before_results),
         "results_after": len(after_results),
         "pick_log_path": PICK_LOG,
+        "board_recovery_added": _hydrate_info.get("added", 0) if isinstance(_hydrate_info, dict) else 0,
+        "board_recovery_details": _hydrate_info.get("details", []) if isinstance(_hydrate_info, dict) else [],
         "result_log_path": RESULT_LOG,
         "learning_lab_rows": len(after_results),
     }
@@ -10177,6 +10354,8 @@ def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False)
         "unmatched_pitchers": [],
         "missing_actual_k": [],
         "pick_log_path": PICK_LOG,
+        "board_recovery_added": _hydrate_info.get("added", 0) if isinstance(_hydrate_info, dict) else 0,
+        "board_recovery_details": _hydrate_info.get("details", []) if isinstance(_hydrate_info, dict) else [],
         "result_log_path": RESULT_LOG,
     }
     if manual_df is None or getattr(manual_df, "empty", True):
@@ -11367,6 +11546,14 @@ if st.session_state.get("loaded_picks"):
                 st.caption(f"Auto-loaded saved manual odds onto {count} card(s).")
         st.caption("Use Refresh first, enter odds, then Apply or Save Odds. Saved odds reload after app restart/close.")
 
+# Recover saved official boards for selected dates before display.
+# This prevents a Railway/session restart from making the Grade/Board pages look empty.
+try:
+    _board_recovery = ensure_pick_log_has_saved_official_boards(dates)
+    st.session_state["official_board_recovery"] = _board_recovery
+except Exception:
+    _board_recovery = {"added": 0, "details": []}
+
 saved = load_json(PICK_LOG, [])
 
 # IMPORTANT:
@@ -11390,6 +11577,15 @@ if only_strong:
 st.session_state.slate_quality_info = compute_slate_quality_score(board)
 
 st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('last_refresh_time') or 'Not refreshed this session'} | Last save added: {st.session_state.get('last_saved_count', 0)}")
+try:
+    _snap = st.session_state.get("official_board_last_snapshot")
+    if _snap and _snap.get("ok"):
+        st.success(f"✅ Durable official board snapshot saved: {_snap.get('row_count', 0)} rows | Dates: {', '.join(_snap.get('dates', []))}")
+    _rec = st.session_state.get("official_board_recovery")
+    if _rec and (_rec.get("added", 0) > 0 or _rec.get("rows_loaded", 0) > 0):
+        st.caption(f"Official board recovery active: loaded {_rec.get('rows_loaded', 0)} row(s), added {_rec.get('added', 0)} to pick log.")
+except Exception:
+    pass
 
 render_kpis(board, bankroll)
 render_slate_quality_score(board)
@@ -12939,275 +13135,6 @@ def _short_lineup_source(row):
     return "—"
 
 
-
-# =========================
-# K UPSIDE TESTER — READ-ONLY FILTER/RANKING LAYER
-# Version: K_UPSIDE_TESTER_2026_07_04
-#
-# Purpose:
-# - Improve K selection quality without changing the baseline K projection.
-# - Leaves Pitching Outs, Moneyline, Fantasy Score, grading math, and raw K model untouched.
-# - Adds tester-only scores/labels to Projection Board and copy/paste tester slate.
-# =========================
-def _kut_num(*vals, default=None):
-    for v in vals:
-        x = safe_float(v, None)
-        if x is not None:
-            return x
-    return default
-
-def _kut_pct100(v, default=None):
-    x = safe_float(v, None)
-    if x is None:
-        return default
-    if abs(x) <= 1.0:
-        x *= 100.0
-    return x
-
-def _kut_line_difficulty(line):
-    ln = safe_float(line, None)
-    if ln is None:
-        return 55, "NO LINE"
-    if ln <= 3.5:
-        return 88, "Easy"
-    if ln <= 4.5:
-        return 78, "Normal"
-    if ln <= 5.5:
-        return 67, "Moderate"
-    if ln <= 6.5:
-        return 56, "Hard"
-    if ln <= 7.5:
-        return 45, "Very Hard"
-    return 36, "Extreme"
-
-def k_upside_tester_metrics(p, d=None, dist=None):
-    """Tester-only K Upside quality score.
-
-    This does not change the model projection. It scores how trustworthy the K play is
-    using strikeout conversion, contact suppression, volatility, BF/IP ceiling,
-    historical line difficulty, role/leash, and learning confidence.
-    """
-    try:
-        p = p or {}
-        d = d or {}
-        dist = dist or {}
-
-        proj = _kut_num(d.get("projection"), p.get("projection"), p.get("k_projection"), default=None)
-        line = _kut_num(d.get("line"), p.get("line"), p.get("underdog_line"), default=None)
-        bf = _kut_num(p.get("expected_bf"), p.get("Exp BF"), p.get("bf"), default=DEFAULT_BF)
-        ip = _kut_num(d.get("ip_floor"), p.get("expected_ip"), p.get("ip_projection"), default=None)
-
-        edge = None
-        if proj is not None and line is not None:
-            edge = proj - line
-        abs_edge = abs(edge) if edge is not None else 0.0
-        side = str(d.get("lean_side") or d.get("decision") or "").upper()
-        if "UNDER" in side:
-            pick_side = "UNDER"
-        elif "OVER" in side:
-            pick_side = "OVER"
-        elif edge is not None:
-            pick_side = "OVER" if edge >= 0 else "UNDER"
-        else:
-            pick_side = "NO LINE"
-
-        pitcher_k_pct = _kut_pct100(p.get("pitcher_k"), default=None)
-        opp_k_pct = _kut_pct100(p.get("opp_k"), default=None)
-        csw = _kut_pct100(p.get("statcast_csw"), default=None)
-        whiff = _kut_pct100(p.get("statcast_whiff"), default=None)
-        putaway = _kut_pct100(p.get("putaway_rate"), p.get("putaway"), default=None)
-        fstrike = _kut_pct100(p.get("first_strike_pct"), default=None)
-
-        # 1) Strikeout Conversion Score
-        conv_parts = []
-        if csw is not None:
-            conv_parts.append(clamp((csw - 24.0) / 10.0, 0, 1) * 34)
-        if whiff is not None:
-            conv_parts.append(clamp((whiff - 9.0) / 8.0, 0, 1) * 28)
-        if putaway is not None:
-            conv_parts.append(clamp((putaway - 17.0) / 10.0, 0, 1) * 20)
-        if pitcher_k_pct is not None:
-            conv_parts.append(clamp((pitcher_k_pct - 18.0) / 14.0, 0, 1) * 18)
-        if fstrike is not None:
-            conv_parts.append(clamp((fstrike - 56.0) / 12.0, 0, 1) * 8)
-        if conv_parts:
-            conversion = clamp(48 + sum(conv_parts), 35, 100)
-        else:
-            conversion = clamp(50 + ((safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K) - LEAGUE_AVG_K) * 180, 35, 88)
-
-        # 2) Contact Suppression Rating: higher = more dangerous for K overs.
-        opp_contact_proxy = None
-        for key in ["opp_contact_pct", "team_contact_pct", "zone_contact_pct", "contact_pct", "lineup_contact_pct"]:
-            if p.get(key) is not None:
-                opp_contact_proxy = _kut_pct100(p.get(key), default=None)
-                break
-        if opp_contact_proxy is not None:
-            contact_risk = clamp((opp_contact_proxy - 72.0) / 12.0, 0, 1) * 100
-        else:
-            # Use opponent K% inverse as fallback.
-            ok = opp_k_pct if opp_k_pct is not None else LEAGUE_AVG_K * 100
-            contact_risk = clamp((24.0 - ok) / 7.0, 0, 1) * 100
-        if contact_risk >= 67:
-            contact_label = "High Contact Tax"
-        elif contact_risk >= 38:
-            contact_label = "Medium Contact Tax"
-        else:
-            contact_label = "Low Contact Tax"
-        contact_score = 100 - contact_risk
-
-        # 3) Volatility Tax
-        vol_label = str(dist.get("volatility") or p.get("volatility") or "").lower()
-        p10 = _kut_num(dist.get("floor"), p.get("p10"), default=None)
-        p90 = _kut_num(dist.get("ceiling"), p.get("p90"), default=None)
-        sim_range = None if p10 is None or p90 is None else max(0, p90 - p10)
-        vol_tax = 0
-        if "high" in vol_label:
-            vol_tax += 18
-        elif "medium" in vol_label or "med" in vol_label:
-            vol_tax += 9
-        if sim_range is not None:
-            vol_tax += clamp((sim_range - 3.0) / 3.0, 0, 1) * 15
-        starter_score = _kut_num(d.get("starter_score"), p.get("starter_score"), default=85)
-        role_score = _kut_num(d.get("role_score"), p.get("role_score"), p.get("reliability_score"), default=85)
-        if starter_score < 75:
-            vol_tax += 10
-        if role_score < 80:
-            vol_tax += 8
-        vol_tax = clamp(vol_tax, 0, 35)
-        volatility_score = 100 - vol_tax
-
-        # 4) Smarter BF/IP ceiling
-        over_needed = int(math.floor(line) + 1) if line is not None else None
-        if over_needed is not None and bf:
-            needed_k_rate = over_needed / max(1.0, bf)
-            ceiling_penalty = clamp((needed_k_rate - 0.285) / 0.115, 0, 1) * 28
-        else:
-            ceiling_penalty = 10
-        if ip is not None and over_needed is not None and over_needed >= 7 and ip < 5.2:
-            ceiling_penalty += 10
-        bf_ceiling_score = clamp(100 - ceiling_penalty, 35, 100)
-        bf_ceiling_label = "PASS" if bf_ceiling_score >= 72 else "THIN" if bf_ceiling_score >= 58 else "FAIL"
-
-        # 5) Historical Line Difficulty
-        line_score, line_label = _kut_line_difficulty(line)
-
-        # 6) Projection Edge / Simulation / Learning confidence
-        edge_score = clamp((abs_edge / 1.35) * 100, 0, 100)
-        conf = _kut_pct100(d.get("confidence"), default=None)
-        hit_rate = _kut_pct100(d.get("hit_rate"), default=None)
-        sim_prob = _kut_num(dist.get("over_prob") if pick_side == "OVER" else dist.get("under_prob"), default=None)
-        sim_pct = None if sim_prob is None else sim_prob * 100
-        prob_score = _kut_num(hit_rate, sim_pct, conf, default=55)
-        learning_score = _kut_num(p.get("learning_confidence"), p.get("reliability_score"), p.get("decision_integrity_score"), default=75)
-
-        sos = (
-            edge_score * 0.40 +
-            clamp((bf - 18.0) / 8.0, 0, 1) * 100 * 0.20 +
-            conversion * 0.15 +
-            contact_score * 0.10 +
-            role_score * 0.07 +
-            learning_score * 0.04 +
-            line_score * 0.04
-        )
-        # confidence-level taxes only; raw projection remains unchanged.
-        sos -= vol_tax * 0.40
-        sos -= max(0, 65 - bf_ceiling_score) * 0.35
-        if abs_edge < 0.50:
-            sos -= 8
-        if pick_side == "OVER" and contact_risk >= 67:
-            sos -= 7
-        if pick_side == "OVER" and line is not None and line >= 6.5 and abs_edge < 1.10:
-            sos -= 6
-        if prob_score is not None and prob_score < 58:
-            sos -= 5
-
-        sos = round(clamp(sos, 0, 100), 1)
-        if sos >= 92:
-            tester_grade = "🔥 ELITE"
-        elif sos >= 86:
-            tester_grade = "✅ STRONG"
-        elif sos >= 78:
-            tester_grade = "⚠️ LEAN"
-        elif sos >= 68:
-            tester_grade = "👀 TRACK"
-        else:
-            tester_grade = "PASS"
-
-        notes = []
-        if abs_edge < 0.50:
-            notes.append("thin edge")
-        if pick_side == "OVER" and contact_risk >= 67:
-            notes.append("high-contact lineup tax")
-        if vol_tax >= 18:
-            notes.append("high volatility")
-        if bf_ceiling_score < 58:
-            notes.append("BF/IP ceiling concern")
-        if line is not None and line >= 6.5:
-            notes.append(f"{line_label} line")
-        if conversion < 62:
-            notes.append("weak K conversion")
-        tester_note = "; ".join(notes) if notes else "clean tester profile"
-
-        return {
-            "K Tester SOS": sos,
-            "K Tester Grade": tester_grade,
-            "Strikeout Conversion": round(conversion, 1),
-            "Contact Suppression": contact_label,
-            "Contact Score": round(contact_score, 1),
-            "Volatility Tax": round(vol_tax, 1),
-            "BF/IP Ceiling": bf_ceiling_label,
-            "BF/IP Ceiling Score": round(bf_ceiling_score, 1),
-            "Line Difficulty": line_label,
-            "Tester Note": tester_note,
-        }
-    except Exception as e:
-        return {
-            "K Tester SOS": None,
-            "K Tester Grade": "TEST ERROR",
-            "Strikeout Conversion": None,
-            "Contact Suppression": "Unknown",
-            "Contact Score": None,
-            "Volatility Tax": None,
-            "BF/IP Ceiling": "Unknown",
-            "BF/IP Ceiling Score": None,
-            "Line Difficulty": "Unknown",
-            "Tester Note": str(e)[:140],
-        }
-
-def build_k_upside_tester_slate(df, min_sos=78):
-    """Copy/paste tester slate sorted by SOS. Tester only; does not affect official grade."""
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return ""
-        d = df.copy()
-        if "Line Source" in d.columns:
-            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
-        if "UD/Line" in d.columns:
-            d = d[~d["UD/Line"].astype(str).str.upper().isin(["NO LINE", "NO_UD_LINE", "", "NAN"])]
-        if "K Tester SOS" not in d.columns:
-            return ""
-        d["__sos"] = pd.to_numeric(d["K Tester SOS"], errors="coerce")
-        d = d[d["__sos"].fillna(0) >= float(min_sos)].sort_values("__sos", ascending=False)
-        if d.empty:
-            return ""
-        lines = []
-        for matchup, g in d.groupby("Matchup", sort=False):
-            lines.append(str(matchup))
-            for _, r in g.iterrows():
-                dec = str(r.get("Decision") or "")
-                side = "O" if "OVER" in dec.upper() else "U" if "UNDER" in dec.upper() else str(r.get("Model Lean") or "")
-                proj = safe_float(r.get("K PROJ"), None)
-                line = safe_float(r.get("UD/Line"), None)
-                ip = safe_float(r.get("IP Floor"), None)
-                sos = safe_float(r.get("K Tester SOS"), None)
-                grade = str(r.get("K Tester Grade") or "")
-                note = str(r.get("Tester Note") or "")
-                lines.append(f"• {r.get('Pitcher')} — {grade} {side} {line:g} — {proj:.2f} K — IP {ip:.2f} — SOS {sos:.1f} ({note})" if proj is not None and line is not None and ip is not None and sos is not None else f"• {r.get('Pitcher')} — {grade} {side} — SOS {sos}")
-            lines.append("")
-        return "\n".join(lines).strip()
-    except Exception as e:
-        return f"K Upside Tester slate unavailable: {e}"
-
 def normalize_official_kproj_columns(df):
     """Display/export normalization only.
 
@@ -13252,7 +13179,6 @@ def build_kproj_table(board):
     for p in board or []:
         d = kproj_decision(p)
         dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
-        tester = k_upside_tester_metrics(p, d, dist) if 'k_upside_tester_metrics' in globals() else {}
         tier3 = build_decision_tier_3_0(p, d)
         p = _sync_market_with_card_decision(p, d) if '_sync_market_with_card_decision' in globals() else p
         rows.append({
@@ -13309,16 +13235,6 @@ def build_kproj_table(board):
             "IP Floor": d.get("ip_floor"),
             "Edge Gap": d.get("edge_gap"),
             "Main Engine Action": p.get("bet_action"),
-            "K Tester SOS": tester.get("K Tester SOS"),
-            "K Tester Grade": tester.get("K Tester Grade"),
-            "Strikeout Conversion": tester.get("Strikeout Conversion"),
-            "Contact Suppression": tester.get("Contact Suppression"),
-            "Contact Score": tester.get("Contact Score"),
-            "Volatility Tax": tester.get("Volatility Tax"),
-            "BF/IP Ceiling": tester.get("BF/IP Ceiling"),
-            "BF/IP Ceiling Score": tester.get("BF/IP Ceiling Score"),
-            "Line Difficulty": tester.get("Line Difficulty"),
-            "Tester Note": tester.get("Tester Note"),
         })
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -13523,28 +13439,6 @@ def render_kproj_tab(board):
 
     st.subheader("Projection Board")
     st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.subheader("🧪 K Upside Tester — Read-Only Ranking")
-    st.caption("Tester layer only: it does not change the baseline K projection, official grade, Pitching Outs, Moneyline, Fantasy Score, or learning math.")
-    if "K Tester SOS" in df.columns:
-        tester_cols = [
-            "Pitcher", "Matchup", "UD/Line", "K PROJ", "Decision",
-            "K Tester SOS", "K Tester Grade", "Strikeout Conversion",
-            "Contact Suppression", "Volatility Tax", "BF/IP Ceiling",
-            "Line Difficulty", "Tester Note"
-        ]
-        tester_cols = [c for c in tester_cols if c in df.columns]
-        tester_df = df[tester_cols].copy()
-        if "K Tester SOS" in tester_df.columns:
-            tester_df["K Tester SOS"] = pd.to_numeric(tester_df["K Tester SOS"], errors="coerce")
-            tester_df = tester_df.sort_values("K Tester SOS", ascending=False)
-        st.dataframe(tester_df, use_container_width=True, hide_index=True)
-        tester_slate = build_k_upside_tester_slate(df, min_sos=78) if 'build_k_upside_tester_slate' in globals() else ""
-        if tester_slate:
-            st.text_area("K Upside Tester slate (SOS 78+)", tester_slate, height=300)
-            st.download_button("Download K Upside Tester slate .txt", tester_slate, file_name="one_way_pickz_k_upside_tester_slate.txt", mime="text/plain")
-    else:
-        st.info("K Upside Tester columns did not build yet.")
 
     st.subheader("Copy/Paste Slate — Best Final Line-Aware Smart Picks")
     st.caption("Underdog only. Uses Line-Aware Smart Final K Projection + Line-Aware Smart Decision + Line-Aware Smart Edge. 🔥 = edge 1.00+ | ⚠️ = edge under 0.65. PASS/NO LINE rows are hidden here.")
@@ -29246,208 +29140,6 @@ def build_better_miss_reason_analytics(results):
     out["Loss Rate %"] = ((out["Losses"] / out["Plays"].replace(0, 1)) * 100).round(1)
     return out.sort_values(["Losses", "Plays"], ascending=False)
 
-
-# =========================
-# PITCHING OUTS GRADING CHECKER — ISOLATED FROM K MODEL
-# Version: PITCHING_OUTS_GRADE_CHECK_2026_07_04
-# =========================
-def _po_actual_outs_from_ip(ip_val):
-    try:
-        if ip_val is None or str(ip_val).strip() == "":
-            return None
-        s = str(ip_val).strip().replace("IP", "").replace("-", "")
-        if "." not in s:
-            return int(float(s) * 3)
-        whole, frac = s.split(".", 1)
-        whole_i = int(float(whole))
-        outs = int(str(frac)[0]) if str(frac) else 0
-        if outs not in [0, 1, 2]:
-            return int(round(float(s) * 3))
-        return whole_i * 3 + outs
-    except Exception:
-        return None
-
-def _po_result_for_side(side, line, actual_outs):
-    side_u = str(side or "").upper()
-    ln = safe_float(line, None)
-    ao = safe_float(actual_outs, None)
-    if ln is None or ao is None:
-        return None
-    if "UNDER" in side_u or side_u == "U":
-        return "WIN" if ao < ln else "LOSS"
-    if "OVER" in side_u or side_u == "O":
-        return "WIN" if ao > ln else "LOSS"
-    return None
-
-def _po_parse_manual_text(text_value):
-    rows = []
-    try:
-        for raw in str(text_value or "").splitlines():
-            line = raw.strip()
-            if not line or "—" not in line:
-                continue
-            clean = line.replace("*", "").replace("✅", "").replace("❌", "").replace("•", "").strip()
-            parts = [x.strip() for x in clean.split("—")]
-            if len(parts) < 3:
-                continue
-            name = parts[0]
-            side_line = parts[1].split()
-            side = side_line[0] if side_line else ""
-            prop_line = None
-            for tok in side_line:
-                if safe_float(tok, None) is not None:
-                    prop_line = safe_float(tok, None)
-                    break
-            actual_ip = None
-            # Use last trailing -5.2 / -IP5.2 style actual marker
-            m = re.search(r'(?:IP)?\s*([0-9]+(?:\.[0-2])?)\s*$', line.replace(" ", ""))
-            if m:
-                actual_ip = m.group(1)
-            actual_outs = _po_actual_outs_from_ip(actual_ip)
-            if name and prop_line is not None and actual_outs is not None:
-                rows.append({"Pitcher": name, "Side": side, "Line": prop_line, "Actual IP": actual_ip, "Actual Outs": actual_outs})
-    except Exception:
-        pass
-    return pd.DataFrame(rows)
-
-def grade_pitching_outs_from_manual_dataframe(manual_df, allow_overwrite=False):
-    diag = {
-        "input_rows": 0,
-        "graded": 0,
-        "wins": 0,
-        "losses": 0,
-        "pick_log_path": OUTS_PICK_LOG,
-        "result_log_path": OUTS_RESULT_LOG,
-        "message": "",
-    }
-    try:
-        if manual_df is None or not isinstance(manual_df, pd.DataFrame) or manual_df.empty:
-            diag["message"] = "No Pitching Outs manual rows found."
-            return diag
-        df = manual_df.copy()
-        diag["input_rows"] = len(df)
-
-        def col_find(names):
-            for c in df.columns:
-                if str(c).strip().lower() in [n.lower() for n in names]:
-                    return c
-            return None
-
-        c_pitcher = col_find(["Pitcher", "Player", "Name"])
-        c_side = col_find(["Side", "Pick", "Decision", "O/U"])
-        c_line = col_find(["Line", "Outs Line", "UD/Line"])
-        c_actual_outs = col_find(["Actual Outs", "Outs", "Actual PO"])
-        c_actual_ip = col_find(["Actual IP", "IP"])
-
-        if not c_pitcher or not c_line or not c_side:
-            diag["message"] = "Need Pitcher, Side/Pick, and Line columns for Pitching Outs grading."
-            return diag
-
-        existing = load_json(OUTS_RESULT_LOG, [])
-        if not isinstance(existing, list):
-            existing = []
-        existing_keys = set()
-        for r in existing:
-            key = (normalize_name(r.get("pitcher")), str(r.get("date") or ""), str(r.get("side") or ""), str(r.get("line") or ""))
-            existing_keys.add(key)
-
-        today = california_now().strftime("%Y-%m-%d")
-        new_rows = []
-        for _, r in df.iterrows():
-            pitcher = str(r.get(c_pitcher) or "").strip()
-            side_raw = str(r.get(c_side) or "").strip().upper()
-            side = "UNDER" if "U" == side_raw or "UNDER" in side_raw else "OVER" if "O" == side_raw or "OVER" in side_raw else side_raw
-            line_val = safe_float(r.get(c_line), None)
-            actual_outs = safe_float(r.get(c_actual_outs), None) if c_actual_outs else None
-            actual_ip = r.get(c_actual_ip) if c_actual_ip else None
-            if actual_outs is None and actual_ip is not None:
-                actual_outs = _po_actual_outs_from_ip(actual_ip)
-            if not pitcher or line_val is None or actual_outs is None:
-                continue
-            result = _po_result_for_side(side, line_val, actual_outs)
-            if result not in ["WIN", "LOSS"]:
-                continue
-            key = (normalize_name(pitcher), today, side, str(line_val))
-            if key in existing_keys and not allow_overwrite:
-                continue
-            row = {
-                "date": today,
-                "pitcher": pitcher,
-                "side": side,
-                "line": float(line_val),
-                "actual_ip": str(actual_ip) if actual_ip is not None else "",
-                "actual_outs": int(actual_outs),
-                "graded_result": result,
-                "win": result == "WIN",
-                "graded_at": now_iso(),
-                "source": "manual_pitching_outs_grade_checker",
-            }
-            new_rows.append(row)
-            existing_keys.add(key)
-
-        existing.extend(new_rows)
-        save_json(OUTS_RESULT_LOG, existing[-20000:])
-        diag["graded"] = len(new_rows)
-        diag["wins"] = sum(1 for r in new_rows if r.get("graded_result") == "WIN")
-        diag["losses"] = sum(1 for r in new_rows if r.get("graded_result") == "LOSS")
-        if len(new_rows) > 0:
-            try:
-                github_backup_now("pitching_outs_manual_grade")
-            except Exception:
-                pass
-        diag["message"] = f"Pitching Outs manual grading complete: {diag['wins']}-{diag['losses']}."
-        return diag
-    except Exception as e:
-        diag["message"] = f"Pitching Outs grading error: {e}"
-        return diag
-
-def render_pitching_outs_grading_check_ui():
-    st.markdown('<div class="section-title-pro">Pitching Outs Grade Check</div>', unsafe_allow_html=True)
-    st.caption("Isolated checker. This does not touch K projections or Pitching Outs math. It verifies/saves Pitching Outs grading to pitching_outs_result_log.json and backs it up to GitHub.")
-    picks = load_json(OUTS_PICK_LOG, [])
-    results = load_json(OUTS_RESULT_LOG, [])
-    if not isinstance(picks, list):
-        picks = []
-    if not isinstance(results, list):
-        results = []
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Saved PO Snapshots", len(picks))
-    finished = [r for r in results if r.get("graded_result") in ["WIN", "LOSS"]]
-    c2.metric("PO Graded Rows", len(finished))
-    if finished:
-        c3.metric("PO Win Rate", f"{sum(1 for r in finished if r.get('graded_result') == 'WIN')/len(finished)*100:.1f}%")
-    else:
-        c3.metric("PO Win Rate", "N/A")
-
-    st.code("Pitcher,Side,Line,Actual IP\nLogan Gilbert,U,19.5,6.1\nYoshinobu Yamamoto,O,18.5,7.0", language="csv")
-    po_file = st.file_uploader("Upload Pitching Outs actual results CSV", type=["csv"], key="po_manual_actual_results_csv")
-    po_text = st.text_area("Or paste Pitching Outs actual results / slate notes", height=120, key="po_manual_actual_results_text")
-    po_overwrite = st.checkbox("Allow overwrite of already graded Pitching Outs rows", value=False, key="po_manual_grade_overwrite")
-    po_df = pd.DataFrame()
-    try:
-        if po_file is not None:
-            po_df = pd.read_csv(po_file)
-        elif po_text.strip():
-            from io import StringIO
-            try:
-                po_df = pd.read_csv(StringIO(po_text.strip()))
-            except Exception:
-                po_df = _po_parse_manual_text(po_text)
-    except Exception as e:
-        st.warning(f"Pitching Outs manual parse error: {e}")
-    if isinstance(po_df, pd.DataFrame) and not po_df.empty:
-        st.write({"Pitching Outs manual rows detected": len(po_df), "Columns": list(po_df.columns)})
-        st.dataframe(po_df.head(50), use_container_width=True, hide_index=True)
-    if st.button("🧾 GRADE PITCHING OUTS FROM MANUAL RESULTS", use_container_width=True):
-        diag_po = grade_pitching_outs_from_manual_dataframe(po_df, allow_overwrite=po_overwrite)
-        if diag_po.get("graded", 0) > 0:
-            st.success(diag_po.get("message"))
-        else:
-            st.warning(diag_po.get("message"))
-        st.write(diag_po)
-    if finished:
-        st.dataframe(pd.DataFrame(results).tail(200), use_container_width=True, hide_index=True)
-
 with tab5:
     st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
     if st.button("✅ AFTER GAMES — Grade Results + Update Learning", use_container_width=True):
@@ -29466,6 +29158,8 @@ with tab5:
             "Missing game_pk or pitcher_id": diag.get("missing_game_or_pitcher_id"),
             "Results before": diag.get("results_before"),
             "Results after": diag.get("results_after"),
+            "Recovered board rows before grading": diag.get("board_recovery_added"),
+            "Board recovery details": diag.get("board_recovery_details"),
         })
         st.caption(f"PICK_LOG: {diag.get('pick_log_path')}")
         st.caption(f"RESULT_LOG: {diag.get('result_log_path')}")
