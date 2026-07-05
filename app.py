@@ -10345,6 +10345,15 @@ def grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False)
     saved official before-game snapshots and write the same RESULT_LOG learning rows as
     the automatic MLB boxscore grader. This makes Learning Lab read real graded outcomes.
     """
+    # Railway-safe manual grading fix:
+    # Recover date-stamped official boards before manual matching, and always define
+    # _hydrate_info so the diagnostics block cannot crash with NameError.
+    try:
+        _hydrate_dates = globals().get("dates", [])
+        _hydrate_info = ensure_pick_log_has_saved_official_boards(_hydrate_dates)
+    except Exception:
+        _hydrate_info = {"added": 0, "details": []}
+
     diag = {
         "status": "NO_DATA",
         "manual_rows": 0,
