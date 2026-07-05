@@ -12059,6 +12059,306 @@ def kproj_sim_hit_rate(proj, line, side, p):
         return dist.get("under_prob")
     return 0.50
 
+
+
+# ============================================================
+# K UPSIDE TESTER LAYER — K MODEL ONLY
+# Adds evaluation/ranking metrics for the K PROJ / UPSIDE tab only.
+# Does NOT touch Pitching Outs, Pitcher FS, Moneyline, grading, learning,
+# saved boards, GitHub backup, or any non-K module.
+# ============================================================
+K_UPSIDE_TESTER_VERSION = "K_UPSIDE_TESTER_SOS_2026_07_RAILWAY_SAFE"
+
+def _kut_num(x, default=None):
+    try:
+        if x is None or str(x).strip() in ["", "—", "None", "nan"]:
+            return default
+        v = float(str(x).replace("%", "").replace(",", "").strip())
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _kut_rate(x, default=None):
+    v = _kut_num(x, None)
+    if v is None:
+        return default
+    if abs(v) > 1.0:
+        v = v / 100.0
+    return float(clamp(v, 0.0, 1.0))
+
+def _kut_first_rate(p, keys, default=None):
+    for k in keys:
+        v = _kut_rate((p or {}).get(k), None)
+        if v is not None:
+            return v
+    return default
+
+def _kut_lineup_contact_context(p):
+    """Return lineup K/contact context from batter rows when available.
+
+    A higher contact risk lowers OVER confidence. This only feeds K tester scores.
+    """
+    rows = (p or {}).get("lineup_rows") or []
+    vals = []
+    for r in rows[:9] if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        k_val = None
+        for key in ["Used K%", "K%", "Raw_K_Rate", "K Rate", "K_Pct", "SO%"]:
+            if r.get(key) is not None:
+                k_val = _kut_rate(r.get(key), None)
+                break
+        if k_val is not None:
+            vals.append(k_val)
+    if vals:
+        avg_k = float(np.mean(vals))
+        low_k_bats = int(sum(1 for v in vals if v <= 0.17))
+        high_k_bats = int(sum(1 for v in vals if v >= 0.255))
+        return {"available": True, "avg_k": avg_k, "low_k_bats": low_k_bats, "high_k_bats": high_k_bats, "sample": len(vals)}
+    ok = _kut_rate((p or {}).get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    return {"available": False, "avg_k": ok, "low_k_bats": None, "high_k_bats": None, "sample": 0}
+
+def k_upside_strikeout_conversion_score(p):
+    """0-100 score: are projected batters likely to convert into strikeouts?"""
+    p = p or {}
+    pk = _kut_rate(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = _kut_rate(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    csw = _kut_first_rate(p, ["statcast_csw", "csw_pct", "CSW%", "CSW"], None)
+    whiff = _kut_first_rate(p, ["statcast_whiff", "whiff_pct", "putaway_whiff", "Putaway/Whiff", "whiff"], None)
+    putaway = _kut_first_rate(p, ["putaway_pct", "putaway", "putaway_rate"], None)
+    lineup = _kut_lineup_contact_context(p)
+    lineup_k = lineup.get("avg_k") or ok
+
+    score = 50.0
+    # Pitcher true K ability.
+    score += clamp((pk - 0.215) * 170.0, -18, 22)
+    # Opponent / lineup strikeout tendency.
+    score += clamp((lineup_k - 0.215) * 145.0, -18, 20)
+    # Quality of strike generation and finish ability.
+    if csw is not None:
+        score += clamp((csw - 0.285) * 130.0, -10, 14)
+    if whiff is not None:
+        score += clamp((whiff - 0.255) * 115.0, -10, 14)
+    if putaway is not None:
+        score += clamp((putaway - 0.205) * 80.0, -6, 8)
+    # Contact-heavy lineups make raw K projection less trustworthy.
+    if lineup.get("low_k_bats") is not None:
+        score -= min(10, max(0, lineup.get("low_k_bats", 0) - 2) * 2.0)
+        score += min(8, max(0, lineup.get("high_k_bats", 0) - 2) * 1.5)
+    label = "ELITE" if score >= 85 else "GOOD" if score >= 72 else "AVG" if score >= 58 else "WEAK"
+    note = f"pk {pk*100:.1f}% | opp/lineup {lineup_k*100:.1f}%"
+    if csw is not None:
+        note += f" | CSW {csw*100:.1f}%"
+    if whiff is not None:
+        note += f" | whiff {whiff*100:.1f}%"
+    return {"score": int(clamp(round(score), 0, 100)), "label": label, "note": note}
+
+def k_upside_contact_suppression_rating(p):
+    """0-100 score where higher = better for K overs; label describes contact risk."""
+    p = p or {}
+    ok = _kut_rate(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    lineup = _kut_lineup_contact_context(p)
+    lineup_k = lineup.get("avg_k") or ok
+    # Direct contact fields if available. Higher contact = worse for K overs.
+    zone_contact = _kut_first_rate(p, ["opp_zone_contact", "zone_contact", "Zone Contact%", "zone_contact_pct"], None)
+    contact = _kut_first_rate(p, ["opp_contact", "contact_rate", "Contact%", "contact_pct"], None)
+    foul = _kut_first_rate(p, ["foul_rate", "opp_foul_rate", "Foul%"], None)
+
+    score = 65.0 + clamp((lineup_k - 0.215) * 180.0, -30, 25)
+    if zone_contact is not None:
+        score -= clamp((zone_contact - 0.835) * 95.0, -8, 14)
+    if contact is not None:
+        score -= clamp((contact - 0.765) * 90.0, -8, 14)
+    if foul is not None:
+        score -= clamp((foul - 0.270) * 45.0, -4, 7)
+    if lineup.get("low_k_bats") is not None:
+        score -= min(14, max(0, lineup.get("low_k_bats", 0) - 2) * 2.8)
+    risk = "LOW" if score >= 75 else "MEDIUM" if score >= 58 else "HIGH"
+    note = f"contact risk {risk} | lineup K {lineup_k*100:.1f}%"
+    if lineup.get("sample"):
+        note += f" | low-K bats {lineup.get('low_k_bats')}"
+    return {"score": int(clamp(round(score), 0, 100)), "risk": risk, "note": note}
+
+def k_upside_volatility_tax(p, dist=None):
+    """Penalty points. Higher = less trust in K official status."""
+    p = p or {}
+    if dist is None:
+        dist = {}
+    vol = _kut_num(dist.get("volatility"), _kut_num(p.get("volatility"), 1.2)) or 1.2
+    role_score, _, _ = kproj_role_stability_score(p)
+    starter_score, _ = kproj_starter_confirmation_score(p)
+    ip_floor = kproj_probable_innings_floor(p)
+    exp_label = str(p.get("pitcher_experience_label") or p.get("experience_label") or "").upper()
+    tax = 0.0
+    tax += clamp((vol - 1.25) * 8.0, 0, 12)
+    tax += clamp((64 - role_score) * 0.18, 0, 9)
+    tax += clamp((62 - starter_score) * 0.15, 0, 7)
+    if ip_floor is not None and ip_floor < 4.3:
+        tax += clamp((4.3 - ip_floor) * 3.0, 0, 8)
+    if any(x in exp_label for x in ["ROOKIE", "UNKNOWN", "LOW SAMPLE"]):
+        tax += 4.0
+    rd = str(p.get("run_damage_risk_level") or "").upper()
+    if rd == "EXTREME":
+        tax += 6.0
+    elif rd == "HIGH":
+        tax += 3.0
+    label = "LOW" if tax < 6 else "MEDIUM" if tax < 14 else "HIGH"
+    return {"tax": round(float(clamp(tax, 0, 30)), 1), "label": label, "note": f"vol {vol:.2f} | role {role_score} | starter {starter_score} | IP floor {ip_floor}"}
+
+def k_upside_bf_ip_ceiling_check(p, line=None, proj=None):
+    """Checks if BF/IP opportunity realistically supports the K line/projection."""
+    p = p or {}
+    bf = _kut_num(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    ip_floor = kproj_probable_innings_floor(p)
+    pk = _kut_rate(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = _kut_rate(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    line = _kut_num(line, None)
+    proj = _kut_num(proj, None)
+    needed = required_ks_for_over(line) if line is not None else None
+    # Realistic upper conversion for a normal starter slate. Elite arms can stretch it a little.
+    ceiling_rate = clamp((pk * 0.62) + (ok * 0.28) + 0.035, 0.22, 0.42)
+    max_supported_k = bf * ceiling_rate
+    score = 82.0
+    if needed is not None:
+        margin = max_supported_k - needed
+        score += clamp(margin * 10.0, -32, 18)
+    if proj is not None:
+        score += clamp((max_supported_k - proj) * 5.0, -18, 8)
+    if bf < 20:
+        score -= 12
+    elif bf >= 24:
+        score += 6
+    if ip_floor is not None and ip_floor < 4.0:
+        score -= 10
+    status = "PASS" if score >= 68 else "CAUTION" if score >= 52 else "FAIL"
+    return {"score": int(clamp(round(score), 0, 100)), "status": status, "max_supported_k": round(float(max_supported_k), 2), "note": f"BF {bf:.1f} | IP floor {ip_floor} | max supported {max_supported_k:.1f} K"}
+
+def k_upside_line_difficulty(line):
+    """Historical line difficulty caution. Higher score = easier/cleaner line."""
+    line = _kut_num(line, None)
+    if line is None:
+        return {"score": 50, "label": "NO LINE", "tax": 8.0, "note": "No real line"}
+    if line <= 3.5:
+        score, tax, label = 88, 0.0, "EASY"
+    elif line <= 4.5:
+        score, tax, label = 78, 1.5, "NORMAL"
+    elif line <= 5.5:
+        score, tax, label = 68, 3.0, "MODERATE"
+    elif line <= 6.5:
+        score, tax, label = 56, 6.0, "HARD"
+    else:
+        score, tax, label = 46, 9.0, "VERY HARD"
+    return {"score": score, "label": label, "tax": tax, "note": f"Line {line:.1f} = {label} clearance difficulty"}
+
+def k_upside_tester_profile(p, decision=None):
+    """Full K Upside Tester profile. Uses K data only; no Pitching Outs changes."""
+    p = p or {}
+    if decision is None:
+        decision = kproj_decision(p)
+    proj = _kut_num(decision.get("projection"), _kut_num(p.get("projection"), None))
+    line = _kut_num(decision.get("line"), _kut_num(p.get("line") or p.get("underdog_line"), None))
+    dist = kproj_distribution_profile(proj, line, p) if proj is not None else {}
+    conversion = k_upside_strikeout_conversion_score(p)
+    contact = k_upside_contact_suppression_rating(p)
+    volatility = k_upside_volatility_tax(p, dist)
+    ceiling = k_upside_bf_ip_ceiling_check(p, line=line, proj=proj)
+    line_diff = k_upside_line_difficulty(line)
+    role_score, _, _ = kproj_role_stability_score(p)
+    # Learning confidence proxy from reliability/data/lineup. This is a trust score, not a projection boost.
+    learning_conf = _kut_num(p.get("reliability_score"), None)
+    if learning_conf is None:
+        learning_conf = _kut_num(p.get("data_score"), 75.0)
+    learning_conf = float(clamp(learning_conf or 75.0, 0, 100))
+    edge = 0.0 if proj is None or line is None else float(proj - line)
+    abs_edge_score = clamp(abs(edge) / 1.75 * 100.0, 0, 100)
+    bf = _kut_num(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    bf_score = clamp((bf - 17.0) / 9.0 * 100.0, 0, 100)
+    # Higher contact score = lower contact suppression risk. Higher conversion = more likely Ks convert.
+    raw = (
+        0.40 * abs_edge_score +
+        0.20 * bf_score +
+        0.15 * conversion["score"] +
+        0.10 * contact["score"] +
+        0.10 * role_score +
+        0.05 * learning_conf
+    )
+    penalty = volatility["tax"] + line_diff["tax"] + (0 if ceiling["status"] == "PASS" else 7 if ceiling["status"] == "CAUTION" else 15)
+    sos = int(clamp(round(raw - penalty), 0, 100))
+    model_side = str(decision.get("lean_side") or ("OVER" if edge >= 0 else "UNDER")).upper()
+    # Tester recommendation: keep direction from current K model but use new quality filters.
+    if line is None:
+        rec = "🚫 NO LINE"
+    elif sos >= 88 and conversion["score"] >= 72 and contact["score"] >= 58 and ceiling["status"] == "PASS" and volatility["label"] != "HIGH":
+        rec = f"🔥 ELITE {model_side}"
+    elif sos >= 78 and ceiling["status"] != "FAIL":
+        rec = f"✅ STRONG {model_side}"
+    elif sos >= 66:
+        rec = f"⚠️ LEAN {model_side}"
+    else:
+        rec = f"🚫 PASS — {model_side}"
+    note = " | ".join([
+        f"SOS {sos}/100",
+        f"conv {conversion['score']} {conversion['label']}",
+        f"contact risk {contact['risk']}",
+        f"vol {volatility['label']} -{volatility['tax']}",
+        f"BF ceiling {ceiling['status']}",
+        f"line diff {line_diff['label']}",
+    ])
+    return {
+        "version": K_UPSIDE_TESTER_VERSION,
+        "sos_score": sos,
+        "recommendation": rec,
+        "strikeout_conversion_score": conversion["score"],
+        "strikeout_conversion_label": conversion["label"],
+        "strikeout_conversion_note": conversion["note"],
+        "contact_suppression_score": contact["score"],
+        "contact_suppression_risk": contact["risk"],
+        "contact_suppression_note": contact["note"],
+        "volatility_tax": volatility["tax"],
+        "volatility_label": volatility["label"],
+        "volatility_note": volatility["note"],
+        "bf_ip_ceiling_score": ceiling["score"],
+        "bf_ip_ceiling_status": ceiling["status"],
+        "bf_ip_max_supported_k": ceiling["max_supported_k"],
+        "bf_ip_ceiling_note": ceiling["note"],
+        "line_difficulty_score": line_diff["score"],
+        "line_difficulty_label": line_diff["label"],
+        "line_difficulty_note": line_diff["note"],
+        "learning_confidence": round(learning_conf, 1),
+        "note": note,
+    }
+
+def build_k_upside_tester_table(board):
+    rows = []
+    for p in board or []:
+        d = kproj_decision(p)
+        t = k_upside_tester_profile(p, d)
+        rows.append({
+            "Pitcher": p.get("pitcher") or p.get("Pitcher"),
+            "Matchup": p.get("matchup") or p.get("Matchup"),
+            "Line": d.get("line"),
+            "K PROJ": d.get("projection"),
+            "Model Decision": d.get("decision"),
+            "Tester Recommendation": t.get("recommendation"),
+            "SOS Score": t.get("sos_score"),
+            "Strikeout Conversion": t.get("strikeout_conversion_score"),
+            "Contact Score": t.get("contact_suppression_score"),
+            "Contact Risk": t.get("contact_suppression_risk"),
+            "Volatility Tax": t.get("volatility_tax"),
+            "Volatility": t.get("volatility_label"),
+            "BF/IP Ceiling": t.get("bf_ip_ceiling_status"),
+            "Max Supported K": t.get("bf_ip_max_supported_k"),
+            "Line Difficulty": t.get("line_difficulty_label"),
+            "Learning Conf": t.get("learning_confidence"),
+            "Tester Note": t.get("note"),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["SOS Score", "K PROJ"], ascending=[False, False])
+    return df
+
 def kproj_confidence_tier(conf, hit_rate, gap, role_score):
     conf = safe_float(conf, 0.50) or 0.50
     hit_rate = safe_float(hit_rate, 0.50) or 0.50
@@ -12475,6 +12775,15 @@ def render_kproj_pitcher_card(p):
     lineup_badge = "good-badge" if p.get("lineup_locked") else "yellow-badge"
     recent_html = kproj_bar_html(p.get("last_10_ks"))
     why_summary, why_green_html, why_risk_html = _k_context_reason_chips(p, d)
+    ktester_card = k_upside_tester_profile(p, d)
+    ktester_rec_display = html.escape(str(ktester_card.get("recommendation", "—")))
+    ktester_sos_display = html.escape(str(ktester_card.get("sos_score", "—")))
+    ktester_conv_display = html.escape(str(ktester_card.get("strikeout_conversion_score", "—")))
+    ktester_contact_display = html.escape(str(ktester_card.get("contact_suppression_risk", "—")))
+    ktester_vol_display = html.escape(str(ktester_card.get("volatility_label", "—")))
+    ktester_ceiling_display = html.escape(str(ktester_card.get("bf_ip_ceiling_status", "—")))
+    ktester_line_diff_display = html.escape(str(ktester_card.get("line_difficulty_label", "—")))
+    ktester_note_display = html.escape(str(ktester_card.get("note", "")))
     # Mobile-friendly mechanics and attribution summaries.
     velo_delta = safe_float(p.get('fastball_velo_delta'))
     velo_display = "—" if velo_delta is None else f"{velo_delta:+.1f} mph"
@@ -12577,10 +12886,16 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Avg Ks</div><div class="kpi-value" style="font-size:18px;">{avg_k_display}</div><div class="kpi-sub">{avg_k_sub}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">K Upside Tester</div><div class="kpi-value" style="font-size:15px;">{ktester_rec_display}</div><div class="kpi-sub">SOS {ktester_sos_display}/100 | Conv {ktester_conv_display}<br>Contact {ktester_contact_display} | Vol {ktester_vol_display}<br>BF/IP {ktester_ceiling_display} | Line {ktester_line_diff_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Form</div><div class="kpi-value" style="font-size:15px;">{p.get('recent_vs_season_flag', '—')}</div><div class="kpi-sub">L3 {p.get('recent_form_l3', '—')} | L10 {p.get('recent_form_l10', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Velocity Trend</div><div class="kpi-value" style="font-size:18px;">{velo_display}</div><div class="kpi-sub">{velo_sub}</div></div>
         <div class="mobile-info-card"><div class="small-muted">F-Strike / Usage</div><div class="kpi-value" style="font-size:18px;">{fstrike_display}</div><div class="kpi-sub">{usage_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">BABIP Regression</div><div class="kpi-value" style="font-size:18px;">{babip_display}</div><div class="kpi-sub">{babip_sub_display}</div></div>
+      </div>
+      <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
+        <div class="small-muted">K Upside Tester — SOS Audit</div>
+        <div class="kpi-value" style="font-size:16px;">{ktester_rec_display}</div>
+        <div class="kpi-sub" style="margin-top:6px;">{ktester_note_display}<br>Use this as a tester/ranking layer only; Pitching Outs is unchanged.</div>
       </div>
       <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
         <div class="small-muted">Why This Pick</div>
@@ -12728,6 +13043,7 @@ def build_kproj_table(board):
         d = kproj_decision(p)
         dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
         tier3 = build_decision_tier_3_0(p, d)
+        ktester = k_upside_tester_profile(p, d)
         p = _sync_market_with_card_decision(p, d) if '_sync_market_with_card_decision' in globals() else p
         rows.append({
             "Pitcher": p.get("pitcher"),
@@ -12783,11 +13099,24 @@ def build_kproj_table(board):
             "IP Floor": d.get("ip_floor"),
             "Edge Gap": d.get("edge_gap"),
             "Main Engine Action": p.get("bet_action"),
+            "K Tester SOS": ktester.get("sos_score"),
+            "K Tester Recommendation": ktester.get("recommendation"),
+            "Strikeout Conversion Score": ktester.get("strikeout_conversion_score"),
+            "Contact Suppression Risk": ktester.get("contact_suppression_risk"),
+            "Contact Suppression Score": ktester.get("contact_suppression_score"),
+            "Volatility Tax": ktester.get("volatility_tax"),
+            "BF/IP Ceiling": ktester.get("bf_ip_ceiling_status"),
+            "Max Supported K": ktester.get("bf_ip_max_supported_k"),
+            "Line Difficulty": ktester.get("line_difficulty_label"),
+            "K Tester Note": ktester.get("note"),
         })
     df = pd.DataFrame(rows)
     if not df.empty:
         df = normalize_official_kproj_columns(df)
-        df = df.sort_values(["Decision", "Confidence %", "K PROJ"], ascending=[True, False, False])
+        if "K Tester SOS" in df.columns:
+            df = df.sort_values(["K Tester SOS", "Confidence %", "K PROJ"], ascending=[False, False, False])
+        else:
+            df = df.sort_values(["Decision", "Confidence %", "K PROJ"], ascending=[True, False, False])
     return df
 
 
@@ -12988,6 +13317,18 @@ def render_kproj_tab(board):
     st.subheader("Projection Board")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    st.subheader("K Upside Tester — SOS Ranking Layer")
+    st.caption("K model only. Adds Strikeout Conversion, Contact Suppression, Volatility Tax, BF/IP Ceiling, Line Difficulty, and SOS Score. Pitching Outs is not touched.")
+    try:
+        tester_df = build_k_upside_tester_table(board)
+        if not tester_df.empty:
+            st.dataframe(tester_df, use_container_width=True, hide_index=True)
+            st.download_button("Download K Upside Tester CSV", tester_df.to_csv(index=False), file_name="k_upside_tester_sos.csv", mime="text/csv")
+        else:
+            st.info("No K Upside Tester rows yet.")
+    except Exception as e:
+        st.warning(f"K Upside Tester panel unavailable: {e}")
+
     st.subheader("Copy/Paste Slate — Best Final Line-Aware Smart Picks")
     st.caption("Underdog only. Uses Line-Aware Smart Final K Projection + Line-Aware Smart Decision + Line-Aware Smart Edge. 🔥 = edge 1.00+ | ⚠️ = edge under 0.65. PASS/NO LINE rows are hidden here.")
     slate_text = build_copy_paste_k_slate(df, show_pass_notes=False)
@@ -13023,7 +13364,7 @@ def render_kproj_tab(board):
             continue
         seen_card_pitchers.add(nm)
         card_board.append(p)
-    priority = sorted(card_board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
+    priority = sorted(card_board, key=lambda p: (safe_float(k_upside_tester_profile(p, kproj_decision(p)).get("sos_score"), 0) or 0, "🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
 
     # AUDIT 1/2 — card coverage check: every projection-board row should have one card.
     # This is display/debug only; it does not change projections, decisions, odds, or exports.
