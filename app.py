@@ -411,9 +411,63 @@ def load_json(path, default):
         pass
     return default
 
+def _safe_json_len(obj):
+    try:
+        if isinstance(obj, list):
+            return len(obj)
+        if isinstance(obj, dict):
+            return len(obj)
+    except Exception:
+        pass
+    return None
+
+def _is_protected_learning_json(path):
+    """Protect core learning/result files from accidental empty/smaller overwrites during redeploys."""
+    try:
+        name = os.path.basename(str(path or "")).lower()
+        protected_names = {
+            "auto_result_log.json",
+            "long_backtest_rows.json",
+            "pitcher_learning.json",
+            "true_calibration_engine.json",
+            "signal_tracking.json",
+            "clv_tracker.json",
+        }
+        return name in protected_names
+    except Exception:
+        return False
+
 def save_json(path, data):
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Railway/data-loss guard: never let a restart/update replace a good learning file
+        # with an empty or sharply smaller payload. This does not change model math.
+        if _is_protected_learning_json(path) and os.path.exists(path):
+            try:
+                with open(path, "r") as f_old:
+                    old_data = json.load(f_old)
+                old_len = _safe_json_len(old_data)
+                new_len = _safe_json_len(data)
+                if old_len is not None and new_len is not None and old_len > 0:
+                    # Block empty writes and major accidental shrinkage. Allows normal dedupe/cleanup up to 10%.
+                    if new_len == 0 or (old_len >= 50 and new_len < int(old_len * 0.90)):
+                        try:
+                            st.session_state["safe_save_last_blocked"] = {
+                                "path": str(path), "old_len": old_len, "new_len": new_len, "time": now_iso()
+                            }
+                        except Exception:
+                            pass
+                        return
+                # Always keep a local .bak before replacing protected learning files.
+                try:
+                    with open(str(path) + ".bak", "w") as f_bak:
+                        json.dump(old_data, f_bak, indent=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
     except Exception:
@@ -29080,15 +29134,19 @@ def _beta_quality_flags(row, rp, pitch_l3, hook_rate, deep_rate, early_exit, sta
 
 
 def _beta_outs_final_decision(proj, line, ip_info):
-    """Beta decision gate: reduce forced borderline picks.
+    """Beta Pitching Outs decision labels.
 
-    This is where the model learns from the losses: many losses were thin unders
-    or overs with pull risk. We pass those instead of forcing a side.
+    IMPORTANT: This does not change Beta Projection/Beta IP/Beta Outs math.
+    It only makes the displayed decision more intuitive:
+    - true thin edges stay PASS
+    - moderate edges become OVER LEAN / UNDER LEAN
+    - bigger edges become OVER / UNDER or STRONG OVER / STRONG UNDER
     """
     line = _beta_num(line, None)
     proj = _beta_num(proj, None)
     if line is None or proj is None:
         return "NO LINE", None, None, "No UD line"
+
     edge = round(proj - line, 2)
     abs_edge = abs(edge)
     raw_side = "OVER" if edge > 0 else "UNDER"
@@ -29099,34 +29157,50 @@ def _beta_outs_final_decision(proj, line, ip_info):
     hook = _beta_num(ip_info.get("Recent Hook Rate"), 0.0) or 0.0
     conf = _beta_num(ip_info.get("Beta IP Confidence"), 50.0) or 50.0
 
+    # True no-play zone: keep discipline when the board is basically priced right.
     if abs_edge < BETA_OUTS_PASS_EDGE:
-        return "PASS", edge, None, "Thin edge under 1.0 out"
+        return "PASS", edge, None, "Projection too close to line / no actionable edge"
 
-    # Loss-focused under safety: if recent distribution supports clearing the line,
-    # don't force an under unless the projection edge is truly strong.
-    if raw_side == "UNDER":
-        recent_supports_over = False
-        if med is not None and med >= line:
-            recent_supports_over = True
-        if l5 is not None and l5 >= line:
-            recent_supports_over = True
-        if deep >= 60:
-            recent_supports_over = True
-        if recent_supports_over and abs_edge < BETA_OUTS_LEASH_RISK_EDGE:
-            return "PASS", edge, None, "Under blocked: recent/deep leash supports over"
+    recent_supports_over = False
+    if med is not None and med >= line:
+        recent_supports_over = True
+    if l5 is not None and l5 >= line:
+        recent_supports_over = True
+    if deep >= 60:
+        recent_supports_over = True
 
-    # Loss-focused over safety: overs need enough cushion when hook/role risk exists.
-    if raw_side == "OVER":
-        pull_risk = (hook >= 40) or ("RECENT_HOOK_RISK" in flags) or ("EARLY_PULL_RISK" in flags) or ("ROLE_RISK" in flags) or conf < 45
-        if pull_risk and abs_edge < BETA_OUTS_PULL_RISK_EDGE:
-            return "PASS", edge, None, "Over blocked: pull/role risk with thin cushion"
+    pull_risk = (hook >= 40) or ("RECENT_HOOK_RISK" in flags) or ("EARLY_PULL_RISK" in flags) or ("ROLE_RISK" in flags) or conf < 45
 
-    if abs_edge >= BETA_OUTS_STRONG_EDGE and conf >= 55:
+    # Label strength only. Projection/hit-rate math stays untouched.
+    if abs_edge >= 3.00 and conf >= 50:
         lean = "STRONG " + raw_side
-    else:
+    elif abs_edge >= BETA_OUTS_STRONG_EDGE and conf >= 55:
         lean = raw_side
+    else:
+        lean = raw_side + " LEAN"
+
+    # Clean notes that match the displayed side. No more confusing "Under blocked" wording.
+    if raw_side == "UNDER":
+        if recent_supports_over and abs_edge < BETA_OUTS_LEASH_RISK_EDGE:
+            note = "Under lean — projected below line, but deep-leash history adds over risk"
+        elif pull_risk or "PITCH_LIMIT_RISK" in flags or "RECENT_HOOK_RISK" in flags:
+            note = "Workload/role flags support the Under"
+        elif lean.startswith("STRONG"):
+            note = "High-confidence Under — strong workload gap"
+        else:
+            note = "Projected workload favors Under"
+    else:
+        if pull_risk and abs_edge < BETA_OUTS_PULL_RISK_EDGE:
+            note = "Over lean — projected above line, but pull/role risk limits confidence"
+        elif recent_supports_over or "DEEP_LEASH_SUPPORT" in flags:
+            note = "Expected workload/deep leash supports Over"
+        elif lean.startswith("STRONG"):
+            note = "High-confidence Over — strong workload gap"
+        else:
+            note = "Projected workload favors Over"
+
     prob = _beta_prob_from_gap(abs_edge, 1.65)
-    return lean, edge, prob, "Playable"
+    return lean, edge, prob, note
 
 
 
