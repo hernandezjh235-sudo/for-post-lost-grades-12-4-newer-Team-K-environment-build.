@@ -27562,9 +27562,9 @@ def _okr_mi_projection_nudge(row, rec, hand):
       35% overall + 45% vs pitcher hand + 20% last-30 vs pitcher hand.
 
     It then compares verified team K% to the model's existing opponent K%.
-    The adjustment is intentionally small and capped at +/-0.30 K so it can
-    help matchup context without overpowering pitcher skill, BF/IP, leash,
-    learning, or line-aware projection layers.
+    ORIGINAL-ANCHOR TESTER: the adjustment is intentionally tiny and capped
+    at +/-0.20 K so K Environment fine-tunes the original K projection without
+    overpowering pitcher skill, BF/IP, leash, learning, or line-aware layers.
     """
     try:
         verified_k, blend_note = _okr_mi_blended_k_pct(rec, hand)
@@ -27595,26 +27595,28 @@ def _okr_mi_projection_nudge(row, rec, hand):
 
         raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
 
-        # Conservative engine-protection layer:
-        # use 35% of raw K-opportunity delta and cap at +/-0.30 Ks.
-        weighted = raw * 0.35
-        capped = max(-0.30, min(0.30, weighted))
+        # Original-anchor K Environment layer:
+        # use only 12% of raw K-opportunity delta and cap at +/-0.20 Ks.
+        # This keeps the regular K Upside projection close to the older
+        # 18-11 style build while still allowing a small matchup fine-tune.
+        weighted = raw * 0.12
+        capped = max(-0.20, min(0.20, weighted))
 
-        if capped >= 0.22:
-            label = 'MI_ELITE_K_ENV_PLUS'
-        elif capped >= 0.07:
+        if capped >= 0.15:
             label = 'MI_K_ENV_PLUS'
-        elif capped <= -0.22:
-            label = 'MI_ELITE_CONTACT_TAX'
-        elif capped <= -0.07:
+        elif capped >= 0.05:
+            label = 'MI_SMALL_K_ENV_PLUS'
+        elif capped <= -0.15:
             label = 'MI_CONTACT_TAX'
+        elif capped <= -0.05:
+            label = 'MI_SMALL_CONTACT_TAX'
         else:
             label = 'MI_NEUTRAL'
 
         reason = (
             f'official MLB team K blend {verified_k:.2f}% ({blend_note}) '
             f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
-            f'raw {raw:+.2f}K * 0.35 capped +/-0.30 = {capped:+.2f}K'
+            f'raw {raw:+.2f}K * 0.12 capped +/-0.20 = {capped:+.2f}K'
         )
         return round(float(capped), 2), label, reason, verified_k
     except Exception as e:
@@ -27638,13 +27640,15 @@ def _okr_mi_decision_from_proj(proj, line, old_decision):
             return old_decision
 
         edge = p - l
+        # Original-anchor display gate: do not let a tiny K Environment nudge
+        # flip a visible decision. Require a clearer gap for leans.
         if edge >= 1.00:
             return '🔥 OVER'
-        if edge > 0.15:
+        if edge > 0.35:
             return '⚠️ OVER LEAN'
         if edge <= -1.00:
             return '🔥 UNDER'
-        if edge < -0.15:
+        if edge < -0.35:
             return '⚠️ UNDER LEAN'
         return '🚫 PASS'
     except Exception:
@@ -27776,8 +27780,8 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     except Exception:
         d["Team K Read"] = ""
 
-    # Matchup Intelligence Projection Nudge 1.0 — small weight only.
-    # Uses 35% overall + 45% hand split + 20% L30 hand split; caps at +/-0.30 K.
+    # Matchup Intelligence Projection Nudge — original-anchor light weight only.
+    # Uses 35% overall + 45% hand split + 20% L30 hand split; caps at +/-0.20 K.
     try:
         mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified = [], [], [], [], [], []
         for idx, row in d.iterrows():
@@ -27798,7 +27802,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Matchup Intel Reason"] = mi_reason
         d["Matchup Intel Verified Team K%"] = mi_verified
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_WEIGHTED_35_45_20_CAP_0_30_2026_06_27"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_ORIGINAL_ANCHOR_WEIGHT_0_12_CAP_0_20_2026_07_06"
         # Promote this as the final display/export projection, but record the pre-value above.
         for c in ["K PROJ", "Line-Aware Smart Final K Projection", "Final K Projection"]:
             if c in d.columns:
@@ -30337,9 +30341,8 @@ def render_beta_k_v5_tab(board):
 
 
 
-tab_kproj, tab_beta_k_v5, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
-    "⚾ K BETA V5",
     "🎯 OUTS BETA",
     "🧪 IP DEBUG BETA",
     "PITCHER FS",
@@ -30357,9 +30360,6 @@ tab_kproj, tab_beta_k_v5, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_
 
 with tab_kproj:
     render_kproj_tab(board)
-
-with tab_beta_k_v5:
-    render_beta_k_v5_tab(board)
 
 with tab_beta_outs:
     render_beta_pitching_outs_tab(board)
