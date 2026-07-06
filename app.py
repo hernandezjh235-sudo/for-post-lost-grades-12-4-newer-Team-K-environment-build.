@@ -12067,7 +12067,7 @@ def kproj_sim_hit_rate(proj, line, side, p):
 # Does NOT touch Pitching Outs, Pitcher FS, Moneyline, grading, learning,
 # saved boards, GitHub backup, or any non-K module.
 # ============================================================
-K_UPSIDE_TESTER_VERSION = "K_UPSIDE_TESTER_SOS_2026_07_RAILWAY_SAFE"
+K_UPSIDE_TESTER_VERSION = "K_UPSIDE_TESTER_SOS_V63_CONSERVATIVE_CALIBRATION"
 
 def _kut_num(x, default=None):
     try:
@@ -12275,36 +12275,66 @@ def k_upside_tester_profile(p, decision=None):
     abs_edge_score = clamp(abs(edge) / 1.75 * 100.0, 0, 100)
     bf = _kut_num(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
     bf_score = clamp((bf - 17.0) / 9.0 * 100.0, 0, 100)
+    # V63 conservative calibration: keep the original K projection as the anchor.
+    # The tester should rank/filter borderline plays, not become a second aggressive model.
     # Higher contact score = lower contact suppression risk. Higher conversion = more likely Ks convert.
+    learning_strength = clamp((learning_conf - 50.0) / 50.0, 0.25, 1.0)
+    tester_weight = 0.45 + (0.35 * learning_strength)  # limited history = smaller tester influence
+
     raw = (
-        0.40 * abs_edge_score +
-        0.20 * bf_score +
-        0.15 * conversion["score"] +
-        0.10 * contact["score"] +
-        0.10 * role_score +
-        0.05 * learning_conf
+        0.55 * abs_edge_score +      # anchor to original projection edge
+        0.16 * bf_score +
+        0.10 * conversion["score"] +
+        0.07 * contact["score"] +
+        0.08 * role_score +
+        0.04 * learning_conf
     )
-    penalty = volatility["tax"] + line_diff["tax"] + (0 if ceiling["status"] == "PASS" else 7 if ceiling["status"] == "CAUTION" else 15)
-    sos = int(clamp(round(raw - penalty), 0, 100))
+
+    # Reduced penalty strength versus the first tester. Volatility/contact now mostly changes confidence.
+    ceiling_penalty = 0 if ceiling["status"] == "PASS" else 4 if ceiling["status"] == "CAUTION" else 10
+    penalty = (volatility["tax"] * 0.65) + (line_diff["tax"] * 0.45) + ceiling_penalty
+    sos = int(clamp(round((raw - penalty) * tester_weight + abs_edge_score * (1.0 - tester_weight)), 0, 100))
+
     model_side = str(decision.get("lean_side") or ("OVER" if edge >= 0 else "UNDER")).upper()
-    # Tester recommendation: keep direction from current K model but use new quality filters.
+    abs_edge = abs(edge)
+    negative_cluster = 0
+    negative_cluster += 1 if conversion["score"] < 58 else 0
+    negative_cluster += 1 if contact["risk"] == "HIGH" else 0
+    negative_cluster += 1 if volatility["label"] == "HIGH" else 0
+    negative_cluster += 1 if ceiling["status"] == "FAIL" else 0
+    negative_cluster += 1 if line_diff["label"] in ["HARD", "VERY HARD"] else 0
+
+    # Conservative recommendation gates:
+    # - no official-style tester play on tiny gaps
+    # - elite/strong requires real projection separation
+    # - large base edges are protected from one warning signal
     if line is None:
         rec = "🚫 NO LINE"
-    elif sos >= 88 and conversion["score"] >= 72 and contact["score"] >= 58 and ceiling["status"] == "PASS" and volatility["label"] != "HIGH":
+    elif abs_edge < 0.35:
+        rec = f"🚫 PASS — THIN {model_side}"
+    elif abs_edge < 0.60 and sos < 82:
+        rec = f"🚫 PASS — BORDERLINE {model_side}"
+    elif negative_cluster >= 3 and abs_edge < 1.15:
+        rec = f"⚠️ LEAN {model_side} — RISK CHECK"
+    elif sos >= 90 and abs_edge >= 1.00 and conversion["score"] >= 70 and contact["score"] >= 56 and ceiling["status"] == "PASS" and volatility["label"] != "HIGH":
         rec = f"🔥 ELITE {model_side}"
-    elif sos >= 78 and ceiling["status"] != "FAIL":
+    elif sos >= 82 and abs_edge >= 0.75 and ceiling["status"] != "FAIL" and negative_cluster <= 2:
         rec = f"✅ STRONG {model_side}"
-    elif sos >= 66:
+    elif sos >= 70 and abs_edge >= 0.55:
         rec = f"⚠️ LEAN {model_side}"
     else:
         rec = f"🚫 PASS — {model_side}"
+
     note = " | ".join([
         f"SOS {sos}/100",
+        f"edge {edge:+.2f}",
+        f"tester wt {tester_weight:.2f}",
         f"conv {conversion['score']} {conversion['label']}",
         f"contact risk {contact['risk']}",
         f"vol {volatility['label']} -{volatility['tax']}",
         f"BF ceiling {ceiling['status']}",
         f"line diff {line_diff['label']}",
+        f"risk flags {negative_cluster}",
     ])
     return {
         "version": K_UPSIDE_TESTER_VERSION,
@@ -12327,6 +12357,8 @@ def k_upside_tester_profile(p, decision=None):
         "line_difficulty_label": line_diff["label"],
         "line_difficulty_note": line_diff["note"],
         "learning_confidence": round(learning_conf, 1),
+        "tester_weight": round(float(tester_weight), 2),
+        "negative_cluster": int(negative_cluster),
         "note": note,
     }
 
@@ -12352,6 +12384,8 @@ def build_k_upside_tester_table(board):
             "Max Supported K": t.get("bf_ip_max_supported_k"),
             "Line Difficulty": t.get("line_difficulty_label"),
             "Learning Conf": t.get("learning_confidence"),
+            "Tester Weight": t.get("tester_weight"),
+            "Risk Flags": t.get("negative_cluster"),
             "Tester Note": t.get("note"),
         })
     df = pd.DataFrame(rows)
