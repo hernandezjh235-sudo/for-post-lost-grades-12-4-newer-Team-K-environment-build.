@@ -1243,176 +1243,9 @@ def get_schedule(date_str):
         params={"sportId": 1, "date": date_str, "hydrate": "probablePitcher,venue,team"}
     ) or {"dates": []}
 
-
-# =========================
-# PROBABLE PITCHER RECOVERY
-# =========================
-# Railway/app restarts are not the issue when a pitcher is missing from the board.
-# The usual cause is the MLB schedule feed returning only one probable pitcher for a game.
-# This recovery layer is intentionally defensive:
-# 1) Use MLB game feed / boxscore if schedule hydrate is incomplete.
-# 2) Use optional repo CSV overrides if a starter is still missing.
-# 3) Warn in the app instead of silently dropping one side of a game.
-# It does NOT change projection math, K environment, Pitching Outs, grading, or saved rows.
-
-PROBABLE_FALLBACK_CSV_CANDIDATES = [
-    Path("learning_data/probable_pitcher_fallbacks.csv"),
-    Path("probable_pitcher_fallbacks.csv"),
-]
-
-# Small safety net for MLB API/search edge cases. Used only after official feed recovery fails.
-# Keep this tiny; the preferred fix is MLB feed recovery or learning_data/probable_pitcher_fallbacks.csv.
-KNOWN_MLB_PITCHER_IDS = {
-    "bryan woo": 693433,
-}
-
-def _append_probable_recovery_note(note):
-    try:
-        st.session_state.setdefault("probable_pitcher_recovery_notes", [])
-        st.session_state["probable_pitcher_recovery_notes"].append(str(note)[:260])
-    except Exception:
-        pass
-
-@st.cache_data(ttl=900, show_spinner=False)
-def search_mlb_pitcher_person(name):
-    """Best-effort MLBAM id/name recovery for a pitcher name."""
-    nm = str(name or "").strip()
-    if not nm:
-        return None
-    try:
-        js = safe_get_json(f"{MLB_BASE}/people/search", params={"names": nm}, timeout=10)
-        people = (js or {}).get("people") or []
-        if people:
-            # Prefer pitchers when position data exists.
-            for p in people:
-                pos = ((p.get("primaryPosition") or {}).get("abbreviation") or (p.get("primaryPosition") or {}).get("name") or "").upper()
-                if "P" == pos or "PITCH" in pos:
-                    return p
-            return people[0]
-    except Exception:
-        pass
-    # Fallback by known exact normalized name only.
-    try:
-        kid = KNOWN_MLB_PITCHER_IDS.get(normalize_name(nm))
-        if kid:
-            js = safe_get_json(f"{MLB_BASE}/people/{kid}", timeout=10)
-            people = (js or {}).get("people") or []
-            if people:
-                return people[0]
-            return {"id": kid, "fullName": nm}
-    except Exception:
-        pass
-    return None
-
-@st.cache_data(ttl=300, show_spinner=False)
-def recover_probable_pitcher_from_game_feed(game_pk, side):
-    """Try to recover missing probable pitcher from MLB live feed or boxscore."""
-    if not game_pk or side not in ["away", "home"]:
-        return None
-    candidates = []
-    try:
-        live = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=12) or {}
-        gd_teams = ((live.get("gameData") or {}).get("probablePitchers") or {})
-        if isinstance(gd_teams, dict):
-            p = gd_teams.get(side)
-            if isinstance(p, dict) and (p.get("fullName") or p.get("id")):
-                candidates.append(p)
-        # Some feeds expose starter/probable through boxscore team pitcher lists.
-        box_team = (((live.get("liveData") or {}).get("boxscore") or {}).get("teams") or {}).get(side) or {}
-        for key in ["probablePitcher", "starter"]:
-            p = box_team.get(key)
-            if isinstance(p, dict) and (p.get("fullName") or p.get("id")):
-                candidates.append(p)
-    except Exception:
-        pass
-    if candidates:
-        p = candidates[0]
-        return {
-            "id": p.get("id"),
-            "fullName": p.get("fullName") or p.get("name") or p.get("full_name"),
-            "pitchHand": p.get("pitchHand") or {},
-            "source": "MLB_GAME_FEED_RECOVERY",
-        }
-    return None
-
-def load_probable_pitcher_fallback_rows():
-    """Optional CSV override: learning_data/probable_pitcher_fallbacks.csv.
-    Columns supported: date, matchup, team, pitcher, hand, pitcher_id.
-    Example row: 2026-07-07,SEA @ MIA,SEA,Bryan Woo,R,693433
-    """
-    for path in PROBABLE_FALLBACK_CSV_CANDIDATES:
-        try:
-            if path.exists():
-                df = pd.read_csv(path)
-                return df.to_dict("records")
-        except Exception:
-            continue
-    return []
-
-def recover_probable_pitcher_from_csv(date_str, matchup, team_abbr):
-    rows = load_probable_pitcher_fallback_rows()
-    if not rows:
-        return None
-    date_norm = str(date_str or "").strip()
-    matchup_norm = str(matchup or "").strip().upper()
-    team_norm = str(team_abbr or "").strip().upper()
-    for r in rows:
-        try:
-            if str(r.get("date") or r.get("Date") or "").strip() and str(r.get("date") or r.get("Date") or "").strip() != date_norm:
-                continue
-            if str(r.get("team") or r.get("Team") or "").strip().upper() != team_norm:
-                continue
-            rm = str(r.get("matchup") or r.get("Matchup") or "").strip().upper()
-            if rm and rm != matchup_norm:
-                continue
-            name = str(r.get("pitcher") or r.get("Pitcher") or "").strip()
-            if not name:
-                continue
-            pid = safe_int(r.get("pitcher_id") or r.get("Pitcher ID") or r.get("mlbam_id"), None)
-            hand = str(r.get("hand") or r.get("Hand") or "R").strip()[:1].upper() or "R"
-            if not pid:
-                person = search_mlb_pitcher_person(name)
-                pid = (person or {}).get("id")
-                name = (person or {}).get("fullName") or name
-            return {"id": pid, "fullName": name, "pitchHand": {"code": hand}, "source": "CSV_FALLBACK"}
-        except Exception:
-            continue
-    return None
-
-def _make_pitcher_row_from_pp(date_str, game_pk, game_time, status, venue, pp, team, opp, away, home, side):
-    """Builds the same row shape as extract_probable_pitchers for recovered pitchers."""
-    if not pp:
-        return None
-    name = pp.get("fullName") or pp.get("name")
-    if not name:
-        return None
-    hand_obj = pp.get("pitchHand") if isinstance(pp.get("pitchHand"), dict) else {}
-    hand = hand_obj.get("code") or pp.get("hand") or "R"
-    return {
-        "date": date_str,
-        "game_pk": game_pk,
-        "game_time": game_time,
-        "status": status,
-        "venue": venue,
-        "pitcher_id": pp.get("id"),
-        "pitcher": name,
-        "hand": hand,
-        "team": team.get("abbreviation", team.get("name")),
-        "team_id": team.get("id"),
-        "opponent": opp.get("abbreviation", opp.get("name")),
-        "opp_team_id": opp.get("id"),
-        "home_team": home.get("name"),
-        "away_team": away.get("name"),
-        "opp_side": "home" if side == "away" else "away",
-        "matchup": f"{away.get('abbreviation', away.get('name'))} @ {home.get('abbreviation', home.get('name'))}",
-        "pitcher_confirmed": False,
-        "pitcher_recovery_source": pp.get("source", "RECOVERED_PROBABLE"),
-    }
-
 def extract_probable_pitchers(date_str):
     sched = get_schedule(date_str)
     rows = []
-    recovery_notes = []
     for d in sched.get("dates", []):
         for g in d.get("games", []):
             game_pk = g.get("gamePk")
@@ -1424,53 +1257,51 @@ def extract_probable_pitchers(date_str):
             status = g.get("status", {}).get("abstractGameState", "Preview")
             game_time = g.get("gameDate", "")
             venue = g.get("venue", {}).get("name", "")
-            matchup = f"{away.get('abbreviation', away.get('name'))} @ {home.get('abbreviation', home.get('name'))}"
-
-            # Recovery if MLB schedule hydrate returned only one side.
-            if not away_pp:
-                away_pp = recover_probable_pitcher_from_game_feed(game_pk, "away") or recover_probable_pitcher_from_csv(date_str, matchup, away.get("abbreviation", away.get("name")))
-                if away_pp:
-                    recovery_notes.append(f"Recovered AWAY probable for {matchup}: {away_pp.get('fullName')} ({away_pp.get('source','fallback')})")
-                else:
-                    recovery_notes.append(f"Missing AWAY probable for {matchup}; board may show only one pitcher")
-            if not home_pp:
-                home_pp = recover_probable_pitcher_from_game_feed(game_pk, "home") or recover_probable_pitcher_from_csv(date_str, matchup, home.get("abbreviation", home.get("name")))
-                if home_pp:
-                    recovery_notes.append(f"Recovered HOME probable for {matchup}: {home_pp.get('fullName')} ({home_pp.get('source','fallback')})")
-                else:
-                    recovery_notes.append(f"Missing HOME probable for {matchup}; board may show only one pitcher")
 
             if away_pp:
-                rr = _make_pitcher_row_from_pp(date_str, game_pk, game_time, status, venue, away_pp, away, home, away, home, "away")
-                if rr:
-                    # Schedule-provided pitcher is confirmed; recovered pitcher is flagged as recovered.
-                    if not rr.get("pitcher_recovery_source"):
-                        rr["pitcher_confirmed"] = True
-                    rows.append(rr)
+                rows.append({
+                    "date": date_str,
+                    "game_pk": game_pk,
+                    "game_time": game_time,
+                    "status": status,
+                    "venue": venue,
+                    "pitcher_id": away_pp.get("id"),
+                    "pitcher": away_pp.get("fullName"),
+                    "hand": away_pp.get("pitchHand", {}).get("code", "R"),
+                    "team": away.get("abbreviation", away.get("name")),
+                    "team_id": away.get("id"),
+                    "opponent": home.get("abbreviation", home.get("name")),
+                    "opp_team_id": home.get("id"),
+                    "home_team": home.get("name"),
+                    "away_team": away.get("name"),
+                    "opp_side": "home",
+                    "matchup": f"{away.get('abbreviation', away.get('name'))} @ {home.get('abbreviation', home.get('name'))}",
+                    "pitcher_confirmed": True
+                })
             if home_pp:
-                rr = _make_pitcher_row_from_pp(date_str, game_pk, game_time, status, venue, home_pp, home, away, away, home, "home")
-                if rr:
-                    if not rr.get("pitcher_recovery_source"):
-                        rr["pitcher_confirmed"] = True
-                    rows.append(rr)
-
-    # Deduplicate by game/team/pitcher in case recovery and schedule return the same arm.
-    deduped = []
-    seen = set()
-    for r in rows:
-        key = (str(r.get("game_pk")), str(r.get("team_id")), normalize_name(r.get("pitcher")))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(r)
-
-    try:
-        if recovery_notes:
-            st.session_state["probable_pitcher_recovery_notes"] = recovery_notes[-30:]
-    except Exception:
-        pass
-
-    return deduped
+                rows.append({
+                    "date": date_str,
+                    "game_pk": game_pk,
+                    "game_time": game_time,
+                    "status": status,
+                    "venue": venue,
+                    "pitcher_id": home_pp.get("id"),
+                    "pitcher": home_pp.get("fullName"),
+                    "hand": home_pp.get("pitchHand", {}).get("code", "R"),
+                    "team": home.get("abbreviation", home.get("name")),
+                    "team_id": home.get("id"),
+                    "opponent": away.get("abbreviation", away.get("name")),
+                    "opp_team_id": away.get("id"),
+                    "home_team": home.get("name"),
+                    "away_team": away.get("name"),
+                    "opp_side": "away",
+                    "matchup": f"{away.get('abbreviation', away.get('name'))} @ {home.get('abbreviation', home.get('name'))}",
+                    "pitcher_confirmed": True
+                })
+    for _p in locals().get("board", locals().get("rows", locals().get("out", []))):
+        if isinstance(_p, dict) and "prop_rows" in _p:
+            _p["prop_rows"] = clean_real_prop_debug_rows(_p.get("prop_rows", []))
+    return rows
 
 def get_pitcher_profile(pid):
     data = safe_get_json(
@@ -11170,17 +11001,6 @@ if refresh_btn:
     st.session_state.last_refresh_time = now_iso()
     st.session_state.pop("saved_manual_odds_auto_applied", None)
     st.success(f"Refreshed {len(projections)} pitchers. Nothing officially saved yet. Saved odds can auto-load below if the toggle is on.")
-    try:
-        notes = st.session_state.get("probable_pitcher_recovery_notes", [])
-        if notes:
-            with st.expander("Probable pitcher recovery / missing pitcher check", expanded=False):
-                for n in notes:
-                    if str(n).lower().startswith("missing"):
-                        st.warning(n)
-                    else:
-                        st.info(n)
-    except Exception:
-        pass
 
 if save_btn:
     if not st.session_state.get("loaded_picks"):
@@ -30947,7 +30767,4 @@ with tab6:
             save_json(LINE_HISTORY_FILE, {})
             save_json(LINEUP_CACHE_FILE, {})
             st.error("All logs cleared.")
-
-
-
 
