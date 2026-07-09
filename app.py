@@ -29664,6 +29664,180 @@ BETA_OUTS_LEASH_RISK_EDGE = 2.00    # extra caution on unders when recent leash 
 BETA_OUTS_PULL_RISK_EDGE = 2.00     # extra caution on overs when hook risk is high
 
 
+# =========================
+# BETA OUTS v5 — Deep-start probability + leash stability layer
+# =========================
+# These helpers do NOT change the core Beta IP/Outs math. They add a workload
+# probability audit and a DANGER tag so high-risk Over/Under plays are easier to
+# separate from clean official plays.
+def _beta_sigmoid(x):
+    try:
+        return 1.0 / (1.0 + math.exp(-float(x)))
+    except Exception:
+        return 0.5
+
+
+def _beta_outs_to_baseball_ip(outs):
+    """Convert outs to baseball IP display, e.g. 17 outs -> 5.2."""
+    try:
+        o = int(math.floor(float(outs) + 1e-9))
+        whole = o // 3
+        rem = o % 3
+        return float(f"{whole}.{rem}")
+    except Exception:
+        return None
+
+
+def _beta_over_needed_outs(line):
+    try:
+        return int(math.floor(float(line)) + 1)
+    except Exception:
+        return None
+
+
+def _beta_under_max_outs(line):
+    try:
+        return int(math.floor(float(line)))
+    except Exception:
+        return None
+
+
+def _beta_deep_start_audit(ip_info, line=None):
+    """Estimate reach probabilities for 5.0/6.0/7.0 IP and leash stability.
+
+    This is a calibration/audit layer only. It reads existing beta workload
+    signals and returns probabilities + a DANGER profile. The projection itself
+    remains whatever _beta_dynamic_ip already calculated.
+    """
+    try:
+        beta_ip = _beta_num(ip_info.get("Beta IP"), 0.0) or 0.0
+        conf = _beta_num(ip_info.get("Beta IP Confidence"), 50.0) or 50.0
+        flags = [str(x).upper() for x in (ip_info.get("Beta Flags") or [])]
+        hook = _beta_num(ip_info.get("Recent Hook Rate"), 25.0)
+        deep = _beta_num(ip_info.get("Deep Start Rate"), 45.0)
+        ppi = _beta_num(ip_info.get("Pitch Efficiency P/IP"), None)
+        vol = _beta_num(ip_info.get("IP Volatility Score"), 50.0) or 50.0
+
+        # Allow fields to arrive as either 0.35 or 35.0.
+        hook_pct = (hook / 100.0) if hook is not None and hook > 1 else (hook or 0.25)
+        deep_pct = (deep / 100.0) if deep is not None and deep > 1 else (deep or 0.45)
+
+        # Larger sigma = less certainty in reaching deep-start thresholds.
+        sigma = 0.48
+        sigma += _beta_cap((70.0 - conf) / 100.0, -0.10, 0.38)
+        sigma += _beta_cap((vol - 50.0) / 125.0, -0.08, 0.24)
+        if ppi is not None:
+            sigma += _beta_cap((ppi - 16.5) / 35.0, -0.08, 0.20)
+        if any(f in flags for f in ["LOW_SAMPLE", "ROLE_RISK", "RECENT_HOOK_RISK", "EARLY_PULL_RISK", "PITCH_LIMIT_RISK", "NON_TRADITIONAL_ROLE"]):
+            sigma += 0.12
+        sigma = _beta_cap(sigma, 0.34, 1.12)
+
+        def reach_prob(threshold_ip):
+            base = _beta_sigmoid((beta_ip - float(threshold_ip)) / sigma)
+            # Deep-start history and recent hook risk should affect probability,
+            # not rewrite the outs projection.
+            base += _beta_cap((deep_pct - 0.45) * 0.16, -0.07, 0.09)
+            base -= _beta_cap((hook_pct - 0.25) * 0.18, -0.04, 0.11)
+            if "DEEP_LEASH_SUPPORT" in flags:
+                base += 0.05
+            if any(f in flags for f in ["PITCH_LIMIT_RISK", "RECENT_HOOK_RISK", "EARLY_PULL_RISK", "ROLE_RISK", "NON_TRADITIONAL_ROLE"]):
+                base -= 0.06
+            return round(_beta_cap(base, 0.02, 0.98), 3)
+
+        p5 = reach_prob(5.0)
+        p6 = reach_prob(6.0)
+        p7 = reach_prob(7.0)
+
+        leash_score = conf
+        leash_score += _beta_cap((deep_pct - 0.45) * 55.0, -8, 9)
+        leash_score -= _beta_cap((hook_pct - 0.25) * 65.0, -5, 13)
+        if ppi is not None:
+            leash_score -= _beta_cap((ppi - 16.5) * 1.2, -4, 8)
+        if "DEEP_LEASH_SUPPORT" in flags:
+            leash_score += 6
+        if "PITCH_LIMIT_RISK" in flags:
+            leash_score -= 12
+        if "RECENT_HOOK_RISK" in flags or "EARLY_PULL_RISK" in flags:
+            leash_score -= 10
+        if "ROLE_RISK" in flags or "NON_TRADITIONAL_ROLE" in flags:
+            leash_score -= 12
+        if "LOW_SAMPLE" in flags:
+            leash_score -= 7
+        leash_score = int(round(_beta_cap(leash_score, 5, 95)))
+
+        if leash_score >= 72:
+            leash_label = "STABLE_DEEP_LEASH"
+        elif leash_score >= 57:
+            leash_label = "OK_LEASH"
+        elif leash_score >= 43:
+            leash_label = "LEASH_CAUTION"
+        else:
+            leash_label = "LEASH_DANGER"
+
+        needed_outs = _beta_over_needed_outs(line) if line is not None else None
+        under_max_outs = _beta_under_max_outs(line) if line is not None else None
+        needed_ip = (needed_outs / 3.0) if needed_outs is not None else None
+        under_max_ip = (under_max_outs / 3.0) if under_max_outs is not None else None
+        p_needed = reach_prob(needed_ip) if needed_ip is not None else None
+        p_under_max = None
+        if under_max_ip is not None:
+            # Probability of finishing at or below the under threshold.
+            p_under_max = round(_beta_cap(1.0 - reach_prob(under_max_ip + (1.0/3.0)), 0.02, 0.98), 3)
+
+        return {
+            "p5": p5,
+            "p6": p6,
+            "p7": p7,
+            "p_needed_over": p_needed,
+            "p_under_max": p_under_max,
+            "leash_score": leash_score,
+            "leash_label": leash_label,
+            "sigma": round(float(sigma), 3),
+            "needed_ip": None if needed_ip is None else round(float(needed_ip), 2),
+            "under_max_ip": None if under_max_ip is None else round(float(under_max_ip), 2),
+        }
+    except Exception as e:
+        return {"p5": None, "p6": None, "p7": None, "p_needed_over": None, "p_under_max": None, "leash_score": 50, "leash_label": "LEASH_UNKNOWN", "error": str(e)[:120]}
+
+
+def _beta_attach_outs_danger(lean, raw_side, abs_edge, ip_info, line, note):
+    """Add DANGER tag for workload conflicts without changing the projection math."""
+    audit = _beta_deep_start_audit(ip_info, line)
+    try:
+        ip_info["Deep Start P5"] = audit.get("p5")
+        ip_info["Deep Start P6"] = audit.get("p6")
+        ip_info["Deep Start P7"] = audit.get("p7")
+        ip_info["Over Needed Probability"] = audit.get("p_needed_over")
+        ip_info["Under Max Probability"] = audit.get("p_under_max")
+        ip_info["Leash Stability Score"] = audit.get("leash_score")
+        ip_info["Leash Stability Label"] = audit.get("leash_label")
+    except Exception:
+        pass
+
+    danger = False
+    reasons = []
+    p_need = _beta_num(audit.get("p_needed_over"), None)
+    p_under = _beta_num(audit.get("p_under_max"), None)
+    leash = _beta_num(audit.get("leash_score"), 50) or 50
+    label = str(audit.get("leash_label") or "")
+
+    if raw_side == "OVER":
+        if p_need is not None and p_need < 0.50 and abs_edge < 3.0:
+            danger = True; reasons.append(f"only {p_need:.0%} reach-prob for required IP")
+        if leash < 48 and abs_edge < 3.25:
+            danger = True; reasons.append(f"{label.lower().replace('_',' ')}")
+    elif raw_side == "UNDER":
+        if p_under is not None and p_under < 0.50 and abs_edge < 3.0:
+            danger = True; reasons.append(f"only {p_under:.0%} under-threshold probability")
+        if leash >= 68 and abs_edge < 2.5:
+            danger = True; reasons.append("deep leash can beat under")
+
+    if danger and "PASS" not in str(lean).upper() and "DANGER" not in str(lean).upper():
+        lean = str(lean) + " ‼️ DANGER"
+        note = str(note or "") + " | Play at your risk: " + "; ".join(reasons[:3])
+    return lean, note, audit
+
+
 def _beta_outs_learning_adjustment(player_name=None):
     """Small beta-only workload calibration from previously graded Outs rows.
 
@@ -29783,6 +29957,11 @@ def _beta_outs_final_decision(proj, line, ip_info):
             note = "High-confidence Over — strong workload gap"
         else:
             note = "Projected workload favors Over"
+
+    # v5 workload audit: deep-start probability + leash-stability danger tag.
+    # This does not change Beta Projection/Beta IP/Beta Outs math; it only
+    # improves the recommendation label and writes audit fields into ip_info.
+    lean, note, _audit = _beta_attach_outs_danger(lean, raw_side, abs_edge, ip_info, line, note)
 
     prob = _beta_prob_from_gap(abs_edge, 1.65)
     return lean, edge, prob, note
@@ -30616,6 +30795,13 @@ def _beta_projection_rows(board, market_kind="OUTS"):
                 "Beta BF": ip_info.get("Beta BF", "—"),
                 "IP Delta": ip_info["Beta IP Delta"],
                 "IP Confidence": ip_info["Beta IP Confidence"],
+                "Leash Stability Score": ip_info.get("Leash Stability Score", "—"),
+                "Leash Stability Label": ip_info.get("Leash Stability Label", "—"),
+                "P Reach 5.0 IP": ip_info.get("Deep Start P5", "—"),
+                "P Reach 6.0 IP": ip_info.get("Deep Start P6", "—"),
+                "P Reach 7.0 IP": ip_info.get("Deep Start P7", "—"),
+                "P Required IP": ip_info.get("Over Needed Probability", "—"),
+                "P Under Threshold": ip_info.get("Under Max Probability", "—"),
                 "Line Status": line_info.get("status"),
                 "Line Match Debug": line_info.get("debug_lines") or line_info.get("message"),
                 "Beta Flags": ", ".join(ip_info.get("Beta Flags", [])) if isinstance(ip_info.get("Beta Flags", []), list) else ip_info.get("Beta Flags", ""),
