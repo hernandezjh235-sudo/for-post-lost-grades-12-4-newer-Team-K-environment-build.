@@ -31568,6 +31568,261 @@ if 'build_kproj_table' in globals():
                 pass
             return df
 
+# =========================
+# APP 75 — CONSOLIDATED K MATCHUP / OPPORTUNITY / SANITY / CONFIDENCE
+# =========================
+# This layer deliberately consolidates overlapping signals already present in the
+# engine. It does not replace the historical/current-season K core. Pitch arsenal,
+# whiff interaction, lineup quality, and environment remain small refinements.
+APP75_K_MODULE_VERSION = "APP75_K_CONSOLIDATED_MODULES_1.0"
+
+
+def _a75_num(v, default=None):
+    try:
+        if v is None or v == "" or (isinstance(v, float) and np.isnan(v)):
+            return default
+        if isinstance(v, str):
+            s = v.replace('%', '').replace('K', '').strip()
+            if not s or s in {'—', '-', 'None', 'nan'}:
+                return default
+            return float(s)
+        return float(v)
+    except Exception:
+        return default
+
+
+def _a75_first(row, names, default=None):
+    for name in names:
+        if name in row:
+            v = _a75_num(row.get(name), None)
+            if v is not None:
+                return v
+    return default
+
+
+def _a75_pct(v, default=None):
+    x = _a75_num(v, default)
+    if x is None:
+        return default
+    return x / 100.0 if x > 1 else x
+
+
+def _a75_workload_module(row):
+    """Better BF/IP + pitch-count efficiency module.
+
+    Outputs a 0-100 score and a small projection nudge. It rewards realistic
+    opportunity, not innings by themselves.
+    """
+    bf = _a75_first(row, ['Exp BF', 'Expected BF', 'Beta BF', 'BF'])
+    ip = _a75_first(row, ['IP Projection', 'Projected IP', 'Beta IP', 'IP Floor', 'IP'])
+    pitches = _a75_first(row, ['Projected Pitches', 'Pitch Count Projection', 'Expected Pitches'])
+    ppb = _a75_first(row, ['Pitches Per Batter', 'PPB', 'pitches_per_batter'])
+    role = _a75_first(row, ['Role Score', 'role_score'], 65) or 65
+
+    parts = []
+    if bf is not None:
+        parts.append(max(20, min(90, 50 + (bf - 21.0) * 5.0)))
+    if ip is not None:
+        parts.append(max(20, min(90, 50 + (ip - 5.0) * 10.0)))
+    if pitches is not None:
+        parts.append(max(20, min(90, 50 + (pitches - 88.0) * 0.7)))
+    if ppb is not None:
+        # Lower pitches/BF allows more BF for the same leash, but extremes are noisy.
+        parts.append(max(30, min(75, 55 + (3.9 - ppb) * 12.0)))
+    parts.append(max(25, min(85, role)))
+    score = float(np.mean(parts)) if parts else 50.0
+    nudge = max(-0.12, min(0.12, (score - 50.0) / 50.0 * 0.12))
+    note = f"workload {score:.0f}/100"
+    if bf is not None: note += f", BF {bf:.1f}"
+    if ip is not None: note += f", IP {ip:.2f}"
+    return score, round(nudge, 3), note
+
+
+def _a75_whiff_opportunity_module(row, proj):
+    """Strikeout Opportunity Index + whiff interaction.
+
+    Uses existing real inputs already loaded by the app. This avoids a second API
+    call and prevents double counting. Projection effect is capped tightly.
+    """
+    bf = _a75_first(row, ['Exp BF', 'Expected BF', 'Beta BF', 'BF'], 21.0) or 21.0
+    pitcher_k = _a75_pct(row.get('Pitcher K%'), None)
+    opp_k = _a75_pct(row.get('Opp K%'), None)
+    conversion = _a75_first(row, ['K Conversion Score', 'Strikeout Conversion Score'], 50) or 50
+    context = _a75_first(row, ['K Context Score', 'K Context', 'Sabermetric K Score'], 50) or 50
+    pitch_factor = _a75_first(row, ['Pitch Type Factor', 'pitch_type_factor'], 1.0) or 1.0
+
+    # Normalize core opportunity. Missing data remains neutral.
+    pk_score = 50 if pitcher_k is None else max(20, min(90, 50 + (pitcher_k - 0.23) * 190))
+    ok_score = 50 if opp_k is None else max(20, min(90, 50 + (opp_k - 0.225) * 180))
+    bf_score = max(20, min(90, 50 + (bf - 21.0) * 5.0))
+    arsenal_score = max(35, min(65, 50 + (pitch_factor - 1.0) / 0.035 * 15))
+    score = 0.31 * pk_score + 0.25 * ok_score + 0.24 * bf_score + 0.12 * conversion + 0.05 * context + 0.03 * arsenal_score
+    score = max(20.0, min(90.0, score))
+
+    # Small modifier only. Do not let this layer create a new model.
+    nudge = max(-0.16, min(0.16, (score - 50.0) / 40.0 * 0.16))
+    return score, round(nudge, 3), f"SOI {score:.0f}/100; arsenal {arsenal_score:.0f}/100"
+
+
+def _a75_lineup_quality_module(row):
+    opp_k = _a75_pct(row.get('Opp K%'), None)
+    lineup_k = _a75_pct(row.get('Lineup K%'), None)
+    status = str(row.get('Lineup') or row.get('Lineup Status') or '').upper()
+    k = lineup_k if lineup_k is not None else opp_k
+    score = 50.0 if k is None else max(25, min(80, 50 + (k - 0.225) * 180))
+    if 'CONFIRMED' in status or 'LOCK' in status:
+        score += 3
+    elif 'FALLBACK' in status or 'PROJECT' in status or 'UNKNOWN' in status:
+        score -= 4
+    score = max(20.0, min(85.0, score))
+    # Lineup quality mostly changes confidence; raw K nudge stays micro.
+    nudge = max(-0.07, min(0.07, (score - 50.0) / 35.0 * 0.07))
+    return score, round(nudge, 3), f"lineup quality {score:.0f}/100"
+
+
+def _a75_sanity_checker(row, proj):
+    """Final projection sanity checker using BF, IP, pitcher K skill, and history.
+
+    Returns a capped projection and audit reason. It only trims projections that
+    demand an implausible conversion rate for the expected workload.
+    """
+    if proj is None:
+        return proj, 0.0, 'no projection', False
+    bf = _a75_first(row, ['Exp BF', 'Expected BF', 'Beta BF', 'BF'])
+    ip = _a75_first(row, ['IP Projection', 'Projected IP', 'Beta IP', 'IP Floor', 'IP'])
+    pk = _a75_pct(row.get('Pitcher K%'), None)
+    hist = _a75_first(row, ['App70 History Baseline K', 'Historical Baseline K'])
+    cap = None
+    reasons = []
+
+    if bf is not None:
+        skill = pk if pk is not None else max(0.12, min(0.38, proj / max(bf, 1)))
+        # Allow upside above expected skill, but not unlimited conversion.
+        cap = bf * min(0.43, skill * 1.22 + 0.018) + 0.35
+        if ip is not None and ip < 4.0:
+            cap -= 0.20
+            reasons.append('short-IP ceiling')
+    if hist is not None:
+        hist_cap = hist + 1.75
+        cap = hist_cap if cap is None else min(cap, hist_cap)
+
+    if cap is not None and proj > cap:
+        new_proj = max(0.0, proj - min(0.45, proj - cap))
+        return round(new_proj, 2), round(new_proj - proj, 2), f"sanity trim: cap {cap:.2f}" + (f"; {', '.join(reasons)}" if reasons else ''), True
+    return round(proj, 2), 0.0, 'sanity pass', False
+
+
+def _a75_dynamic_confidence(row, proj, line, workload_score, soi_score, lineup_score, sanity_flag):
+    old = _a75_first(row, ['App70 Confidence %', 'Confidence %', 'Confidence'], 50) or 50
+    if line is None or proj is None:
+        return round(old, 1), False, 'no line/projection'
+    edge = abs(proj - line)
+    vol = _a75_first(row, ['App70 Volatility Penalty', 'Volatility Tax', 'Volatility'], 0) or 0
+    data_score = _a75_first(row, ['Data Score', 'data_score'], 75) or 75
+    lineup_status = str(row.get('Lineup') or row.get('Lineup Status') or '').upper()
+
+    conf = 0.55 * old + 0.14 * workload_score + 0.13 * soi_score + 0.08 * lineup_score + 0.10 * min(75, 48 + edge * 10)
+    conf -= min(9, vol * 0.35)
+    if data_score < 70: conf -= 5
+    if sanity_flag: conf -= 7
+    if 'FALLBACK' in lineup_status or 'UNKNOWN' in lineup_status: conf -= 3
+    conf = max(35.0, min(74.0, conf))
+    danger = conf < 54 or sanity_flag or vol >= 15 or data_score < 65
+    reasons = []
+    if conf < 54: reasons.append('low calibrated confidence')
+    if sanity_flag: reasons.append('projection sanity trim')
+    if vol >= 15: reasons.append('high volatility')
+    if data_score < 65: reasons.append('thin data')
+    return round(conf, 1), danger, ', '.join(reasons) or 'calibration aligned'
+
+
+def _a75_apply_consolidated_modules(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    out_proj, workload_scores, workload_notes = [], [], []
+    soi_scores, soi_notes, arsenal_scores = [], [], []
+    lineup_scores, lineup_notes, sanity_shifts, sanity_notes = [], [], [], []
+    confs, danger_tags, danger_notes, total_nudges = [], [], [], []
+
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        base = _a75_first(row, ['App70 Calibrated K PROJ', 'K PROJ', 'Final K Projection'])
+        line = _a75_first(row, ['UD/Line', 'UD Line', 'Line', 'line'])
+        w_score, w_nudge, w_note = _a75_workload_module(row)
+        soi_score, soi_nudge, soi_note = _a75_whiff_opportunity_module(row, base)
+        lu_score, lu_nudge, lu_note = _a75_lineup_quality_module(row)
+
+        # Aggregate refinements with a hard cap. Existing K core remains the anchor.
+        nudge = max(-0.28, min(0.28, 0.45 * w_nudge + 0.40 * soi_nudge + 0.15 * lu_nudge))
+        p1 = None if base is None else round(max(0.0, min(15.0, base + nudge)), 2)
+        p2, sanity_shift, sanity_note, sanity_flag = _a75_sanity_checker(row, p1)
+        conf, danger, danger_reason = _a75_dynamic_confidence(row, p2, line, w_score, soi_score, lu_score, sanity_flag)
+
+        pitch_factor = _a75_first(row, ['Pitch Type Factor', 'pitch_type_factor'], 1.0) or 1.0
+        arsenal_score = max(35, min(65, 50 + (pitch_factor - 1.0) / 0.035 * 15))
+
+        out_proj.append(p2 if p2 is not None else '')
+        workload_scores.append(round(w_score, 1)); workload_notes.append(w_note)
+        soi_scores.append(round(soi_score, 1)); soi_notes.append(soi_note)
+        arsenal_scores.append(round(arsenal_score, 1))
+        lineup_scores.append(round(lu_score, 1)); lineup_notes.append(lu_note)
+        sanity_shifts.append(sanity_shift); sanity_notes.append(sanity_note)
+        confs.append(conf); total_nudges.append(round(nudge + sanity_shift, 2))
+        danger_tags.append('‼️ DANGER' if danger else '')
+        danger_notes.append(('Play at your risk — ' + danger_reason) if danger else 'Confidence calibration aligned')
+
+    if 'K PROJ' in d.columns and 'Pre-App75 K PROJ' not in d.columns:
+        d['Pre-App75 K PROJ'] = d['K PROJ']
+    d['Workload Engine Score'] = workload_scores
+    d['Workload Engine Note'] = workload_notes
+    d['Strikeout Opportunity Index'] = soi_scores
+    d['Whiff Interaction Note'] = soi_notes
+    d['Pitch Arsenal Matchup Score'] = arsenal_scores
+    d['Lineup Quality Score'] = lineup_scores
+    d['Lineup Quality Note'] = lineup_notes
+    d['Projection Sanity Shift'] = sanity_shifts
+    d['Projection Sanity Note'] = sanity_notes
+    d['App75 Total K Adjustment'] = total_nudges
+    d['App75 Final K PROJ'] = out_proj
+    d['App75 Confidence %'] = confs
+    d['App75 Danger Tag'] = danger_tags
+    d['App75 Danger Note'] = danger_notes
+    d['App75 Version'] = APP75_K_MODULE_VERSION
+
+    # Sync the regular K Upside board only. Do not touch Pitching Outs tables.
+    d['K PROJ'] = d['App75 Final K PROJ']
+    for c in ['Matchup Intelligence Final K Projection', 'Line-Aware Smart Final K Projection', 'Official K PROJ', 'Final K Projection']:
+        if c in d.columns:
+            d[c] = d['App75 Final K PROJ']
+    if 'Confidence %' in d.columns:
+        d['Confidence %'] = d['App75 Confidence %']
+    elif 'Confidence' in d.columns:
+        d['Confidence'] = d['App75 Confidence %']
+
+    # Keep the model side, while surfacing risk as requested.
+    if 'Decision' in d.columns:
+        for idx in d.index:
+            tag = d.at[idx, 'App75 Danger Tag']
+            if tag and tag not in str(d.at[idx, 'Decision']):
+                d.at[idx, 'Decision'] = f"{d.at[idx, 'Decision']} {tag}"
+    return d
+
+
+if 'build_kproj_table' in globals():
+    _prev_app75_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_app75_build_kproj_table(board)
+        try:
+            return _a75_apply_consolidated_modules(df)
+        except Exception as _app75_e:
+            try:
+                st.warning(f'App75 consolidated K modules skipped safely: {_app75_e}')
+            except Exception:
+                pass
+            return df
+
+
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
