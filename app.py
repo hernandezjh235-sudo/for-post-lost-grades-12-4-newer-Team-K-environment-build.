@@ -23,7 +23,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ v11.17 + v73 RECENT HIT RATE CAP / MATCHUP FIRST"
+APP_VERSION = "ONE WAY PICKZ v12.0 + APP78 FINAL PIPELINE CLEANUP"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -31426,13 +31426,11 @@ def _a70_env_nudge(row):
     nudge = 0.0
     reasons = []
     try:
-        # Existing matchup-intelligence nudge, if available, is heavily discounted.
+        # Matchup Intel already changed the core projection upstream.
+        # Read it for audit only; never apply it a second time here.
         mi = _a70_num(row.get('Matchup Intel K Nudge'), None)
-        if mi is not None:
-            v = max(-0.12, min(0.12, mi * 0.25))
-            nudge += v
-            if abs(v) >= 0.03:
-                reasons.append(f'MI {v:+.2f}')
+        if mi is not None and abs(mi) >= 0.01:
+            reasons.append(f'MI audit {mi:+.2f} (already applied)')
         env_blend = _a70_num(row.get('K Env Blend %'), None)
         if env_blend is not None:
             if env_blend >= 27:
@@ -31933,6 +31931,361 @@ if 'build_kproj_table' in globals():
         except Exception as _app75_e:
             try:
                 st.warning(f'App75 consolidated K modules skipped safely: {_app75_e}')
+            except Exception:
+                pass
+            return df
+
+
+# ============================================================
+# APP 78 / v12.0 — FINAL K PIPELINE CONSOLIDATION
+# ============================================================
+# Goals:
+# - Apply adaptive opponent recency exactly once (already inside Pre-App70 K PROJ).
+# - Combine all later secondary adjustments into one capped calibration budget.
+# - Use one unified risk score, one confidence engine, and one final decision gate.
+# - Keep OVER/UNDER visible; use ‼️ DANGER instead of repeated PASS gates.
+# - Leave the core K projection, BF/IP, Monte Carlo, learning, and Pitching Outs untouched.
+APP78_V12_VERSION = "APP78_V12_FINAL_PIPELINE_CONSOLIDATION_2026_07_11"
+APP78_SECONDARY_UP_CAP = 0.45
+APP78_SECONDARY_DOWN_CAP = -0.55
+
+
+def _a78_num(v, default=None):
+    try:
+        if v is None or v == "" or (isinstance(v, float) and np.isnan(v)):
+            return default
+        if isinstance(v, str):
+            s = v.replace('%', '').replace('K', '').replace(',', '').strip()
+            if not s or s in {'—', '-', 'None', 'nan', 'NL', 'NO LINE'}:
+                return default
+            return float(s)
+        return float(v)
+    except Exception:
+        return default
+
+
+def _a78_first(row, names, default=None):
+    for name in names:
+        if name in row:
+            v = _a78_num(row.get(name), None)
+            if v is not None:
+                return v
+    return default
+
+
+def _a78_line(row):
+    return _a78_first(row, ['UD/Line', 'UD Line', 'Line', 'line', 'K Line'], None)
+
+
+def _a78_core_anchor(row):
+    """Core anchor after adaptive recency, but before App70/App75 secondary layers."""
+    return _a78_first(row, [
+        'Pre-App70 K PROJ',
+        'Matchup Intelligence Final K Projection',
+        'Line-Aware Smart Final K Projection',
+        'K PROJ',
+        'Final K Projection',
+    ], None)
+
+
+def _a78_pct(v, default=None):
+    x = _a78_num(v, default)
+    if x is None:
+        return default
+    return x / 100.0 if abs(x) > 1.0 else x
+
+
+def _a78_unified_risk(row, workload_score, soi_score, lineup_score, sanity_flag=False):
+    """Single 0-100 risk score. Each underlying concern is counted once."""
+    role_risk = 0.0
+    workload_risk = 0.0
+    volatility_risk = 0.0
+    data_risk = 0.0
+    lineup_risk = 0.0
+    injury_risk = 0.0
+    reasons = []
+
+    text = ' '.join(str(row.get(c, '')) for c in [
+        'Role', 'role', 'Pitcher Role', 'Role Label', 'Starter Status',
+        'Volatility Label', 'Decision Note', 'Tester Note',
+        'Open/Bulk Role Signal 2.1', 'Injury Status', 'Risk Notes'
+    ]).upper()
+
+    if any(x in text for x in ['OPENER', 'BULK', 'RELIEF', 'SPOT START']):
+        role_risk = 24; reasons.append('unstable role')
+    elif any(x in text for x in ['ROOKIE', 'DEBUT', 'LOW SAMPLE', 'TINY_HISTORY', 'UNKNOWN']):
+        role_risk = 14; reasons.append('limited role sample')
+
+    if any(x in text for x in ['PITCH LIMIT', 'LIMITED', 'SHORT LEASH', 'HOOK', 'RETURN FROM IL']):
+        workload_risk = max(workload_risk, 22); reasons.append('leash/pitch-limit risk')
+
+    bf = _a78_first(row, ['Exp BF', 'Expected BF', 'Beta BF', 'BF'], None)
+    ip = _a78_first(row, ['IP Projection', 'Projected IP', 'IP Floor', 'Beta IP', 'IP'], None)
+    if bf is not None:
+        if bf < 17: workload_risk = max(workload_risk, 26); reasons.append('very low BF')
+        elif bf < 20: workload_risk = max(workload_risk, 16); reasons.append('low BF')
+    if ip is not None:
+        if ip < 3.0: workload_risk = max(workload_risk, 28); reasons.append('very low IP')
+        elif ip < 4.0: workload_risk = max(workload_risk, 17); reasons.append('low IP')
+
+    raw_vol = _a78_first(row, ['Volatility Score', 'Volatility Tax', 'Volatility', 'App70 Volatility Penalty'], 0) or 0
+    if raw_vol <= 10:
+        volatility_risk = min(22, raw_vol * 2.0)
+    else:
+        volatility_risk = min(25, raw_vol)
+    if volatility_risk >= 12:
+        reasons.append('high volatility')
+
+    data_score = _a78_first(row, ['Data Score', 'data_score', 'Official Data Score'], 78) or 78
+    data_risk = max(0, min(22, (75 - data_score) * 0.8))
+    if data_risk >= 8:
+        reasons.append('thin data')
+
+    if lineup_score is not None:
+        lineup_risk = max(0, min(15, (52 - lineup_score) * 0.45))
+    lineup_status = str(row.get('Lineup') or row.get('Lineup Status') or '').upper()
+    if any(x in lineup_status for x in ['FALLBACK', 'UNKNOWN', 'PROJECTED']):
+        lineup_risk = max(lineup_risk, 8)
+        reasons.append('lineup not confirmed')
+
+    if any(x in text for x in ['INJURY', 'IL RETURN', 'RETURNING', 'REHAB']):
+        injury_risk = 12; reasons.append('injury/return uncertainty')
+
+    # Workload/opportunity module outputs can reduce—not duplicate—risk.
+    support_credit = 0.0
+    if workload_score is not None:
+        support_credit += max(-5, min(8, (workload_score - 50) * 0.16))
+    if soi_score is not None:
+        support_credit += max(-4, min(6, (soi_score - 50) * 0.12))
+
+    total = role_risk + workload_risk + volatility_risk + data_risk + lineup_risk + injury_risk
+    total -= max(0, support_credit)
+    if sanity_flag:
+        total += 12
+        reasons.append('sanity ceiling conflict')
+    total = round(max(0.0, min(100.0, total)), 1)
+    label = 'LOW' if total < 25 else 'MEDIUM' if total < 50 else 'HIGH' if total < 72 else 'EXTREME'
+    return total, label, '; '.join(dict.fromkeys(reasons)) or 'no major risk conflict'
+
+
+def _a78_secondary_adjustment(row, core_proj):
+    """One budget for every non-core projection adjustment after adaptive recency."""
+    parts = []
+
+    # App70 historical stabilizer is retained as a small evidence-backed input.
+    hist = _a78_num(row.get('App70 History Nudge'), 0.0) or 0.0
+    parts.append(('history', hist))
+
+    # Fixed line-bucket penalties are converted to a small calibration input.
+    # Most of their effect now belongs in confidence/risk, not raw projection.
+    bucket = _a78_num(row.get('App70 Bucket Nudge'), 0.0) or 0.0
+    parts.append(('line bucket', bucket * 0.35))
+
+    # Volatility no longer changes projection here; it feeds unified risk only.
+
+    # Recompute the App75 micro-modules from the core anchor, once.
+    try:
+        w_score, w_nudge, w_note = _a75_workload_module(row)
+    except Exception:
+        w_score, w_nudge, w_note = 50.0, 0.0, 'workload unavailable'
+    try:
+        soi_score, soi_nudge, soi_note = _a75_whiff_opportunity_module(row, core_proj)
+    except Exception:
+        soi_score, soi_nudge, soi_note = 50.0, 0.0, 'opportunity unavailable'
+    try:
+        lu_score, lu_nudge, lu_note = _a75_lineup_quality_module(row)
+    except Exception:
+        lu_score, lu_nudge, lu_note = 50.0, 0.0, 'lineup unavailable'
+
+    parts.append(('workload', 0.45 * (_a78_num(w_nudge, 0.0) or 0.0)))
+    parts.append(('opportunity/whiff', 0.40 * (_a78_num(soi_nudge, 0.0) or 0.0)))
+    parts.append(('lineup', 0.15 * (_a78_num(lu_nudge, 0.0) or 0.0)))
+
+    raw = sum(v for _, v in parts)
+    capped = max(APP78_SECONDARY_DOWN_CAP, min(APP78_SECONDARY_UP_CAP, raw))
+    note = '; '.join(f'{k} {v:+.2f}' for k, v in parts if abs(v) >= 0.005) or 'secondary calibration neutral'
+    if abs(raw - capped) >= 0.005:
+        note += f'; budget cap {capped:+.2f}'
+    return round(capped, 3), note, w_score, w_note, soi_score, soi_note, lu_score, lu_note
+
+
+def _a78_final_confidence(row, projection, line, risk_score, workload_score, soi_score, lineup_score, sanity_flag):
+    if projection is None or line is None:
+        return None, 'no line/projection'
+    edge = abs(projection - line)
+    sim_prob = _a78_first(row, [
+        'Sim Pick %', 'Simulation Hit Rate %', 'Hit Rate %', 'Fair Probability %',
+        'App70 Confidence %', 'Confidence %', 'Confidence'
+    ], None)
+    if sim_prob is not None and sim_prob <= 1:
+        sim_prob *= 100
+    if sim_prob is None:
+        sim_prob = 50 + min(16, edge * 8)
+
+    data_score = _a78_first(row, ['Data Score', 'data_score', 'Official Data Score'], 78) or 78
+    edge_score = min(76, 50 + edge * 10)
+    support = 0.24 * workload_score + 0.24 * soi_score + 0.12 * lineup_score + 0.20 * edge_score + 0.20 * sim_prob
+    support -= risk_score * 0.22
+    if data_score < 70:
+        support -= (70 - data_score) * 0.35
+    if sanity_flag:
+        support -= 4
+    conf = round(max(35.0, min(76.0, support)), 1)
+    return conf, f'edge {edge:.2f}; risk {risk_score:.1f}; sim/base {sim_prob:.1f}'
+
+
+def _a78_final_decision(projection, line, confidence, risk_score, data_ok=True):
+    if projection is None:
+        return 'NO PROJECTION', '', None
+    if line is None:
+        return '🚫 NO UD LINE', '', None
+    if not data_ok:
+        return '🚫 PASS — DATA UNUSABLE', '', round(projection - line, 2)
+
+    edge = round(projection - line, 2)
+    side = 'OVER' if edge >= 0 else 'UNDER'
+    abs_edge = abs(edge)
+    danger = risk_score >= 45 or confidence < 55 or abs_edge < 0.55
+
+    if confidence >= 64 and abs_edge >= 1.25 and risk_score < 45:
+        prefix = '🔥'
+    elif confidence >= 57 and abs_edge >= 0.70:
+        prefix = '⚠️'
+    else:
+        prefix = '⚠️'
+        danger = True
+
+    decision = f'{prefix} {side}'
+    tag = '‼️ DANGER' if danger else ''
+    return decision, tag, edge
+
+
+def _a78_apply_final_pipeline(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+
+    final_proj = []
+    total_adj = []
+    adjustment_notes = []
+    sanity_shifts = []
+    sanity_notes = []
+    risk_scores = []
+    risk_labels = []
+    risk_notes = []
+    confidences = []
+    confidence_notes = []
+    decisions = []
+    danger_tags = []
+    final_edges = []
+    workload_scores = []
+    workload_notes = []
+    soi_scores = []
+    soi_notes = []
+    lineup_scores = []
+    lineup_notes = []
+
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        core = _a78_core_anchor(row)
+        line = _a78_line(row)
+
+        adj, adj_note, w_score, w_note, soi_score, soi_note, lu_score, lu_note = _a78_secondary_adjustment(row, core)
+        p1 = None if core is None else round(max(0.0, min(15.0, core + adj)), 2)
+        try:
+            p2, sanity_shift, sanity_note, sanity_flag = _a75_sanity_checker(row, p1)
+        except Exception:
+            p2, sanity_shift, sanity_note, sanity_flag = p1, 0.0, 'sanity unavailable', False
+
+        risk, risk_label, risk_note = _a78_unified_risk(row, w_score, soi_score, lu_score, sanity_flag)
+        conf, conf_note = _a78_final_confidence(row, p2, line, risk, w_score, soi_score, lu_score, sanity_flag)
+        data_score = _a78_first(row, ['Data Score', 'data_score', 'Official Data Score'], 78) or 78
+        data_ok = core is not None and data_score >= 35
+        dec, danger, edge = _a78_final_decision(p2, line, conf or 0, risk, data_ok=data_ok)
+
+        final_proj.append('' if p2 is None else round(p2, 2))
+        total_adj.append('' if core is None or p2 is None else round(p2 - core, 2))
+        adjustment_notes.append(adj_note)
+        sanity_shifts.append(round(_a78_num(sanity_shift, 0.0) or 0.0, 2))
+        sanity_notes.append(sanity_note)
+        risk_scores.append(risk)
+        risk_labels.append(risk_label)
+        risk_notes.append(risk_note)
+        confidences.append('' if conf is None else conf)
+        confidence_notes.append(conf_note)
+        decisions.append(dec)
+        danger_tags.append(danger)
+        final_edges.append('' if edge is None else edge)
+        workload_scores.append(round(w_score, 1)); workload_notes.append(w_note)
+        soi_scores.append(round(soi_score, 1)); soi_notes.append(soi_note)
+        lineup_scores.append(round(lu_score, 1)); lineup_notes.append(lu_note)
+
+    if 'K PROJ' in d.columns and 'Pre-App78 K PROJ' not in d.columns:
+        d['Pre-App78 K PROJ'] = d['K PROJ']
+    if 'Decision' in d.columns and 'Pre-App78 Decision' not in d.columns:
+        d['Pre-App78 Decision'] = d['Decision']
+    if 'Confidence %' in d.columns and 'Pre-App78 Confidence %' not in d.columns:
+        d['Pre-App78 Confidence %'] = d['Confidence %']
+
+    d['App78 Core Anchor K PROJ'] = [
+        '' if _a78_core_anchor(r.to_dict()) is None else round(_a78_core_anchor(r.to_dict()), 2)
+        for _, r in d.iterrows()
+    ]
+    d['App78 Secondary Adjustment'] = total_adj
+    d['App78 Adjustment Note'] = adjustment_notes
+    d['App78 Sanity Shift'] = sanity_shifts
+    d['App78 Sanity Note'] = sanity_notes
+    d['Unified Risk Score'] = risk_scores
+    d['Unified Risk Label'] = risk_labels
+    d['Unified Risk Note'] = risk_notes
+    d['Final Confidence %'] = confidences
+    d['Final Confidence Note'] = confidence_notes
+    d['Final Decision'] = decisions
+    d['Final Danger Tag'] = danger_tags
+    d['Final K Edge'] = final_edges
+    d['Final Workload Score'] = workload_scores
+    d['Final Workload Note'] = workload_notes
+    d['Final Strikeout Opportunity Index'] = soi_scores
+    d['Final Opportunity Note'] = soi_notes
+    d['Final Lineup Quality Score'] = lineup_scores
+    d['Final Lineup Quality Note'] = lineup_notes
+    d['App78 Final K PROJ'] = final_proj
+    d['App78 Version'] = APP78_V12_VERSION
+
+    # Final synchronization. Nothing after this wrapper may alter K projection/decision/confidence.
+    d['K PROJ'] = d['App78 Final K PROJ']
+    for c in ['Matchup Intelligence Final K Projection', 'Line-Aware Smart Final K Projection', 'Official K PROJ', 'Final K Projection', 'App70 Calibrated K PROJ', 'App75 Final K PROJ']:
+        if c in d.columns:
+            d[c] = d['App78 Final K PROJ']
+    for c in ['Edge Gap', 'Official K Edge', 'Line-Aware Smart Edge', 'App70 Edge']:
+        if c in d.columns:
+            d[c] = d['Final K Edge']
+    for c in ['Decision', 'Main Engine Action', 'Line-Aware Smart Decision', 'App70 Decision']:
+        if c in d.columns:
+            d[c] = d['Final Decision']
+    if 'Confidence %' in d.columns:
+        d['Confidence %'] = d['Final Confidence %']
+    if 'Confidence' in d.columns:
+        d['Confidence'] = d['Final Confidence %']
+
+    # Preserve the side while surfacing risk clearly.
+    if 'Decision' in d.columns:
+        for idx in d.index:
+            tag = str(d.at[idx, 'Final Danger Tag'] or '')
+            if tag and tag not in str(d.at[idx, 'Decision']):
+                d.at[idx, 'Decision'] = f"{d.at[idx, 'Decision']} {tag}"
+    return d
+
+
+if 'build_kproj_table' in globals():
+    _prev_app78_build_kproj_table = build_kproj_table
+    def build_kproj_table(board):
+        df = _prev_app78_build_kproj_table(board)
+        try:
+            return _a78_apply_final_pipeline(df)
+        except Exception as _app78_e:
+            try:
+                st.warning(f'v12 final K pipeline cleanup skipped safely: {_app78_e}')
             except Exception:
                 pass
             return df
