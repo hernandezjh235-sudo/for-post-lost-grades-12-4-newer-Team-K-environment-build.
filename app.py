@@ -27832,7 +27832,7 @@ def _okr_mlb_season():
         return 2026
 
 
-def _okr_fetch_bdfed_split(season, sit_code=None, last30=False):
+def _okr_fetch_bdfed_split(season, sit_code=None, last30=False, lookback_days=None):
     """Official MLB.com stats backend used by MLB Stats pages. Returns parsed rows or []."""
     try:
         import requests
@@ -27851,10 +27851,12 @@ def _okr_fetch_bdfed_split(season, sit_code=None, last30=False):
         }
         if sit_code:
             params["sitCodes"] = sit_code
-        if last30 and _okr_dt:
+        days = int(lookback_days or (30 if last30 else 0))
+        if days > 0 and _okr_dt:
             end = _okr_dt.date.today()
-            start = end - _okr_dt.timedelta(days=30)
-            # BDFED commonly honors startDate/endDate. If ignored, the source still returns season data.
+            start = end - _okr_dt.timedelta(days=days)
+            # BDFED commonly honors startDate/endDate. The response is validated downstream
+            # through PA/sample-size reliability before recent form can affect projections.
             params["startDate"] = start.strftime("%Y-%m-%d")
             params["endDate"] = end.strftime("%Y-%m-%d")
         r = requests.get(base, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
@@ -27899,9 +27901,15 @@ def _okr_cache_fetch_table(season=None):
         "Overall": _okr_fetch_bdfed_split(season, None, False),
         "vs RHP": _okr_fetch_bdfed_split(season, "vr", False),
         "vs LHP": _okr_fetch_bdfed_split(season, "vl", False),
-        "L30 Overall": _okr_fetch_bdfed_split(season, None, True),
-        "L30 vs RHP": _okr_fetch_bdfed_split(season, "vr", True),
-        "L30 vs LHP": _okr_fetch_bdfed_split(season, "vl", True),
+        "L5 Overall": _okr_fetch_bdfed_split(season, None, lookback_days=5),
+        "L5 vs RHP": _okr_fetch_bdfed_split(season, "vr", lookback_days=5),
+        "L5 vs LHP": _okr_fetch_bdfed_split(season, "vl", lookback_days=5),
+        "L15 Overall": _okr_fetch_bdfed_split(season, None, lookback_days=15),
+        "L15 vs RHP": _okr_fetch_bdfed_split(season, "vr", lookback_days=15),
+        "L15 vs LHP": _okr_fetch_bdfed_split(season, "vl", lookback_days=15),
+        "L30 Overall": _okr_fetch_bdfed_split(season, None, lookback_days=30),
+        "L30 vs RHP": _okr_fetch_bdfed_split(season, "vr", lookback_days=30),
+        "L30 vs LHP": _okr_fetch_bdfed_split(season, "vl", lookback_days=30),
     }
     # If last-30 pull fails or is ignored, keep blanks rather than faking ranks.
     merged = {}
@@ -28099,48 +28107,71 @@ def _owp_overlay_full_board_pitcher_k_rank(card_row):
         return card_row
 
 def _okr_mi_blended_k_pct(rec, hand):
-    """Verified MLB team K% blend for small projection nudge.
+    """Recency-weighted verified team K% blend in percent units.
 
-    Returns percent units (e.g. 24.7), not decimal.
+    The day-to-day profile emphasizes current form without replacing the stable
+    handedness baseline. Target weights when all samples are trustworthy:
+      45% L5 vs pitcher hand
+      30% L15 vs pitcher hand
+      15% L30 vs pitcher hand
+      10% season vs pitcher hand
 
-    CAREFUL WEIGHTING:
-    - 35% Team K% Overall
-    - 45% Team K% vs pitcher hand (vs RHP/LHP)
-    - 20% Team K% last 30 days vs pitcher hand
-
-    Missing pieces are safely re-normalized. This keeps the matchup environment
-    useful without letting one missing split break or over-swing the projection.
+    Recent windows are reliability-shrunk by plate appearances. A five-game
+    stretch therefore cannot dominate when the team has too few PA or when the
+    feed fails to return a real date-filtered sample. Missing/weak recent weight
+    automatically flows back to the season handedness baseline.
     """
     try:
+        rec = rec or {}
         hand = str(hand or '').upper()
         split = 'vs LHP' if hand == 'LHP' else 'vs RHP' if hand == 'RHP' else None
+        if not split:
+            return None, 'NO_HAND_FOR_RECENCY_BLEND'
 
-        pieces = []
-        # Overall season K% = stability anchor.
-        pieces.append((_okr_num((rec or {}).get('K% Overall'), None), 0.35, '35% overall'))
-
-        # Hand-specific split = most important matchup piece.
-        if split:
-            pieces.append((_okr_num((rec or {}).get(f'K% {split}'), None), 0.45, f'45% season {split}'))
-            pieces.append((_okr_num((rec or {}).get(f'K% L30 {split}'), None), 0.20, f'20% L30 {split}'))
-
-        vals = [(v, w, n) for v, w, n in pieces if v is not None]
-        if not vals:
+        season_v = _okr_num(rec.get(f'K% {split}'), None)
+        overall_v = _okr_num(rec.get('K% Overall'), None)
+        anchor = season_v if season_v is not None else overall_v
+        if anchor is None:
             return None, 'NO_VERIFIED_K_BLEND'
 
-        total_w = sum(w for _, w, _ in vals) or 1.0
-        blend = sum(v * w for v, w, _ in vals) / total_w
-        note = ' + '.join([f'{int(round((w/total_w)*100))}% {n.split(" ", 1)[-1]}' for _, w, n in vals])
-        return round(float(blend), 2), note
+        # (name, target weight, minimum PA for full reliability)
+        windows = [('L5', 0.45, 150.0), ('L15', 0.30, 400.0), ('L30', 0.15, 750.0)]
+        weighted_sum = float(anchor) * 0.10
+        used_weight = 0.10
+        details = [f'10% season {split}']
+        unused_recent = 0.0
+
+        for name, target_w, full_pa in windows:
+            val = _okr_num(rec.get(f'K% {name} {split}'), None)
+            pa = _okr_num(rec.get(f'PA {name} {split}'), None)
+            if val is None or pa is None or pa <= 0:
+                unused_recent += target_w
+                continue
+            reliability = max(0.0, min(1.0, float(pa) / full_pa))
+            eff_w = target_w * reliability
+            unused_recent += target_w - eff_w
+            if eff_w > 0:
+                weighted_sum += float(val) * eff_w
+                used_weight += eff_w
+                details.append(f'{eff_w*100:.0f}% {name} {split} (PA {int(pa)})')
+
+        # Shift all unsupported/noisy recent weight back to the stable hand split.
+        weighted_sum += float(anchor) * unused_recent
+        used_weight += unused_recent
+        if unused_recent > 0.001:
+            details.append(f'{unused_recent*100:.0f}% recent shrink -> season')
+
+        blend = weighted_sum / max(used_weight, 1e-9)
+        return round(float(blend), 2), ' + '.join(details)
     except Exception:
-        return None, 'K_BLEND_ERROR'
+        return None, 'K_RECENCY_BLEND_ERROR'
 
 
 def _okr_mi_projection_nudge(row, rec, hand):
     """Small capped K-environment projection nudge from official MLB team K%.
 
-    The verified K environment is blended as:
-      35% overall + 45% vs pitcher hand + 20% last-30 vs pitcher hand.
+    The verified K environment uses a sample-size-aware recency blend:
+      L5 + L15 + L30 vs pitcher hand, anchored by season vs-hand K%.
 
     It then compares verified team K% to the model's existing opponent K%.
     ORIGINAL-ANCHOR TESTER: the adjustment is intentionally tiny and capped
@@ -28256,7 +28287,10 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
 
     opp_teams, p_teams, hands = [], [], []
     k_hand, rank_hand, label_hand, source_hand = [], [], [], []
-    k_rhp, r_rhp, k_lhp, r_lhp, k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], [], [], [], [], []
+    k_rhp, r_rhp, k_lhp, r_lhp = [], [], [], []
+    k_l5_rhp, r_l5_rhp, k_l5_lhp, r_l5_lhp = [], [], [], []
+    k_l15_rhp, r_l15_rhp, k_l15_lhp, r_l15_lhp = [], [], [], []
+    k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], []
     k_overall, r_overall, so_overall, so_rank_overall, pa_overall = [], [], [], [], []
     k_l30_overall, r_l30_overall, so_l30_overall, so_rank_l30_overall, pa_l30_overall = [], [], [], [], []
     top5_note = []
@@ -28300,6 +28334,10 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         source_hand.append(src_used or "")
         k_rhp.append(rec.get("K% vs RHP", "")); r_rhp.append(rec.get("K Rank vs RHP", ""))
         k_lhp.append(rec.get("K% vs LHP", "")); r_lhp.append(rec.get("K Rank vs LHP", ""))
+        k_l5_rhp.append(rec.get("K% L5 vs RHP", "")); r_l5_rhp.append(rec.get("K Rank L5 vs RHP", ""))
+        k_l5_lhp.append(rec.get("K% L5 vs LHP", "")); r_l5_lhp.append(rec.get("K Rank L5 vs LHP", ""))
+        k_l15_rhp.append(rec.get("K% L15 vs RHP", "")); r_l15_rhp.append(rec.get("K Rank L15 vs RHP", ""))
+        k_l15_lhp.append(rec.get("K% L15 vs LHP", "")); r_l15_lhp.append(rec.get("K Rank L15 vs LHP", ""))
         k_l30_rhp.append(rec.get("K% L30 vs RHP", "")); r_l30_rhp.append(rec.get("K Rank L30 vs RHP", ""))
         k_l30_lhp.append(rec.get("K% L30 vs LHP", "")); r_l30_lhp.append(rec.get("K Rank L30 vs LHP", ""))
         k_overall.append(rec.get("K% Overall", "")); r_overall.append(rec.get("K Rank Overall", ""))
@@ -28319,6 +28357,14 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     d["Opp K Rank vs RHP Official"] = r_rhp
     d["Opp K% vs LHP Official"] = k_lhp
     d["Opp K Rank vs LHP Official"] = r_lhp
+    d["Opp L5 K% vs RHP Official"] = k_l5_rhp
+    d["Opp L5 K Rank vs RHP Official"] = r_l5_rhp
+    d["Opp L5 K% vs LHP Official"] = k_l5_lhp
+    d["Opp L5 K Rank vs LHP Official"] = r_l5_lhp
+    d["Opp L15 K% vs RHP Official"] = k_l15_rhp
+    d["Opp L15 K Rank vs RHP Official"] = r_l15_rhp
+    d["Opp L15 K% vs LHP Official"] = k_l15_lhp
+    d["Opp L15 K Rank vs LHP Official"] = r_l15_lhp
     d["Opp L30 K% vs RHP Official"] = k_l30_rhp
     d["Opp L30 K Rank vs RHP Official"] = r_l30_rhp
     d["Opp L30 K% vs LHP Official"] = k_l30_lhp
@@ -28362,9 +28408,9 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Team K Read"] = ""
 
     # Matchup Intelligence Projection Nudge — original-anchor light weight only.
-    # Uses 35% overall + 45% hand split + 20% L30 hand split; caps at +/-0.20 K.
+    # Uses PA-shrunk L5/L15/L30 vs-hand K% plus season anchor; caps at +/-0.20 K.
     try:
-        mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified = [], [], [], [], [], []
+        mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified, mi_blend_detail = [], [], [], [], [], [], []
         for idx, row in d.iterrows():
             rd = row.to_dict()
             opp = _okr_abbr(rd.get("Opponent Team"))
@@ -28374,16 +28420,19 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
             if base is None:
                 base = _okr_num(rd.get("K PROJ"), None)
             adj, lab, why, verified = _okr_mi_projection_nudge(rd, rec, hand)
+            _, blend_detail = _okr_mi_blended_k_pct(rec, hand)
             final = base if base is None else round(max(0.0, float(base) + float(adj)), 2)
             mi_pre.append("" if base is None else round(float(base), 2))
-            mi_adj.append(adj); mi_final.append("" if final is None else final); mi_label.append(lab); mi_reason.append(why); mi_verified.append("" if verified is None else round(float(verified), 2))
+            mi_adj.append(adj); mi_final.append("" if final is None else final); mi_label.append(lab); mi_reason.append(why); mi_verified.append("" if verified is None else round(float(verified), 2)); mi_blend_detail.append(blend_detail)
         d["Pre-Matchup Intel K Projection"] = mi_pre
         d["Matchup Intel K Nudge"] = mi_adj
         d["Matchup Intel Label"] = mi_label
         d["Matchup Intel Reason"] = mi_reason
         d["Matchup Intel Verified Team K%"] = mi_verified
+        d["Recency Team K Blend Detail"] = mi_blend_detail
+        d["Recency Team K Blend Method"] = "45% L5 + 30% L15 + 15% L30 + 10% season vs hand; PA reliability shrink to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_ORIGINAL_ANCHOR_WEIGHT_0_12_CAP_0_20_2026_07_06"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_RECENCY_L5_L15_L30_PA_SHRINK_WEIGHT_0_12_CAP_0_20_2026_07_10"
         # Promote this as the final display/export projection, but record the pre-value above.
         for c in ["K PROJ", "Line-Aware Smart Final K Projection", "Final K Projection"]:
             if c in d.columns:
@@ -28414,7 +28463,7 @@ def _okr_top5_test_table():
         table = _okr_fetch_team_k_table(_okr_mlb_season()) or {}
         rows = []
         for team, rec in table.items():
-            for split in ["Overall", "vs RHP", "vs LHP", "L30 Overall", "L30 vs RHP", "L30 vs LHP"]:
+            for split in ["Overall", "vs RHP", "vs LHP", "L5 Overall", "L5 vs RHP", "L5 vs LHP", "L15 Overall", "L15 vs RHP", "L15 vs LHP", "L30 Overall", "L30 vs RHP", "L30 vs LHP"]:
                 rows.append({
                     "Split": split,
                     "Team": team,
