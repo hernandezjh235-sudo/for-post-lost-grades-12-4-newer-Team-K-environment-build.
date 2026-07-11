@@ -28106,66 +28106,132 @@ def _owp_overlay_full_board_pitcher_k_rank(card_row):
     except Exception:
         return card_row
 
-def _okr_mi_blended_k_pct(rec, hand):
-    """Recency-weighted verified team K% blend in percent units.
+def _okr_mi_adaptive_weight_profile(rec, hand):
+    """Return adaptive recency weights for opponent K% versus pitcher hand.
 
-    The day-to-day profile emphasizes current form without replacing the stable
-    handedness baseline. Target weights when all samples are trustworthy:
-      45% L5 vs pitcher hand
-      30% L15 vs pitcher hand
-      15% L30 vs pitcher hand
-      10% season vs pitcher hand
+    The profile reacts to sample quality and trend agreement:
+      * L5 can rise to 55% when L5 and L15 agree and both samples are reliable.
+      * L5 falls toward 25-35% when the sample is thin or conflicts sharply with L15.
+      * Unsupported recent weight automatically returns to the season split.
 
-    Recent windows are reliability-shrunk by plate appearances. A five-game
-    stretch therefore cannot dominate when the team has too few PA or when the
-    feed fails to return a real date-filtered sample. Missing/weak recent weight
-    automatically flows back to the season handedness baseline.
+    This prevents a noisy five-game stretch from dominating while still allowing
+    genuine current lineup trends to matter more than a stale season average.
     """
     try:
         rec = rec or {}
         hand = str(hand or '').upper()
         split = 'vs LHP' if hand == 'LHP' else 'vs RHP' if hand == 'RHP' else None
         if not split:
-            return None, 'NO_HAND_FOR_RECENCY_BLEND'
+            return None
+
+        vals = {}
+        pas = {}
+        full_pa = {'L5': 150.0, 'L15': 400.0, 'L30': 750.0}
+        for name in ('L5', 'L15', 'L30'):
+            vals[name] = _okr_num(rec.get(f'K% {name} {split}'), None)
+            pas[name] = _okr_num(rec.get(f'PA {name} {split}'), None)
 
         season_v = _okr_num(rec.get(f'K% {split}'), None)
-        overall_v = _okr_num(rec.get('K% Overall'), None)
-        anchor = season_v if season_v is not None else overall_v
-        if anchor is None:
+        if season_v is None:
+            season_v = _okr_num(rec.get('K% Overall'), None)
+        if season_v is None:
+            return None
+
+        rel = {}
+        for name in ('L5', 'L15', 'L30'):
+            pa = pas[name]
+            rel[name] = 0.0 if pa is None or pa <= 0 else max(0.0, min(1.0, float(pa) / full_pa[name]))
+
+        # Default balanced profile.
+        mode = 'BALANCED_45_30_15_10'
+        targets = {'L5': 0.45, 'L15': 0.30, 'L30': 0.15, 'SEASON': 0.10}
+
+        v5, v15 = vals.get('L5'), vals.get('L15')
+        r5, r15 = rel.get('L5', 0.0), rel.get('L15', 0.0)
+
+        if v5 is None or r5 < 0.35:
+            targets = {'L5': 0.25, 'L15': 0.35, 'L30': 0.20, 'SEASON': 0.20}
+            mode = 'LOW_L5_RELIABILITY_25_35_20_20'
+        elif v15 is None or r15 < 0.35:
+            targets = {'L5': 0.35, 'L15': 0.20, 'L30': 0.20, 'SEASON': 0.25}
+            mode = 'LOW_L15_SUPPORT_35_20_20_25'
+        else:
+            diff_5_15 = abs(float(v5) - float(v15))
+            same_direction = ((float(v5) - float(season_v)) * (float(v15) - float(season_v))) >= 0
+            if r5 >= 0.90 and r15 >= 0.75 and same_direction and diff_5_15 <= 2.5:
+                targets = {'L5': 0.55, 'L15': 0.25, 'L30': 0.10, 'SEASON': 0.10}
+                mode = 'CONFIRMED_CURRENT_TREND_55_25_10_10'
+            elif r5 >= 0.70 and r15 >= 0.60 and same_direction and diff_5_15 <= 4.0:
+                targets = {'L5': 0.50, 'L15': 0.27, 'L30': 0.13, 'SEASON': 0.10}
+                mode = 'SUPPORTED_CURRENT_TREND_50_27_13_10'
+            elif diff_5_15 >= 6.0 or not same_direction:
+                targets = {'L5': 0.30, 'L15': 0.35, 'L30': 0.20, 'SEASON': 0.15}
+                mode = 'CONFLICTING_RECENCY_30_35_20_15'
+            elif r5 < 0.60:
+                targets = {'L5': 0.35, 'L15': 0.35, 'L30': 0.20, 'SEASON': 0.10}
+                mode = 'MODERATE_L5_RELIABILITY_35_35_20_10'
+
+        # Reliability-shrink each recent target; missing weight returns to season.
+        effective = {'SEASON': float(targets['SEASON'])}
+        shrink_to_season = 0.0
+        for name in ('L5', 'L15', 'L30'):
+            if vals[name] is None or rel[name] <= 0:
+                effective[name] = 0.0
+                shrink_to_season += float(targets[name])
+            else:
+                effective[name] = float(targets[name]) * float(rel[name])
+                shrink_to_season += float(targets[name]) - effective[name]
+        effective['SEASON'] += shrink_to_season
+
+        # Floating-point guard: normalize to exactly 1.0.
+        total = sum(effective.values())
+        if total <= 0:
+            effective = {'L5': 0.0, 'L15': 0.0, 'L30': 0.0, 'SEASON': 1.0}
+        else:
+            effective = {k: float(v) / total for k, v in effective.items()}
+
+        return {
+            'split': split,
+            'season': float(season_v),
+            'values': vals,
+            'pa': pas,
+            'reliability': rel,
+            'targets': targets,
+            'effective': effective,
+            'mode': mode,
+        }
+    except Exception:
+        return None
+
+
+def _okr_mi_blended_k_pct(rec, hand):
+    """Adaptive, sample-aware opponent K% blend in percent units."""
+    try:
+        profile = _okr_mi_adaptive_weight_profile(rec, hand)
+        if not profile:
             return None, 'NO_VERIFIED_K_BLEND'
 
-        # (name, target weight, minimum PA for full reliability)
-        windows = [('L5', 0.45, 150.0), ('L15', 0.30, 400.0), ('L30', 0.15, 750.0)]
-        weighted_sum = float(anchor) * 0.10
-        used_weight = 0.10
-        details = [f'10% season {split}']
-        unused_recent = 0.0
+        eff = profile['effective']
+        vals = profile['values']
+        season_v = profile['season']
+        split = profile['split']
 
-        for name, target_w, full_pa in windows:
-            val = _okr_num(rec.get(f'K% {name} {split}'), None)
-            pa = _okr_num(rec.get(f'PA {name} {split}'), None)
-            if val is None or pa is None or pa <= 0:
-                unused_recent += target_w
-                continue
-            reliability = max(0.0, min(1.0, float(pa) / full_pa))
-            eff_w = target_w * reliability
-            unused_recent += target_w - eff_w
-            if eff_w > 0:
-                weighted_sum += float(val) * eff_w
-                used_weight += eff_w
-                details.append(f'{eff_w*100:.0f}% {name} {split} (PA {int(pa)})')
+        blend = float(season_v) * float(eff['SEASON'])
+        details = [f"mode={profile['mode']}"]
+        for name in ('L5', 'L15', 'L30'):
+            val = vals.get(name)
+            w = float(eff.get(name, 0.0))
+            pa = profile['pa'].get(name)
+            if val is not None and w > 0:
+                blend += float(val) * w
+                details.append(f"{w*100:.1f}% {name} {split}={float(val):.2f}% (PA {int(pa) if pa else 0})")
+        details.append(f"{float(eff['SEASON'])*100:.1f}% season {split}={float(season_v):.2f}%")
 
-        # Shift all unsupported/noisy recent weight back to the stable hand split.
-        weighted_sum += float(anchor) * unused_recent
-        used_weight += unused_recent
-        if unused_recent > 0.001:
-            details.append(f'{unused_recent*100:.0f}% recent shrink -> season')
-
-        blend = weighted_sum / max(used_weight, 1e-9)
-        return round(float(blend), 2), ' + '.join(details)
+        target_text = '/'.join(f"{profile['targets'][k]*100:.0f}" for k in ('L5','L15','L30','SEASON'))
+        details.append(f"target L5/L15/L30/season={target_text}")
+        return round(float(blend), 2), ' | '.join(details)
     except Exception:
         return None, 'K_RECENCY_BLEND_ERROR'
-
 
 def _okr_mi_projection_nudge(row, rec, hand):
     """Small capped K-environment projection nudge from official MLB team K%.
@@ -28430,9 +28496,9 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Matchup Intel Reason"] = mi_reason
         d["Matchup Intel Verified Team K%"] = mi_verified
         d["Recency Team K Blend Detail"] = mi_blend_detail
-        d["Recency Team K Blend Method"] = "45% L5 + 30% L15 + 15% L30 + 10% season vs hand; PA reliability shrink to season"
+        d["Recency Team K Blend Method"] = "Adaptive L5/L15/L30/season vs hand: L5 25-55% based on PA reliability and L5-L15 trend agreement; unsupported recent weight shrinks to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_RECENCY_L5_L15_L30_PA_SHRINK_WEIGHT_0_12_CAP_0_20_2026_07_10"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_ADAPTIVE_RECENCY_L5_25_55_L15_L30_SEASON_PA_TREND_SHRINK_WEIGHT_0_12_CAP_0_20_2026_07_11"
         # Promote this as the final display/export projection, but record the pre-value above.
         for c in ["K PROJ", "Line-Aware Smart Final K Projection", "Final K Projection"]:
             if c in d.columns:
