@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -32335,8 +32336,8 @@ def _app82_role(row):
     if any(k in blob for k in ["starter", "probable", "confirmed"]):
         return "STARTER"
     # Market/workload evidence fallback.
-    ip = _app82_first_num(row, ["APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"])
-    bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ", "BF Projection", "Projected Batters Faced", "Expected Batters Faced"])
+    ip = _app82_first_num(row, ["IP", "IP PROJ", "Projected IP", "Beta IP", "APP78 Core Anchor IP", "Projected Innings"])
+    bf = _app82_first_num(row, ["Exp BF", "BF", "Projected BF", "Expected BF", "BF PROJ", "BF Projection", "Projected Batters Faced", "Expected Batters Faced"])
     if (_app82_np.isfinite(ip) and ip >= 3.0) or (_app82_np.isfinite(bf) and bf >= 14):
         return "STARTER_LIKELY"
     return "UNKNOWN"
@@ -32346,8 +32347,8 @@ def _app82_sustainable_k_rate(row):
     candidates = [
         (["Pitcher K%", "K%", "Season K%", "Pitcher K Rate", "Pitcher K Rate %", "Season K Rate", "K Rate", "K Rate %"], 0.40),
         (["K Env Blend %", "K Environment Blend %", "K Env Blend", "K Environment %"], 0.15),
-        (["CSW%", "CSW %", "CSW", "CSW Rate", "CSW Rate %"], 0.15),
-        (["SwStr%", "SwStr %", "SwStr", "SwStr Rate", "SwStr Rate %"], 0.10),
+        (["T12 CSW%", "CSW%", "CSW %", "CSW", "CSW Rate", "CSW Rate %"], 0.15),
+        (["T12 SwStr%", "SwStr%", "SwStr %", "SwStr", "SwStr Rate", "SwStr Rate %"], 0.10),
         (["Recent K%", "L5 K%", "L10 K%"], 0.10),
         (["Opponent K%", "Opp K%", "Recency Team K Blend"], 0.10),
     ]
@@ -32394,13 +32395,26 @@ def _app82_apply(df):
         ip = _app82_first_num(row, [
             "APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"
         ])
-        bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ", "BF Projection", "Projected Batters Faced", "Expected Batters Faced"])
+        bf = _app82_first_num(row, ["Exp BF", "BF", "Projected BF", "Expected BF", "BF PROJ", "BF Projection", "Projected Batters Faced", "Expected Batters Faced"])
         if not _app82_np.isfinite(bf) and _app82_np.isfinite(ip):
             bf = max(3.0, ip * 4.25)
 
         kr = _app82_sustainable_k_rate(row)
         sustainable = bf * kr if (_app82_np.isfinite(bf) and _app82_np.isfinite(kr)) else _app82_np.nan
-        anchor_inputs_missing = not (_app82_np.isfinite(bf) and _app82_np.isfinite(kr))
+
+        # Live-schema BF-to-K projections already produced upstream by the app.
+        # Blend them with the sustainable BF*K-rate anchor rather than ignoring them.
+        bf_k_21 = _app82_first_num(row, ["BF-K Expected K 2.1"])
+        bf_k_22 = _app82_first_num(row, ["BF-to-K Conversion Projection 2.2"])
+        bf_anchors = [x for x in [bf_k_21, bf_k_22] if _app82_np.isfinite(x)]
+        if bf_anchors:
+            bf_k_anchor = sum(bf_anchors) / len(bf_anchors)
+            if _app82_np.isfinite(sustainable):
+                sustainable = 0.60 * sustainable + 0.40 * bf_k_anchor
+            else:
+                sustainable = bf_k_anchor
+
+        anchor_inputs_missing = not _app82_np.isfinite(sustainable)
 
         p10 = _app82_first_num(row, ["p10", "P10", "Sim P10", "K P10", "K Sim P10", "Pre Calibration P10", "pre_calibration_p10"])
         p90 = _app82_first_num(row, ["p90", "P90", "Sim P90", "K P90", "K Sim P90", "Pre Calibration P90", "pre_calibration_p90"])
@@ -32925,3 +32939,5 @@ with tab6:
             save_json(LINE_HISTORY_FILE, {})
             save_json(LINEUP_CACHE_FILE, {})
             st.error("All logs cleared.")
+
+
