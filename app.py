@@ -32336,7 +32336,7 @@ def _app82_role(row):
         return "STARTER"
     # Market/workload evidence fallback.
     ip = _app82_first_num(row, ["APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"])
-    bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ"])
+    bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ", "BF Projection", "Projected Batters Faced", "Expected Batters Faced"])
     if (_app82_np.isfinite(ip) and ip >= 3.0) or (_app82_np.isfinite(bf) and bf >= 14):
         return "STARTER_LIKELY"
     return "UNKNOWN"
@@ -32344,10 +32344,10 @@ def _app82_role(row):
 def _app82_sustainable_k_rate(row):
     vals, weights = [], []
     candidates = [
-        (["Pitcher K%", "K%", "Season K%", "Pitcher K Rate"], 0.40),
-        (["K Env Blend %", "K Environment Blend %"], 0.15),
-        (["CSW%", "CSW %"], 0.15),
-        (["SwStr%", "SwStr %"], 0.10),
+        (["Pitcher K%", "K%", "Season K%", "Pitcher K Rate", "Pitcher K Rate %", "Season K Rate", "K Rate", "K Rate %"], 0.40),
+        (["K Env Blend %", "K Environment Blend %", "K Env Blend", "K Environment %"], 0.15),
+        (["CSW%", "CSW %", "CSW", "CSW Rate", "CSW Rate %"], 0.15),
+        (["SwStr%", "SwStr %", "SwStr", "SwStr Rate", "SwStr Rate %"], 0.10),
         (["Recent K%", "L5 K%", "L10 K%"], 0.10),
         (["Opponent K%", "Opp K%", "Recency Team K Blend"], 0.10),
     ]
@@ -32363,6 +32363,11 @@ def _app82_sustainable_k_rate(row):
                 x = max(0.10, min(0.40, x * 1.55))
             vals.append(x); weights.append(w)
     if not vals:
+        # Fallback to K/9 translated to approximate K/BF when the export schema
+        # does not expose a direct K-rate column under the expected aliases.
+        k9 = _app82_first_num(row, ["K/9", "K9", "Pitcher K/9", "Season K/9", "K Per 9"])
+        if _app82_np.isfinite(k9):
+            return max(0.08, min(0.40, k9 / 38.0))
         return _app82_np.nan
     return sum(v*w for v,w in zip(vals,weights)) / sum(weights)
 
@@ -32389,15 +32394,16 @@ def _app82_apply(df):
         ip = _app82_first_num(row, [
             "APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"
         ])
-        bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ"])
+        bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ", "BF Projection", "Projected Batters Faced", "Expected Batters Faced"])
         if not _app82_np.isfinite(bf) and _app82_np.isfinite(ip):
             bf = max(3.0, ip * 4.25)
 
         kr = _app82_sustainable_k_rate(row)
         sustainable = bf * kr if (_app82_np.isfinite(bf) and _app82_np.isfinite(kr)) else _app82_np.nan
+        anchor_inputs_missing = not (_app82_np.isfinite(bf) and _app82_np.isfinite(kr))
 
-        p10 = _app82_first_num(row, ["p10", "P10", "Sim P10", "K P10"])
-        p90 = _app82_first_num(row, ["p90", "P90", "Sim P90", "K P90"])
+        p10 = _app82_first_num(row, ["p10", "P10", "Sim P10", "K P10", "K Sim P10", "Pre Calibration P10", "pre_calibration_p10"])
+        p90 = _app82_first_num(row, ["p90", "P90", "Sim P90", "K P90", "K Sim P90", "Pre Calibration P90", "pre_calibration_p90"])
         width = (p90 - p10) if (_app82_np.isfinite(p90) and _app82_np.isfinite(p10)) else _app82_np.nan
 
         adj = 0.0
@@ -32436,6 +32442,8 @@ def _app82_apply(df):
         edge = abs(fp - line) if (_app82_np.isfinite(line) and _app82_np.isfinite(fp)) else _app82_np.nan
 
         flags = []
+        if anchor_inputs_missing:
+            flags.append("ANCHOR_INPUTS_MISSING")
         # Simulation ceiling/floor conflict affects selection, not projection.
         if side == "UNDER" and _app82_np.isfinite(p90) and _app82_np.isfinite(line) and p90 >= line + 1.5:
             flags.append("HIGH_CEILING_UNDER")
