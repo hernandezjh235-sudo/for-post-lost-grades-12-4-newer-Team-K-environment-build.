@@ -32289,7 +32289,207 @@ if 'build_kproj_table' in globals():
             except Exception:
                 pass
             return df
+APP82_ACTIVE_PIPELINE_VERSION = "APP82_FIXED_ACTIVE_v2"
 
+# =============================================================================
+# APP82 — PROJECTION REALITY ANCHOR + WORKLOAD/CEILING VALIDATION
+# Added after App78 cleanup. This layer is intentionally conservative:
+# - It does NOT globally raise/lower projections.
+# - It repairs only strong contradictions between final K projection,
+#   sustainable K skill, expected BF/workload, and simulation ceiling.
+# - It keeps side visible and uses DANGER/TRACK when evidence conflicts.
+# =============================================================================
+
+import math as _app82_math
+import numpy as _app82_np
+import pandas as _app82_pd
+
+def _app82_num(v, default=_app82_np.nan):
+    try:
+        x = float(v)
+        return x if _app82_np.isfinite(x) else default
+    except Exception:
+        return default
+
+def _app82_first_num(row, names, default=_app82_np.nan):
+    for n in names:
+        if n in row.index:
+            x = _app82_num(row.get(n), _app82_np.nan)
+            if _app82_np.isfinite(x):
+                return x
+    return default
+
+def _app82_pct(x):
+    x = _app82_num(x, _app82_np.nan)
+    if not _app82_np.isfinite(x):
+        return _app82_np.nan
+    return x / 100.0 if x > 1.0 else x
+
+def _app82_role(row):
+    blob = " ".join(str(row.get(c, "")) for c in [
+        "Role", "Pitcher Role", "Starter Status", "Probable Starter",
+        "Role Stability", "Role/Leash", "Beta Flags", "K Flags"
+    ]).lower()
+    if any(k in blob for k in ["reliever", "bullpen", "opener"]):
+        return "RELIEF_OR_OPENER"
+    if any(k in blob for k in ["starter", "probable", "confirmed"]):
+        return "STARTER"
+    # Market/workload evidence fallback.
+    ip = _app82_first_num(row, ["APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"])
+    bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ"])
+    if (_app82_np.isfinite(ip) and ip >= 3.0) or (_app82_np.isfinite(bf) and bf >= 14):
+        return "STARTER_LIKELY"
+    return "UNKNOWN"
+
+def _app82_sustainable_k_rate(row):
+    vals, weights = [], []
+    candidates = [
+        (["Pitcher K%", "K%", "Season K%", "Pitcher K Rate"], 0.40),
+        (["K Env Blend %", "K Environment Blend %"], 0.15),
+        (["CSW%", "CSW %"], 0.15),
+        (["SwStr%", "SwStr %"], 0.10),
+        (["Recent K%", "L5 K%", "L10 K%"], 0.10),
+        (["Opponent K%", "Opp K%", "Recency Team K Blend"], 0.10),
+    ]
+    for names, w in candidates:
+        x = _app82_first_num(row, names)
+        x = _app82_pct(x)
+        if _app82_np.isfinite(x):
+            # CSW and SwStr are not direct K rates; map gently toward K-rate space.
+            joined = " ".join(names)
+            if "CSW" in joined:
+                x = max(0.10, min(0.40, (x - 0.20) * 0.75 + 0.20))
+            elif "SwStr" in joined:
+                x = max(0.10, min(0.40, x * 1.55))
+            vals.append(x); weights.append(w)
+    if not vals:
+        return _app82_np.nan
+    return sum(v*w for v,w in zip(vals,weights)) / sum(weights)
+
+def _app82_apply(df):
+    if df is None or not isinstance(df, _app82_pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+
+    proj_col = next((c for c in [
+        "APP78 Final K Projection", "Matchup Intelligence Final K Projection",
+        "K PROJ", "Projection", "Beta Projection"
+    ] if c in out.columns), None)
+    line_col = next((c for c in ["UD Line", "Line", "K Line", "stat_value"] if c in out.columns), None)
+    if proj_col is None:
+        return out
+
+    anchors, adjustments, reasons, roles, contradictions = [], [], [], [], []
+    final_proj, final_side, danger, tiers = [], [], [], []
+
+    for _, row in out.iterrows():
+        p = _app82_num(row.get(proj_col))
+        line = _app82_num(row.get(line_col)) if line_col else _app82_np.nan
+        role = _app82_role(row)
+        ip = _app82_first_num(row, [
+            "APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"
+        ])
+        bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ"])
+        if not _app82_np.isfinite(bf) and _app82_np.isfinite(ip):
+            bf = max(3.0, ip * 4.25)
+
+        kr = _app82_sustainable_k_rate(row)
+        sustainable = bf * kr if (_app82_np.isfinite(bf) and _app82_np.isfinite(kr)) else _app82_np.nan
+
+        p10 = _app82_first_num(row, ["p10", "P10", "Sim P10", "K P10"])
+        p90 = _app82_first_num(row, ["p90", "P90", "Sim P90", "K P90"])
+        width = (p90 - p10) if (_app82_np.isfinite(p90) and _app82_np.isfinite(p10)) else _app82_np.nan
+
+        adj = 0.0
+        why = []
+
+        # Reality anchor: only repair large contradictions; never replace the model.
+        if _app82_np.isfinite(sustainable) and _app82_np.isfinite(p):
+            gap = sustainable - p
+            if gap >= 1.50:
+                adj += min(0.45, gap * 0.22)
+                why.append("LOW_K_CONTRADICTION")
+            elif gap <= -1.50:
+                adj -= min(0.40, abs(gap) * 0.20)
+                why.append("HIGH_K_CONTRADICTION")
+
+        # Starter workload contradiction. Do not blindly inflate IP; flag and add only
+        # a tiny K repair when a starter-like role has an implausibly low workload.
+        workload_conflict = False
+        if role in ("STARTER", "STARTER_LIKELY") and _app82_np.isfinite(ip) and ip < 3.75:
+            workload_conflict = True
+            why.append("STARTER_WORKLOAD_CONFLICT")
+            if _app82_np.isfinite(kr):
+                # modest fallback toward 4.25 IP, capped tightly
+                fallback_bf = 4.25 * 4.25
+                fallback_k = fallback_bf * kr
+                if _app82_np.isfinite(p) and fallback_k > p:
+                    adj += min(0.25, (fallback_k - p) * 0.15)
+
+        # One combined reality-anchor budget.
+        adj = max(-0.45, min(0.55, adj))
+        fp = p + adj if _app82_np.isfinite(p) else p
+
+        side = ""
+        if _app82_np.isfinite(line) and _app82_np.isfinite(fp):
+            side = "OVER" if fp > line else "UNDER"
+        edge = abs(fp - line) if (_app82_np.isfinite(line) and _app82_np.isfinite(fp)) else _app82_np.nan
+
+        flags = []
+        # Simulation ceiling/floor conflict affects selection, not projection.
+        if side == "UNDER" and _app82_np.isfinite(p90) and _app82_np.isfinite(line) and p90 >= line + 1.5:
+            flags.append("HIGH_CEILING_UNDER")
+        if side == "OVER" and _app82_np.isfinite(p10) and _app82_np.isfinite(line) and p10 <= line - 1.5:
+            flags.append("LOW_FLOOR_OVER")
+        if _app82_np.isfinite(width) and width >= 5.0:
+            flags.append("WIDE_SIM_RANGE")
+        if workload_conflict:
+            flags.append("WORKLOAD_ROLE_CONFLICT")
+        if why and any(x in why for x in ["LOW_K_CONTRADICTION", "HIGH_K_CONTRADICTION"]):
+            flags.append("BF_K_CONTRADICTION")
+
+        is_danger = bool(flags)
+        # Selection tiers: projection remains visible; thin/conflicted plays are not official.
+        tier = "TRACK ONLY"
+        if _app82_np.isfinite(edge):
+            if edge >= 1.0 and not is_danger:
+                tier = "OFFICIAL"
+            elif edge >= 0.50 and not is_danger:
+                tier = "PLAYABLE"
+            elif edge >= 1.0 and is_danger:
+                tier = "PLAYABLE ‼️ DANGER"
+            else:
+                tier = "TRACK ONLY ‼️ DANGER" if is_danger else "TRACK ONLY"
+
+        anchors.append(sustainable)
+        adjustments.append(adj)
+        reasons.append(",".join(why) if why else "NO_REALITY_REPAIR")
+        roles.append(role)
+        contradictions.append(",".join(flags) if flags else "NONE")
+        final_proj.append(fp)
+        final_side.append(side)
+        danger.append("‼️ DANGER" if is_danger else "")
+        tiers.append(tier)
+
+    out["APP82 Sustainable K Anchor"] = anchors
+    out["APP82 Reality Adjustment"] = adjustments
+    out["APP82 Reality Reason"] = reasons
+    out["APP82 Role Validation"] = roles
+    out["APP82 Contradiction Flags"] = contradictions
+    out["APP82 Final K Projection"] = final_proj
+    out["APP82 Final Side"] = final_side
+    out["APP82 Danger"] = danger
+    out["APP82 Selection Tier"] = tiers
+    return out
+
+# Wrap the final K table once. Preserve all upstream engines and App78.
+try:
+    _app82_prev_build_kproj_table = build_kproj_table
+    def build_kproj_table(*args, **kwargs):
+        _df = _app82_prev_build_kproj_table(*args, **kwargs)
+        return _app82_apply(_df)
+except Exception:
+    pass
 
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
@@ -32717,206 +32917,3 @@ with tab6:
             save_json(LINE_HISTORY_FILE, {})
             save_json(LINEUP_CACHE_FILE, {})
             st.error("All logs cleared.")
-
-
-# =============================================================================
-# APP82 — PROJECTION REALITY ANCHOR + WORKLOAD/CEILING VALIDATION
-# Added after App78 cleanup. This layer is intentionally conservative:
-# - It does NOT globally raise/lower projections.
-# - It repairs only strong contradictions between final K projection,
-#   sustainable K skill, expected BF/workload, and simulation ceiling.
-# - It keeps side visible and uses DANGER/TRACK when evidence conflicts.
-# =============================================================================
-
-import math as _app82_math
-import numpy as _app82_np
-import pandas as _app82_pd
-
-def _app82_num(v, default=_app82_np.nan):
-    try:
-        x = float(v)
-        return x if _app82_np.isfinite(x) else default
-    except Exception:
-        return default
-
-def _app82_first_num(row, names, default=_app82_np.nan):
-    for n in names:
-        if n in row.index:
-            x = _app82_num(row.get(n), _app82_np.nan)
-            if _app82_np.isfinite(x):
-                return x
-    return default
-
-def _app82_pct(x):
-    x = _app82_num(x, _app82_np.nan)
-    if not _app82_np.isfinite(x):
-        return _app82_np.nan
-    return x / 100.0 if x > 1.0 else x
-
-def _app82_role(row):
-    blob = " ".join(str(row.get(c, "")) for c in [
-        "Role", "Pitcher Role", "Starter Status", "Probable Starter",
-        "Role Stability", "Role/Leash", "Beta Flags", "K Flags"
-    ]).lower()
-    if any(k in blob for k in ["reliever", "bullpen", "opener"]):
-        return "RELIEF_OR_OPENER"
-    if any(k in blob for k in ["starter", "probable", "confirmed"]):
-        return "STARTER"
-    # Market/workload evidence fallback.
-    ip = _app82_first_num(row, ["APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"])
-    bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ"])
-    if (_app82_np.isfinite(ip) and ip >= 3.0) or (_app82_np.isfinite(bf) and bf >= 14):
-        return "STARTER_LIKELY"
-    return "UNKNOWN"
-
-def _app82_sustainable_k_rate(row):
-    vals, weights = [], []
-    candidates = [
-        (["Pitcher K%", "K%", "Season K%", "Pitcher K Rate"], 0.40),
-        (["K Env Blend %", "K Environment Blend %"], 0.15),
-        (["CSW%", "CSW %"], 0.15),
-        (["SwStr%", "SwStr %"], 0.10),
-        (["Recent K%", "L5 K%", "L10 K%"], 0.10),
-        (["Opponent K%", "Opp K%", "Recency Team K Blend"], 0.10),
-    ]
-    for names, w in candidates:
-        x = _app82_first_num(row, names)
-        x = _app82_pct(x)
-        if _app82_np.isfinite(x):
-            # CSW and SwStr are not direct K rates; map gently toward K-rate space.
-            joined = " ".join(names)
-            if "CSW" in joined:
-                x = max(0.10, min(0.40, (x - 0.20) * 0.75 + 0.20))
-            elif "SwStr" in joined:
-                x = max(0.10, min(0.40, x * 1.55))
-            vals.append(x); weights.append(w)
-    if not vals:
-        return _app82_np.nan
-    return sum(v*w for v,w in zip(vals,weights)) / sum(weights)
-
-def _app82_apply(df):
-    if df is None or not isinstance(df, _app82_pd.DataFrame) or df.empty:
-        return df
-    out = df.copy()
-
-    proj_col = next((c for c in [
-        "APP78 Final K Projection", "Matchup Intelligence Final K Projection",
-        "K PROJ", "Projection", "Beta Projection"
-    ] if c in out.columns), None)
-    line_col = next((c for c in ["UD Line", "Line", "K Line", "stat_value"] if c in out.columns), None)
-    if proj_col is None:
-        return out
-
-    anchors, adjustments, reasons, roles, contradictions = [], [], [], [], []
-    final_proj, final_side, danger, tiers = [], [], [], []
-
-    for _, row in out.iterrows():
-        p = _app82_num(row.get(proj_col))
-        line = _app82_num(row.get(line_col)) if line_col else _app82_np.nan
-        role = _app82_role(row)
-        ip = _app82_first_num(row, [
-            "APP78 Core Anchor IP", "IP PROJ", "Projected IP", "Beta IP", "IP"
-        ])
-        bf = _app82_first_num(row, ["BF", "Projected BF", "Expected BF", "BF PROJ"])
-        if not _app82_np.isfinite(bf) and _app82_np.isfinite(ip):
-            bf = max(3.0, ip * 4.25)
-
-        kr = _app82_sustainable_k_rate(row)
-        sustainable = bf * kr if (_app82_np.isfinite(bf) and _app82_np.isfinite(kr)) else _app82_np.nan
-
-        p10 = _app82_first_num(row, ["p10", "P10", "Sim P10", "K P10"])
-        p90 = _app82_first_num(row, ["p90", "P90", "Sim P90", "K P90"])
-        width = (p90 - p10) if (_app82_np.isfinite(p90) and _app82_np.isfinite(p10)) else _app82_np.nan
-
-        adj = 0.0
-        why = []
-
-        # Reality anchor: only repair large contradictions; never replace the model.
-        if _app82_np.isfinite(sustainable) and _app82_np.isfinite(p):
-            gap = sustainable - p
-            if gap >= 1.50:
-                adj += min(0.45, gap * 0.22)
-                why.append("LOW_K_CONTRADICTION")
-            elif gap <= -1.50:
-                adj -= min(0.40, abs(gap) * 0.20)
-                why.append("HIGH_K_CONTRADICTION")
-
-        # Starter workload contradiction. Do not blindly inflate IP; flag and add only
-        # a tiny K repair when a starter-like role has an implausibly low workload.
-        workload_conflict = False
-        if role in ("STARTER", "STARTER_LIKELY") and _app82_np.isfinite(ip) and ip < 3.75:
-            workload_conflict = True
-            why.append("STARTER_WORKLOAD_CONFLICT")
-            if _app82_np.isfinite(kr):
-                # modest fallback toward 4.25 IP, capped tightly
-                fallback_bf = 4.25 * 4.25
-                fallback_k = fallback_bf * kr
-                if _app82_np.isfinite(p) and fallback_k > p:
-                    adj += min(0.25, (fallback_k - p) * 0.15)
-
-        # One combined reality-anchor budget.
-        adj = max(-0.45, min(0.55, adj))
-        fp = p + adj if _app82_np.isfinite(p) else p
-
-        side = ""
-        if _app82_np.isfinite(line) and _app82_np.isfinite(fp):
-            side = "OVER" if fp > line else "UNDER"
-        edge = abs(fp - line) if (_app82_np.isfinite(line) and _app82_np.isfinite(fp)) else _app82_np.nan
-
-        flags = []
-        # Simulation ceiling/floor conflict affects selection, not projection.
-        if side == "UNDER" and _app82_np.isfinite(p90) and _app82_np.isfinite(line) and p90 >= line + 1.5:
-            flags.append("HIGH_CEILING_UNDER")
-        if side == "OVER" and _app82_np.isfinite(p10) and _app82_np.isfinite(line) and p10 <= line - 1.5:
-            flags.append("LOW_FLOOR_OVER")
-        if _app82_np.isfinite(width) and width >= 5.0:
-            flags.append("WIDE_SIM_RANGE")
-        if workload_conflict:
-            flags.append("WORKLOAD_ROLE_CONFLICT")
-        if why and any(x in why for x in ["LOW_K_CONTRADICTION", "HIGH_K_CONTRADICTION"]):
-            flags.append("BF_K_CONTRADICTION")
-
-        is_danger = bool(flags)
-        # Selection tiers: projection remains visible; thin/conflicted plays are not official.
-        tier = "TRACK ONLY"
-        if _app82_np.isfinite(edge):
-            if edge >= 1.0 and not is_danger:
-                tier = "OFFICIAL"
-            elif edge >= 0.50 and not is_danger:
-                tier = "PLAYABLE"
-            elif edge >= 1.0 and is_danger:
-                tier = "PLAYABLE ‼️ DANGER"
-            else:
-                tier = "TRACK ONLY ‼️ DANGER" if is_danger else "TRACK ONLY"
-
-        anchors.append(sustainable)
-        adjustments.append(adj)
-        reasons.append(",".join(why) if why else "NO_REALITY_REPAIR")
-        roles.append(role)
-        contradictions.append(",".join(flags) if flags else "NONE")
-        final_proj.append(fp)
-        final_side.append(side)
-        danger.append("‼️ DANGER" if is_danger else "")
-        tiers.append(tier)
-
-    out["APP82 Sustainable K Anchor"] = anchors
-    out["APP82 Reality Adjustment"] = adjustments
-    out["APP82 Reality Reason"] = reasons
-    out["APP82 Role Validation"] = roles
-    out["APP82 Contradiction Flags"] = contradictions
-    out["APP82 Final K Projection"] = final_proj
-    out["APP82 Final Side"] = final_side
-    out["APP82 Danger"] = danger
-    out["APP82 Selection Tier"] = tiers
-    return out
-
-# Wrap the final K table once. Preserve all upstream engines and App78.
-try:
-    _app82_prev_build_kproj_table = build_kproj_table
-    def build_kproj_table(*args, **kwargs):
-        _df = _app82_prev_build_kproj_table(*args, **kwargs)
-        return _app82_apply(_df)
-except Exception:
-    pass
-
-
