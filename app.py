@@ -32513,6 +32513,195 @@ try:
 except Exception:
     pass
 
+
+# =============================================================================
+# APP85 — ORIGINAL-K PRESERVATION + TARGETED K MISS DIAGNOSTICS
+# Architecture:
+#   ORIGINAL BASE_K (preserved) ->
+#   Lineup K Signal + Arsenal Signal + BF/Workload Risk +
+#   Line Difficulty + Recent Skill -> Risk/Upside classification
+#
+# IMPORTANT: Diagnostic signals DO NOT overwrite BASE_K.
+# They are exported separately for backtesting. Projection adjustments should
+# only be enabled after historical testing proves incremental accuracy.
+# =============================================================================
+import numpy as _a85_np
+import pandas as _a85_pd
+
+APP85_VERSION = "APP85_ORIGINAL_K_PLUS_TARGETED_DIAGNOSTICS_v1"
+
+def _a85_num(v, default=_a85_np.nan):
+    try:
+        x = float(v)
+        return x if _a85_np.isfinite(x) else default
+    except Exception:
+        return default
+
+def _a85_first(row, names):
+    for n in names:
+        if n in row.index:
+            x = _a85_num(row.get(n))
+            if _a85_np.isfinite(x):
+                return x
+    return _a85_np.nan
+
+def _a85_pct(v):
+    x = _a85_num(v)
+    if not _a85_np.isfinite(x):
+        return _a85_np.nan
+    return x / 100.0 if x > 1 else x
+
+def _a85_apply(df):
+    if df is None or not isinstance(df, _a85_pd.DataFrame) or df.empty:
+        return df
+    z = df.copy()
+
+    base_candidates = [
+        "APP78 Final K Projection", "APP78 Final K PROJ",
+        "Matchup Intelligence Final K Projection", "Final K PROJ",
+        "K PROJ", "Projection", "Beta Projection"
+    ]
+    line_candidates = ["UD Line", "Line", "K Line", "stat_value"]
+    ip_candidates = ["IP", "IP PROJ", "Projected IP", "Beta IP", "Projected Innings"]
+    bf_candidates = ["Exp BF", "Expected BF", "Projected BF", "BF PROJ", "BF"]
+
+    rows = []
+    for _, r in z.iterrows():
+        base = _a85_first(r, base_candidates)
+        line = _a85_first(r, line_candidates)
+        ip = _a85_first(r, ip_candidates)
+        bf = _a85_first(r, bf_candidates)
+        pk = _a85_pct(_a85_first(r, ["Pitcher K%", "K%", "Pitcher K Rate %", "Season K%"]))
+        oppk = _a85_pct(_a85_first(r, [
+            "Opponent K%", "Opp K%", "K Env Blend %", "Recency Team K Blend",
+            "Opp L5 K% vs Hand", "Opp L15 K% vs Hand", "Opp L30 K% vs Hand"
+        ]))
+        csw = _a85_pct(_a85_first(r, ["T12 CSW%", "CSW%", "CSW %"]))
+        sw = _a85_pct(_a85_first(r, ["T12 SwStr%", "SwStr%", "SwStr %"]))
+        putaway = _a85_pct(_a85_first(r, ["PutAway%", "Putaway Rate", "Put Away %", "PutAway Rate"]))
+
+        # Lineup-specific K opportunity: use actual lineup fields when present.
+        lineup_vals = []
+        for c in r.index:
+            cl = c.lower()
+            if ("lineup" in cl or "batter" in cl) and "k%" in cl:
+                x = _a85_pct(r.get(c))
+                if _a85_np.isfinite(x):
+                    lineup_vals.append(x)
+        lineup_k = sum(lineup_vals)/len(lineup_vals) if lineup_vals else _a85_np.nan
+
+        # Arsenal compatibility: consume existing pitch/arsenal matchup fields if available.
+        arsenal = _a85_first(r, [
+            "Pitch Arsenal Matchup", "Pitch Arsenal Matchup Score",
+            "Arsenal Matchup Score", "Arsenal Edge", "Pitch Mix Matchup"
+        ])
+
+        # Existing BF-to-K projections are audit anchors, not replacements for BASE_K.
+        bfk1 = _a85_first(r, ["BF-K Expected K 2.1"])
+        bfk2 = _a85_first(r, ["BF-to-K Conversion Projection 2.2"])
+        bfk = _a85_np.nan
+        vals = [x for x in [bfk1, bfk2] if _a85_np.isfinite(x)]
+        if vals: bfk = sum(vals)/len(vals)
+
+        # Expected BF uncertainty / workload risk.
+        workload_flags = []
+        if _a85_np.isfinite(ip) and ip < 3.5:
+            workload_flags.append("LOW_IP")
+        if _a85_np.isfinite(bf) and bf < 16:
+            workload_flags.append("LOW_BF")
+        if _a85_np.isfinite(ip) and _a85_np.isfinite(bf) and ip > 0:
+            bf_per_ip = bf/ip
+            if bf_per_ip < 3.5 or bf_per_ip > 5.5:
+                workload_flags.append("BF_IP_CONTRADICTION")
+
+        # Line difficulty: flag thresholds materially above BASE_K / historical-style expectation.
+        line_diff = (line - base) if (_a85_np.isfinite(line) and _a85_np.isfinite(base)) else _a85_np.nan
+        line_flag = ""
+        if _a85_np.isfinite(line_diff):
+            if line_diff >= 1.0: line_flag = "HARD_LINE_ABOVE_BASE"
+            elif line_diff >= 0.5: line_flag = "LINE_ABOVE_BASE"
+            elif line_diff <= -1.0: line_flag = "FAVORABLE_LINE_BELOW_BASE"
+
+        # Recent skill signal from CSW/SwStr without changing projection.
+        recent_skill = []
+        if _a85_np.isfinite(csw):
+            recent_skill.append((csw - 0.27) / 0.05)
+        if _a85_np.isfinite(sw):
+            recent_skill.append((sw - 0.12) / 0.04)
+        recent_score = sum(recent_skill)/len(recent_skill) if recent_skill else _a85_np.nan
+
+        # Team/lineup opportunity differential.
+        matchup_k = lineup_k if _a85_np.isfinite(lineup_k) else oppk
+        lineup_signal = _a85_np.nan
+        if _a85_np.isfinite(matchup_k) and _a85_np.isfinite(pk):
+            lineup_signal = (0.55*pk + 0.45*matchup_k) * (bf if _a85_np.isfinite(bf) else 0)
+
+        # Risk/upside classification only.
+        tags = []
+        if _a85_np.isfinite(lineup_signal) and _a85_np.isfinite(base):
+            if lineup_signal >= base + 1.0: tags.append("LINEUP_K_UPSIDE")
+            elif lineup_signal <= base - 1.0: tags.append("LINEUP_K_DOWNSIDE")
+        if _a85_np.isfinite(bfk) and _a85_np.isfinite(base):
+            if bfk >= base + 1.0: tags.append("BFK_UPSIDE")
+            elif bfk <= base - 1.0: tags.append("BFK_DOWNSIDE")
+        if _a85_np.isfinite(recent_score):
+            if recent_score >= 0.75: tags.append("RECENT_SKILL_UP")
+            elif recent_score <= -0.75: tags.append("RECENT_SKILL_DOWN")
+        if workload_flags: tags.append("WORKLOAD_RISK")
+        if line_flag: tags.append(line_flag)
+
+        # Protect elite-K pitchers from automatic generic downside classifications.
+        elite = _a85_np.isfinite(pk) and pk >= 0.28
+        if elite: tags.append("ELITE_K_SKILL")
+
+        upside = sum(t in tags for t in ["LINEUP_K_UPSIDE","BFK_UPSIDE","RECENT_SKILL_UP","FAVORABLE_LINE_BELOW_BASE"])
+        risk = sum(t in tags for t in ["LINEUP_K_DOWNSIDE","BFK_DOWNSIDE","RECENT_SKILL_DOWN","WORKLOAD_RISK","HARD_LINE_ABOVE_BASE"])
+        if upside >= 2 and risk == 0:
+            cls = "UPSIDE CONFIRMED"
+        elif risk >= 2 and upside == 0:
+            cls = "‼️ DANGER"
+        elif upside > risk:
+            cls = "UPSIDE LEAN"
+        elif risk > upside:
+            cls = "RISK LEAN"
+        else:
+            cls = "NEUTRAL"
+
+        rows.append({
+            "APP85 BASE_K (Original Preserved)": base,
+            "APP85 Final K Projection": base,
+            "APP85 Lineup K Signal": lineup_signal,
+            "APP85 Lineup K%": lineup_k,
+            "APP85 Pitcher K%": pk*100 if _a85_np.isfinite(pk) else _a85_np.nan,
+            "APP85 Opponent K%": oppk*100 if _a85_np.isfinite(oppk) else _a85_np.nan,
+            "APP85 Expected BF": bf,
+            "APP85 PutAway Rate": putaway*100 if _a85_np.isfinite(putaway) else _a85_np.nan,
+            "APP85 Arsenal Matchup Score": arsenal,
+            "APP85 BF-to-K Anchor": bfk,
+            "APP85 Recent Skill Score": recent_score,
+            "APP85 Line Difficulty": line_diff,
+            "APP85 Workload Risk": ",".join(workload_flags) if workload_flags else "NONE",
+            "APP85 Risk/Upside Tags": ",".join(tags) if tags else "NONE",
+            "APP85 Risk/Upside Class": cls,
+            "APP85 Projection Adjustment": 0.0,
+            "APP85 Adjustment Mode": "DIAGNOSTIC_ONLY_BACKTEST_FIRST",
+        })
+
+    audit = _a85_pd.DataFrame(rows, index=z.index)
+    for c in audit.columns:
+        z[c] = audit[c]
+    return z
+
+# Wrap the active final K table before Streamlit UI renders.
+try:
+    _a85_prev_build_kproj_table = build_kproj_table
+    def build_kproj_table(*args, **kwargs):
+        _df = _a85_prev_build_kproj_table(*args, **kwargs)
+        return _a85_apply(_df)
+except Exception:
+    pass
+
+
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
