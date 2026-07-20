@@ -32702,6 +32702,574 @@ except Exception:
     pass
 
 
+# =============================================================================
+# APP86 — DAILY LINEUP K% REFRESH / TEAM-LINEUP K ENVIRONMENT
+# Preserves Original BASE_K and Pitching Outs. Diagnostic only.
+# =============================================================================
+import time as _a86_time
+import numpy as _a86_np
+import pandas as _a86_pd
+
+APP86_VERSION = "APP86_ORIGINAL_K_DAILY_LINEUP_K_REFRESH_v1"
+
+def _a86_num(v):
+    try:
+        x = float(v)
+        return x if _a86_np.isfinite(x) else _a86_np.nan
+    except Exception:
+        return _a86_np.nan
+
+def _a86_pct(v):
+    x = _a86_num(v)
+    if not _a86_np.isfinite(x):
+        return _a86_np.nan
+    return x / 100.0 if x > 1 else x
+
+def _a86_lineup_k_values(row):
+    overall, vs_r, vs_l = [], [], []
+    for c in row.index:
+        cl = str(c).lower()
+        if "k%" not in cl or not any(t in cl for t in ["lineup", "batter", "hitter"]):
+            continue
+        x = _a86_pct(row.get(c))
+        if not _a86_np.isfinite(x):
+            continue
+        if "vs rhp" in cl or "vs right" in cl:
+            vs_r.append(x)
+        elif "vs lhp" in cl or "vs left" in cl:
+            vs_l.append(x)
+        else:
+            overall.append(x)
+    return overall, vs_r, vs_l
+
+def _a86_apply(df):
+    if df is None or not isinstance(df, _a86_pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    team_vals=[]; hand_vals=[]; counts=[]; statuses=[]; sources=[]; stamps=[]
+
+    for _, row in out.iterrows():
+        overall, vs_r, vs_l = _a86_lineup_k_values(row)
+        hand = str(row.get("Pitcher Hand", row.get("Throws", row.get("Pitcher Throws","")))).upper()
+        overall_avg = sum(overall)/len(overall) if overall else _a86_np.nan
+
+        if hand.startswith("L") and vs_l:
+            hand_avg, n = sum(vs_l)/len(vs_l), len(vs_l)
+        elif hand.startswith("R") and vs_r:
+            hand_avg, n = sum(vs_r)/len(vs_r), len(vs_r)
+        else:
+            hand_avg, n = overall_avg, len(overall)
+
+        if not _a86_np.isfinite(hand_avg):
+            if hand.startswith("L"):
+                hand_avg = _a86_pct(row.get("Opp K% vs LHP Official"))
+            elif hand.startswith("R"):
+                hand_avg = _a86_pct(row.get("Opp K% vs RHP Official"))
+
+        if not _a86_np.isfinite(overall_avg):
+            overall_avg = _a86_pct(row.get("Team Batter K% Overall Official"))
+
+        if n >= 9:
+            status, source = "CONFIRMED/COMPLETE_9", "BATTER_LEVEL_LINEUP"
+        elif n >= 7:
+            status, source = "NEAR_COMPLETE_7_8", "BATTER_LEVEL_LINEUP"
+        elif n > 0:
+            status, source = f"PARTIAL_LINEUP_{n}", "BATTER_LEVEL_LINEUP"
+        else:
+            status, source = "TEAM_RATE_FALLBACK", "OFFICIAL_TEAM_K_RATE_FALLBACK"
+
+        team_vals.append(overall_avg*100 if _a86_np.isfinite(overall_avg) else _a86_np.nan)
+        hand_vals.append(hand_avg*100 if _a86_np.isfinite(hand_avg) else _a86_np.nan)
+        counts.append(int(n))
+        statuses.append(status)
+        sources.append(source)
+        stamps.append(_a86_time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    out["APP86 Daily Lineup Team K%"] = team_vals
+    out["APP86 Daily Lineup K% vs Pitcher Hand"] = hand_vals
+    out["APP86 Lineup Batter Count"] = counts
+    out["APP86 Lineup Refresh Status"] = statuses
+    out["APP86 Lineup K% Source"] = sources
+    out["APP86 Lineup Refresh Timestamp"] = stamps
+
+    if "APP85 Lineup K%" in out.columns:
+        fresh = _a86_pd.to_numeric(out["APP86 Daily Lineup K% vs Pitcher Hand"], errors="coerce")
+        old = _a86_pd.to_numeric(out["APP85 Lineup K%"], errors="coerce")
+        out["APP85 Lineup K%"] = fresh.where(fresh.notna(), old)
+    return out
+
+try:
+    _a86_prev_build_kproj_table = build_kproj_table
+    def build_kproj_table(*args, **kwargs):
+        return _a86_apply(_a86_prev_build_kproj_table(*args, **kwargs))
+except Exception:
+    pass
+
+
+# =============================================================================
+# APP87 — FULL ACTIVE MATCHUP ADJUSTMENT ENGINE
+# Original BASE_K remains the anchor. Pitching Outs stays untouched.
+# =============================================================================
+import numpy as _a87_np
+import pandas as _a87_pd
+
+APP87_VERSION = "APP87_FULL_ACTIVE_K_MATCHUP_ENGINE_v1"
+
+def _a87_num(v):
+    try:
+        x = float(v)
+        return x if _a87_np.isfinite(x) else _a87_np.nan
+    except Exception:
+        return _a87_np.nan
+
+def _a87_clip(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _a87_apply(df):
+    if df is None or not isinstance(df, _a87_pd.DataFrame) or df.empty:
+        return df
+
+    out = df.copy()
+    final_proj=[]; lineup_adj_col=[]; bfk_adj_col=[]; recent_adj_col=[]
+    workload_adj_col=[]; total_adj_col=[]; side_col=[]; flip_guard_col=[]
+    active_signal_count_col=[]; decision_note_col=[]
+
+    for _, row in out.iterrows():
+        base = _a87_num(row.get("APP85 BASE_K (Original Preserved)"))
+        if not _a87_np.isfinite(base):
+            base = _a87_num(row.get("APP85 Final K Projection"))
+        if not _a87_np.isfinite(base):
+            base = _a87_num(row.get("K PROJ"))
+
+        line = _a87_num(row.get("UD Line"))
+        if not _a87_np.isfinite(line):
+            line = _a87_num(row.get("Line"))
+
+        lineup_k = _a87_num(row.get("APP86 Daily Lineup K% vs Pitcher Hand"))
+        opp_k = _a87_num(row.get("APP85 Opponent K%"))
+        exp_bf = _a87_num(row.get("APP85 Expected BF"))
+
+        lineup_adj = 0.0
+        if _a87_np.isfinite(lineup_k) and _a87_np.isfinite(opp_k):
+            if not _a87_np.isfinite(exp_bf):
+                exp_bf = 22.0
+            raw_lineup = ((lineup_k - opp_k) / 100.0) * exp_bf
+            lineup_adj = _a87_clip(raw_lineup * 0.35, -0.22, 0.22)
+
+        bfk = _a87_num(row.get("APP85 BF-to-K Anchor"))
+        bfk_adj = 0.0
+        if _a87_np.isfinite(bfk) and _a87_np.isfinite(base):
+            bfk_adj = _a87_clip((bfk - base) * 0.16, -0.18, 0.18)
+
+        recent_score = _a87_num(row.get("APP85 Recent Skill Score"))
+        recent_adj = 0.0
+        if _a87_np.isfinite(recent_score):
+            recent_adj = _a87_clip(recent_score * 0.07, -0.12, 0.12)
+
+        workload = str(row.get("APP85 Workload Risk", "") or "").upper()
+        workload_adj = 0.0
+        if "BF_IP_CONTRADICTION" in workload:
+            workload_adj -= 0.10
+        elif "LOW_BF" in workload and "LOW_IP" in workload:
+            workload_adj -= 0.08
+        elif "LOW_BF" in workload or "LOW_IP" in workload:
+            workload_adj -= 0.04
+
+        raw_total = lineup_adj + bfk_adj + recent_adj + workload_adj
+        total_adj = _a87_clip(raw_total, -0.45, 0.45)
+        tentative = base + total_adj if _a87_np.isfinite(base) else base
+
+        signals = [lineup_adj, bfk_adj, recent_adj, workload_adj]
+        pos = sum(1 for x in signals if x >= 0.04)
+        neg = sum(1 for x in signals if x <= -0.04)
+        active_count = pos + neg
+
+        final_side = ""
+        flip_guard = "NO_LINE"
+        if _a87_np.isfinite(line) and _a87_np.isfinite(base):
+            base_side = "OVER" if base > line else "UNDER"
+            tent_side = "OVER" if tentative > line else "UNDER"
+            final_side = tent_side
+            flip_guard = "NO_FLIP"
+            if tent_side != base_side:
+                agree = pos if total_adj > 0 else neg
+                if abs(total_adj) < 0.30 or agree < 3:
+                    final_side = base_side
+                    flip_guard = "ORIGINAL_SIDE_PROTECTED"
+                else:
+                    flip_guard = "FLIP_ALLOWED_3_SIGNAL_CONFIRMATION"
+
+        final_proj.append(tentative)
+        lineup_adj_col.append(lineup_adj)
+        bfk_adj_col.append(bfk_adj)
+        recent_adj_col.append(recent_adj)
+        workload_adj_col.append(workload_adj)
+        total_adj_col.append(total_adj)
+        side_col.append(final_side)
+        flip_guard_col.append(flip_guard)
+        active_signal_count_col.append(active_count)
+
+        notes=[]
+        if abs(lineup_adj) >= 0.04: notes.append(f"lineup {lineup_adj:+.2f}")
+        if abs(bfk_adj) >= 0.04: notes.append(f"BF-K {bfk_adj:+.2f}")
+        if abs(recent_adj) >= 0.04: notes.append(f"recent {recent_adj:+.2f}")
+        if abs(workload_adj) >= 0.04: notes.append(f"workload {workload_adj:+.2f}")
+        notes.append(flip_guard)
+        decision_note_col.append("; ".join(notes))
+
+    out["APP87 Original BASE_K"] = out.get("APP85 BASE_K (Original Preserved)")
+    out["APP87 Daily Lineup K Adjustment"] = lineup_adj_col
+    out["APP87 BF-to-K Adjustment"] = bfk_adj_col
+    out["APP87 Recent Skill Adjustment"] = recent_adj_col
+    out["APP87 Workload Adjustment"] = workload_adj_col
+    out["APP87 Total K Adjustment"] = total_adj_col
+    out["APP87 Final K Projection"] = final_proj
+    out["APP87 Final Side"] = side_col
+    out["APP87 Side Flip Guard"] = flip_guard_col
+    out["APP87 Active Signal Count"] = active_signal_count_col
+    out["APP87 Decision Note"] = decision_note_col
+
+    if "K PROJ" in out.columns:
+        out["K PROJ"] = out["APP87 Final K Projection"]
+    if "Final K Projection" in out.columns:
+        out["Final K Projection"] = out["APP87 Final K Projection"]
+
+    return out
+
+try:
+    _a87_prev_build_kproj_table = build_kproj_table
+    def build_kproj_table(*args, **kwargs):
+        return _a87_apply(_a87_prev_build_kproj_table(*args, **kwargs))
+except Exception:
+    pass
+
+
+# =============================================================================
+# APP88 — FULL ORIGINAL-K + ALL MATCHUP LAYERS
+#
+# Core rule:
+#   ORIGINAL BASE_K stays the foundation.
+#   Pitching Outs engine stays untouched.
+#
+# Active K layers:
+#   1) Daily batter-by-batter lineup K opportunity vs pitcher hand
+#   2) Team/opponent K environment
+#   3) Arsenal-vs-lineup compatibility
+#   4) PutAway rate / opponent whiff interaction
+#   5) Expected BF distribution / workload uncertainty
+#   6) Recent CSW / SwStr / recent skill
+#   7) Recent starts / historical same-line performance
+#   8) Market/model probability agreement
+#   9) Historical line difficulty
+#
+# All adjustments are individually capped and the TOTAL adjustment is capped.
+# No blanket downward suppression. Original side is protected unless multiple
+# independent signals agree strongly enough to justify a flip.
+# =============================================================================
+
+import numpy as _a88_np
+import pandas as _a88_pd
+
+APP88_VERSION = "APP88_FULL_ORIGINAL_K_ALL_MATCHUP_LAYERS_v1"
+
+def _a88_num(v):
+    try:
+        x = float(v)
+        return x if _a88_np.isfinite(x) else _a88_np.nan
+    except Exception:
+        return _a88_np.nan
+
+def _a88_pct(v):
+    x = _a88_num(v)
+    if not _a88_np.isfinite(x):
+        return _a88_np.nan
+    return x / 100.0 if x > 1 else x
+
+def _a88_clip(x, lo, hi):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+def _a88_first(row, names):
+    for n in names:
+        if n in row.index:
+            x = _a88_num(row.get(n))
+            if _a88_np.isfinite(x):
+                return x
+    return _a88_np.nan
+
+def _a88_collect_batter_k(row, pitcher_hand):
+    overall=[]; hand_specific=[]
+    for c in row.index:
+        cl = str(c).lower()
+        if "k%" not in cl:
+            continue
+        if not any(t in cl for t in ["lineup", "batter", "hitter"]):
+            continue
+        x = _a88_pct(row.get(c))
+        if not _a88_np.isfinite(x):
+            continue
+        overall.append(x)
+        if pitcher_hand.startswith("L") and any(t in cl for t in ["vs lhp","vs left"]):
+            hand_specific.append(x)
+        elif pitcher_hand.startswith("R") and any(t in cl for t in ["vs rhp","vs right"]):
+            hand_specific.append(x)
+    use = hand_specific if hand_specific else overall
+    return use
+
+def _a88_arsenal_signal(row):
+    # Prefer explicit existing arsenal matchup score if the app already calculates one.
+    explicit = _a88_first(row, [
+        "Pitch Arsenal Matchup Score", "Arsenal Matchup Score", "Arsenal Edge",
+        "Pitch Mix Matchup", "Pitch Arsenal Matchup"
+    ])
+    if _a88_np.isfinite(explicit):
+        # Normalize common 0-100 or -1..1 style scales conservatively.
+        if abs(explicit) > 2:
+            return _a88_clip((explicit - 50.0) / 50.0, -1.0, 1.0)
+        return _a88_clip(explicit, -1.0, 1.0)
+
+    # Fallback: infer from pitch-specific whiff/K matchup columns.
+    vals=[]
+    for c in row.index:
+        cl=str(c).lower()
+        if not any(p in cl for p in ["four-seam","4-seam","ff","sinker","si","slider","sl","changeup","ch","curve","cu","cutter","fc","splitter","fs","sweeper","st"]):
+            continue
+        if not any(m in cl for m in ["whiff","k%","strikeout","matchup","edge"]):
+            continue
+        x=_a88_num(row.get(c))
+        if not _a88_np.isfinite(x):
+            continue
+        # Normalize percentages and generic scores.
+        if 0 <= x <= 1:
+            vals.append((x-0.25)/0.15)
+        elif 1 < x <= 100:
+            vals.append((x-25.0)/15.0)
+        elif -5 <= x <= 5:
+            vals.append(x)
+    if not vals:
+        return _a88_np.nan
+    return _a88_clip(sum(vals)/len(vals), -1.0, 1.0)
+
+def _a88_apply(df):
+    if df is None or not isinstance(df, _a88_pd.DataFrame) or df.empty:
+        return df
+
+    out=df.copy()
+    rows=[]
+
+    for _, row in out.iterrows():
+        base=_a88_first(row, [
+            "APP87 Original BASE_K","APP85 BASE_K (Original Preserved)",
+            "Original K PROJ","K PROJ","Final K Projection"
+        ])
+        line=_a88_first(row, ["UD Line","Line","K Line","stat_value"])
+        hand=str(row.get("Pitcher Hand", row.get("Throws", row.get("Pitcher Throws","")))).upper()
+
+        # 1) BATTER-BY-BATTER LINEUP K OPPORTUNITY
+        batter_ks=_a88_collect_batter_k(row, hand)
+        lineup_k=(sum(batter_ks)/len(batter_ks)) if batter_ks else _a88_pct(row.get("APP86 Daily Lineup K% vs Pitcher Hand"))
+        team_k=_a88_pct(_a88_first(row, ["APP85 Opponent K%","Opp K%","Opponent K%"]))
+        exp_bf=_a88_first(row, ["APP85 Expected BF","Exp BF","Expected BF","Projected BF"])
+        if not _a88_np.isfinite(exp_bf):
+            exp_bf=22.0
+
+        lineup_adj=0.0
+        if _a88_np.isfinite(lineup_k) and _a88_np.isfinite(team_k):
+            lineup_adj=_a88_clip(((lineup_k-team_k)*exp_bf)*0.35, -0.22, 0.22)
+
+        # 2) TEAM K ENVIRONMENT / PITCHER K INTERACTION
+        pitcher_k=_a88_pct(_a88_first(row, ["APP85 Pitcher K%","Pitcher K%","K%"]))
+        team_env_adj=0.0
+        if _a88_np.isfinite(pitcher_k) and _a88_np.isfinite(lineup_k):
+            blend=(0.55*pitcher_k)+(0.45*lineup_k)
+            implied=blend*exp_bf
+            team_env_adj=_a88_clip((implied-base)*0.08, -0.12, 0.12) if _a88_np.isfinite(base) else 0.0
+
+        # 3) ARSENAL VS LINEUP
+        arsenal_score=_a88_arsenal_signal(row)
+        arsenal_adj=_a88_clip(arsenal_score*0.12, -0.12, 0.12) if _a88_np.isfinite(arsenal_score) else 0.0
+
+        # 4) PUTAWAY + OPPONENT WHIFF INTERACTION
+        putaway=_a88_pct(_a88_first(row, ["PutAway%","Putaway Rate","Put Away %","PutAway Rate"]))
+        opp_whiff=_a88_pct(_a88_first(row, ["Opponent Whiff%","Opp Whiff%","Team Whiff%","Lineup Whiff%"]))
+        whiff_adj=0.0
+        whiff_parts=[]
+        if _a88_np.isfinite(putaway):
+            whiff_parts.append((putaway-0.30)/0.12)
+        if _a88_np.isfinite(opp_whiff):
+            whiff_parts.append((opp_whiff-0.25)/0.10)
+        if whiff_parts:
+            whiff_adj=_a88_clip((sum(whiff_parts)/len(whiff_parts))*0.08, -0.10, 0.10)
+
+        # 5) EXPECTED BF DISTRIBUTION / WORKLOAD UNCERTAINTY
+        bf_p10=_a88_first(row, ["BF P10","Expected BF P10","Projected BF P10","P10 BF"])
+        bf_p90=_a88_first(row, ["BF P90","Expected BF P90","Projected BF P90","P90 BF"])
+        workload_adj=0.0
+        workload_risk="NONE"
+        if _a88_np.isfinite(bf_p10) and _a88_np.isfinite(bf_p90):
+            spread=bf_p90-bf_p10
+            if spread >= 10:
+                workload_risk="WIDE_BF_RANGE"
+            elif spread >= 7:
+                workload_risk="MODERATE_BF_RANGE"
+        else:
+            # Fallback from IP uncertainty / explicit workload-risk flags.
+            wr=str(row.get("APP85 Workload Risk","") or "").upper()
+            if "BF_IP_CONTRADICTION" in wr:
+                workload_risk="BF_IP_CONTRADICTION"
+                workload_adj=-0.08
+            elif "LOW_BF" in wr and "LOW_IP" in wr:
+                workload_risk="LOW_BF_LOW_IP"
+                workload_adj=-0.06
+            elif "LOW_BF" in wr or "LOW_IP" in wr:
+                workload_risk="LOW_OPPORTUNITY"
+                workload_adj=-0.03
+
+        # 6) RECENT SKILL
+        recent_score=_a88_num(row.get("APP85 Recent Skill Score"))
+        recent_adj=_a88_clip(recent_score*0.06, -0.10, 0.10) if _a88_np.isfinite(recent_score) else 0.0
+
+        # 7) RECENT STARTS / HISTORICAL SAME-LINE PERFORMANCE
+        hist_rate=_a88_pct(_a88_first(row, [
+            "Same Line Hit Rate","Historical Line Hit Rate","Recent Same Line Hit Rate",
+            "L10 Hit Rate","L5 Hit Rate"
+        ]))
+        hist_adj=0.0
+        if _a88_np.isfinite(hist_rate):
+            # Very small influence; direction relative to current side.
+            if _a88_np.isfinite(line) and _a88_np.isfinite(base):
+                base_side="OVER" if base>line else "UNDER"
+                directional=(hist_rate-0.50)
+                hist_adj=_a88_clip(directional*0.16, -0.08, 0.08)
+                if base_side=="UNDER":
+                    hist_adj=-hist_adj
+
+        # 8) MARKET / MODEL PROBABILITY AGREEMENT
+        model_prob=_a88_pct(_a88_first(row, [
+            "Fair Probability","Model Probability","K Model Probability","Win Probability"
+        ]))
+        market_prob=_a88_pct(_a88_first(row, [
+            "No Vig Probability","Market Probability","Market Implied Probability"
+        ]))
+        market_adj=0.0
+        if _a88_np.isfinite(model_prob) and _a88_np.isfinite(market_prob):
+            market_adj=_a88_clip((model_prob-market_prob)*0.20, -0.06, 0.06)
+
+        # 9) HISTORICAL LINE DIFFICULTY
+        hist_avg=_a88_first(row, [
+            "Historical K Average","Recent K Average","L10 K Avg","Season K Avg"
+        ])
+        line_diff_flag="NONE"
+        line_adj=0.0
+        if _a88_np.isfinite(line) and _a88_np.isfinite(hist_avg):
+            diff=line-hist_avg
+            if diff>=1.0:
+                line_diff_flag="HARD_LINE_ABOVE_HIST_AVG"
+                line_adj=-0.05
+            elif diff<=-1.0:
+                line_diff_flag="FAVORABLE_LINE_BELOW_HIST_AVG"
+                line_adj=0.05
+
+        # Existing BF-to-K anchor
+        bfk=_a88_num(row.get("APP85 BF-to-K Anchor"))
+        bfk_adj=_a88_clip((bfk-base)*0.14,-0.16,0.16) if _a88_np.isfinite(bfk) and _a88_np.isfinite(base) else 0.0
+
+        # Combine all active signals.
+        adjustments=[
+            lineup_adj,team_env_adj,arsenal_adj,whiff_adj,workload_adj,
+            recent_adj,hist_adj,market_adj,line_adj,bfk_adj
+        ]
+        raw_total=sum(adjustments)
+        total_adj=_a88_clip(raw_total,-0.45,0.45)
+        tentative=base+total_adj if _a88_np.isfinite(base) else base
+
+        # Signal agreement for side flips.
+        pos=sum(1 for x in adjustments if x>=0.04)
+        neg=sum(1 for x in adjustments if x<=-0.04)
+        active=pos+neg
+        final_side=""
+        flip_guard="NO_LINE"
+        if _a88_np.isfinite(line) and _a88_np.isfinite(base):
+            base_side="OVER" if base>line else "UNDER"
+            tent_side="OVER" if tentative>line else "UNDER"
+            final_side=tent_side
+            flip_guard="NO_FLIP"
+            if tent_side!=base_side:
+                agree=pos if total_adj>0 else neg
+                if abs(total_adj)<0.30 or agree<3:
+                    final_side=base_side
+                    flip_guard="ORIGINAL_SIDE_PROTECTED"
+                else:
+                    flip_guard="FLIP_ALLOWED_3_SIGNAL_CONFIRMATION"
+
+        # Risk/upside classification.
+        if pos>=3 and neg<=1:
+            cls="UPSIDE CONFIRMED"
+        elif neg>=3 and pos<=1:
+            cls="‼️ DANGER"
+        elif pos>neg:
+            cls="UPSIDE LEAN"
+        elif neg>pos:
+            cls="RISK LEAN"
+        else:
+            cls="NEUTRAL"
+
+        rows.append({
+            "APP88 Original BASE_K":base,
+            "APP88 Batter Lineup K%": lineup_k*100 if _a88_np.isfinite(lineup_k) else _a88_np.nan,
+            "APP88 Batter Count":len(batter_ks),
+            "APP88 Lineup K Adjustment":lineup_adj,
+            "APP88 Team K Environment Adjustment":team_env_adj,
+            "APP88 Arsenal Matchup Score":arsenal_score,
+            "APP88 Arsenal Adjustment":arsenal_adj,
+            "APP88 PutAway Rate":putaway*100 if _a88_np.isfinite(putaway) else _a88_np.nan,
+            "APP88 Opponent Whiff%":opp_whiff*100 if _a88_np.isfinite(opp_whiff) else _a88_np.nan,
+            "APP88 Whiff Interaction Adjustment":whiff_adj,
+            "APP88 BF P10":bf_p10,
+            "APP88 BF P90":bf_p90,
+            "APP88 Workload Risk":workload_risk,
+            "APP88 Workload Adjustment":workload_adj,
+            "APP88 Recent Skill Adjustment":recent_adj,
+            "APP88 Historical Line Adjustment":hist_adj,
+            "APP88 Market Agreement Adjustment":market_adj,
+            "APP88 Line Difficulty":line_diff_flag,
+            "APP88 Line Difficulty Adjustment":line_adj,
+            "APP88 BF-to-K Adjustment":bfk_adj,
+            "APP88 Total K Adjustment":total_adj,
+            "APP88 Final K Projection":tentative,
+            "APP88 Final Side":final_side,
+            "APP88 Side Flip Guard":flip_guard,
+            "APP88 Active Positive Signals":pos,
+            "APP88 Active Negative Signals":neg,
+            "APP88 Active Signal Count":active,
+            "APP88 Risk/Upside Class":cls,
+        })
+
+    audit=_a88_pd.DataFrame(rows,index=out.index)
+    for c in audit.columns:
+        out[c]=audit[c]
+
+    # Promote active K projection only. Pitching Outs is untouched.
+    if "K PROJ" in out.columns:
+        out["K PROJ"]=out["APP88 Final K Projection"]
+    if "Final K Projection" in out.columns:
+        out["Final K Projection"]=out["APP88 Final K Projection"]
+
+    return out
+
+try:
+    _a88_prev_build_kproj_table=build_kproj_table
+    def build_kproj_table(*args,**kwargs):
+        return _a88_apply(_a88_prev_build_kproj_table(*args,**kwargs))
+except Exception:
+    pass
+
+
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
