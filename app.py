@@ -33270,6 +33270,107 @@ except Exception:
     pass
 
 
+# =============================================================================
+# APP89 — COPY/PASTE SLATE USES THE TRUE ACTIVE FINAL K PROJECTION
+#
+# Fixes a display-only mismatch:
+# The old copy/paste builder still read "Line-Aware Smart Final K Projection",
+# which could show stale pre-App88 numbers and stale Over/Under directions.
+#
+# This override uses:
+#   APP88 Final K Projection
+#   APP88 Final Side
+#   current Underdog line
+# and falls back safely only when an App88 field is unavailable.
+#
+# Projection math and Pitching Outs are untouched.
+# =============================================================================
+
+def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+
+        d = df.copy()
+
+        # Underdog only.
+        if "Line Source" in d.columns:
+            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
+
+        # Normalize the active line column.
+        if "UD/Line" not in d.columns:
+            d["UD/Line"] = d.get("Line")
+        d = d[~d["UD/Line"].astype(str).str.upper().isin(
+            ["NO LINE", "NO_UD_LINE", "", "NAN", "NONE"]
+        )].copy()
+
+        # One current/primary row per pitcher.
+        d = _owp_one_final_row_per_pitcher(d)
+
+        lines = []
+        for matchup, g in d.groupby("Matchup", sort=False):
+            block = []
+
+            for _, r in g.iterrows():
+                line = safe_float(r.get("UD/Line"), None)
+
+                # TRUE active projection priority.
+                proj = safe_float(r.get("APP88 Final K Projection"), None)
+                if proj is None:
+                    proj = safe_float(r.get("K PROJ"), None)
+                if proj is None:
+                    proj = safe_float(r.get("Final K Projection"), None)
+                if proj is None:
+                    proj = safe_float(r.get("Line-Aware Smart Final K Projection"), None)
+
+                # TRUE active side priority.
+                side = str(r.get("APP88 Final Side") or "").upper().strip()
+                if side not in {"OVER", "UNDER"} and proj is not None and line is not None:
+                    side = "OVER" if proj > line else "UNDER"
+
+                if side not in {"OVER", "UNDER"}:
+                    if not show_pass_notes:
+                        continue
+                    symbol = "PASS"
+                    edge = None
+                else:
+                    edge = None if proj is None or line is None else proj - line
+                    abs_edge = abs(edge) if edge is not None else 0.0
+
+                    # Match the user's clean slate style.
+                    prefix = "O" if side == "OVER" else "U"
+                    if abs_edge >= 1.00:
+                        symbol = f"🔥 {prefix}"
+                    elif abs_edge < 0.65:
+                        symbol = f"⚠️ {prefix}"
+                    else:
+                        symbol = prefix
+
+                ip = safe_float(r.get("IP Floor"), None)
+                if ip is None:
+                    ip = safe_float(r.get("IP PROJ"), None)
+                if ip is None:
+                    ip = safe_float(r.get("Projected IP"), None)
+
+                line_txt = "NO LINE" if line is None else f"{line:.1f}"
+                proj_txt = "—" if proj is None else f"{proj:.2f}"
+                ip_txt = "—" if ip is None else f"{ip:.2f}"
+
+                block.append(
+                    f"• {r.get('Pitcher')} — {symbol} {line_txt} — {proj_txt} K — IP {ip_txt}"
+                )
+
+            if block:
+                lines.append(str(matchup))
+                lines.extend(block)
+                lines.append("")
+
+        return "\n".join(lines).strip()
+
+    except Exception as e:
+        return f"Slate builder unavailable: {e}"
+
+
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
