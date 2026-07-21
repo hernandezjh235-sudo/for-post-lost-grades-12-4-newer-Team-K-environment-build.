@@ -10893,30 +10893,23 @@ def render_kpis(picks, bankroll):
 _OFFICIAL_CARD_ROW_GUARD = False
 
 def official_card_k_row(p):
-    """Build a one-player K board row so the card matches the table exactly.
-
-    This is display-only. It prevents card projection/edge/decision from using
-    an earlier layer while the table is using the final post-stack K PROJ.
-    """
+    """Return the final one-player K row with exception-safe re-entry protection."""
     global _OFFICIAL_CARD_ROW_GUARD
+    if _OFFICIAL_CARD_ROW_GUARD:
+        return {}
+    _OFFICIAL_CARD_ROW_GUARD = True
     try:
-        if _OFFICIAL_CARD_ROW_GUARD:
-            return {}
-        _OFFICIAL_CARD_ROW_GUARD = True
         df = build_kproj_table([p])
-        _OFFICIAL_CARD_ROW_GUARD = False
         if df is not None and not df.empty:
             row = df.iloc[0].to_dict()
-            # Display-only: card row is one-player, so overlay the slate-wide rank map.
             if '_owp_overlay_full_board_pitcher_k_rank' in globals():
                 row = _owp_overlay_full_board_pitcher_k_rank(row)
             return row
+        return {}
     except Exception:
-        try:
-            _OFFICIAL_CARD_ROW_GUARD = False
-        except Exception:
-            pass
-    return {}
+        return {}
+    finally:
+        _OFFICIAL_CARD_ROW_GUARD = False
 
 def official_card_k_projection(p):
     """Official card projection synced to the board K PROJ.
@@ -13718,6 +13711,8 @@ def build_kproj_table(board):
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
+            # Immutable raw projection snapshot captured before all later wrappers.
+            "RAW BASE_K": d.get("projection"),
             "K PROJ": d.get("projection"),
             "Floor": dist.get("floor"),
             "Median": dist.get("median"),
@@ -30477,383 +30472,7 @@ def _beta_dynamic_ip(row):
     }
 
 
-@st.cache_data(ttl=240, show_spinner=False)
-def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
-    """Robust Underdog parser for beta pitcher markets.
-
-    Fixes the first beta issue where lines showed 0 because the parser only
-    looked for one narrow market label. This version mirrors the K parser more
-    closely and accepts Underdog JSON:API relationship layouts where the market
-    title can live on over_under, appearance, appearance_stat, option, or stat
-    objects.
-
-    Supported market_kind:
-    - OUTS = Pitching Outs / Outs Recorded
-    - ER   = Earned Runs Allowed
-    """
-    import json, re
-    try:
-        urls = UNDERDOG_URLS
-    except Exception:
-        return {"status": "DISABLED", "line": None, "rows": [], "message": "UNDERDOG_URLS unavailable"}
-
-    mk = str(market_kind or "").upper()
-    if mk == "OUTS":
-        market_label = "Pitching Outs"
-        market_terms = [
-            # Keep this strict so we do not accidentally grab alternate/other outs-like props.
-            "pitching outs", "pitcher outs", "outs recorded", "recorded outs"
-        ]
-        bad_terms = [
-            "strikeout", "strikeouts", "earned run", "earned runs", "er allowed",
-            "hits allowed", "walks", "fantasy", "batters faced", "h+r", "rbis"
-        ]
-        lo, hi = 6.5, 24.5
-    else:
-        market_label = "Earned Runs Allowed"
-        market_terms = [
-            "earned runs allowed", "earned run allowed", "earned runs", "earned run",
-            "pitcher earned runs", "pitcher earned runs allowed",
-            "er allowed", "ers allowed", "er", "earned_runs_allowed", "earned-run", "era"
-        ]
-        bad_terms = [
-            "strikeout", "strikeouts", "outs", "hits allowed", "walks", "fantasy",
-            "batters faced"
-        ]
-        lo, hi = 0.5, 8.5
-
-    target_norm = normalize_name(player_name)
-    accepted_rows = []
-    last_msg = ""
-
-    def attrs(obj):
-        if not isinstance(obj, dict):
-            return {}
-        out = {}
-        a = obj.get("attributes")
-        if isinstance(a, dict):
-            out.update(a)
-        for k, v in obj.items():
-            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
-                out[k] = v
-        return out
-
-    def obj_type(obj, fallback=""):
-        return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_") if isinstance(obj, dict) else ""
-
-    def obj_id(obj):
-        if not isinstance(obj, dict):
-            return None
-        v = obj.get("id") or attrs(obj).get("id")
-        return str(v) if v not in [None, ""] else None
-
-    def collect_objects(data):
-        objects = []
-        def walk(x, parent_key=""):
-            if isinstance(x, dict):
-                y = dict(x)
-                if parent_key and "_parent_key" not in y:
-                    y["_parent_key"] = parent_key
-                objects.append(y)
-                for k, v in x.items():
-                    if isinstance(v, (dict, list)):
-                        walk(v, k)
-            elif isinstance(x, list):
-                for item in x:
-                    walk(item, parent_key)
-        walk(data)
-        return objects
-
-    def build_maps(objects):
-        by_id_any = {}
-        by_key = {}
-        for obj in objects:
-            oid = obj_id(obj)
-            if not oid:
-                continue
-            typ = obj_type(obj)
-            by_id_any.setdefault(oid, []).append(obj)
-            for tt in {typ, typ.rstrip("s"), typ + "s"}:
-                by_key[(tt, oid)] = obj
-        return by_id_any, by_key
-
-    def rel_objects(obj, rel_names, by_id_any, by_key):
-        hits = []
-        if not isinstance(obj, dict):
-            return hits
-        rels = obj.get("relationships") or {}
-        for name in rel_names:
-            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip("s"), name + "s"}
-            for key in keys:
-                node = rels.get(key)
-                if node is None:
-                    continue
-                data = node.get("data") if isinstance(node, dict) else node
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    rid = item.get("id")
-                    rtype = str(item.get("type") or key or "").lower().replace("-", "_")
-                    if rid in [None, ""]:
-                        continue
-                    found = None
-                    for cand_t in [rtype, rtype.rstrip("s"), rtype + "s", key, key.rstrip("s"), key + "s"]:
-                        found = by_key.get((cand_t, str(rid)))
-                        if found is not None:
-                            break
-                    if found is not None:
-                        hits.append(found)
-                    else:
-                        hits.extend(by_id_any.get(str(rid), []))
-        return hits
-
-    def gather_related(seed, by_id_any, by_key):
-        related = []
-        stack = [seed]
-        seen = set()
-        rel_names = [
-            "over_under", "over_unders", "appearance", "appearances", "player", "players",
-            "appearance_stat", "appearance_stats", "stat", "stats", "option", "options",
-            "market", "markets", "game", "event", "sport", "league"
-        ]
-        while stack and len(related) < 20:
-            obj = stack.pop(0)
-            if not isinstance(obj, dict):
-                continue
-            key = (obj_type(obj), obj_id(obj), id(obj))
-            if key in seen:
-                continue
-            seen.add(key)
-            related.append(obj)
-            for nxt in rel_objects(obj, rel_names, by_id_any, by_key):
-                stack.append(nxt)
-        return related
-
-    def text_from(*objs, include_json=False):
-        parts = []
-        wanted = [
-            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
-            "display_name", "short_name", "abbr_name", "stat", "stat_type", "appearance_stat",
-            "display_stat", "label", "market", "market_name", "sport", "league", "sport_name",
-            "league_name", "position", "description", "over_under_title", "scoring_type",
-            "projection_type", "appearance_name", "category", "type"
-        ]
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            for d in [attrs(obj), obj]:
-                if not isinstance(d, dict):
-                    continue
-                for k in wanted:
-                    v = d.get(k)
-                    if isinstance(v, dict):
-                        parts.extend(str(x) for x in v.values() if x not in [None, ""] and not isinstance(x, (dict, list)))
-                    elif v not in [None, ""] and not isinstance(v, (dict, list)):
-                        parts.append(str(v))
-            if include_json:
-                try:
-                    parts.append(json.dumps(obj, default=str)[:800])
-                except Exception:
-                    pass
-        return " | ".join(parts)
-
-    def line_from_obj(*objs):
-        # Real Underdog target fields only. Do not use prices/odds.
-        # Priority matters. Underdog's main board line is usually stat_value/line_score.
-        # Generic `line` is often used by alternate rows, so it is accepted but deprioritized
-        # later when choosing the final matched line.
-        keys = ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value", "line"]
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            for d in [attrs(obj), obj]:
-                if not isinstance(d, dict):
-                    continue
-                for k in keys:
-                    v = _beta_num(d.get(k), None)
-                    if v is not None and lo <= v <= hi and abs(v * 2 - round(v * 2)) < 1e-9:
-                        return float(v), f"{k} from Underdog object"
-        # Fallback: half-line from market text, still constrained by market range.
-        blob = text_from(*objs, include_json=False)
-        for m in re.findall(r"(?<!\d)(\d{1,2}\.5)(?!\d)", blob):
-            v = _beta_num(m, None)
-            if v is not None and lo <= v <= hi:
-                return float(v), "half-line from Underdog text"
-        return None, "no valid market line"
-
-    def player_name_from(*objs):
-        candidates = []
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            a = attrs(obj)
-            candidates.extend([
-                a.get("display_name"), a.get("full_name"), a.get("name"), a.get("player_name"),
-                a.get("short_name"), a.get("abbreviation"), a.get("abbr_name"),
-                (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip(),
-            ])
-        for c in candidates:
-            if c and normalize_name(c):
-                return str(c)
-        return ""
-
-    def underdog_player_score(evidence, matched=""):
-        score = max(name_score(player_name, evidence), name_score(player_name, matched))
-        t_parts = target_norm.split()
-        ev = normalize_name(evidence)
-        if len(t_parts) >= 2:
-            initial = t_parts[0][:1]
-            last = t_parts[-1]
-            if last in ev:
-                toks = ev.split()
-                for i, tok in enumerate(toks):
-                    if tok == last and i > 0 and toks[i-1][:1] == initial:
-                        score = max(score, 0.93)
-                if initial in ev:
-                    score = max(score, 0.88)
-        if target_norm and target_norm in ev:
-            score = max(score, 0.94)
-        return score
-
-    def market_ok(blob, line=None):
-        low = str(blob or "").lower()
-        if any(b in low for b in bad_terms):
-            return False
-        # Outs can safely infer from 10.5+ pitcher prop lines when player matches strongly.
-        if mk == "OUTS" and line is not None and line >= 10.5:
-            if not any(x in low for x in ["strikeout", "earned", "hit", "walk", "fantasy"]):
-                return True
-        return any(t in low for t in market_terms)
-
-    def active_status_ok(*objs):
-        status_blob = " ".join(
-            str(attrs(o).get(k, ""))
-            for o in objs if isinstance(o, dict)
-            for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]
-        ).lower()
-        return not any(x in status_blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
-
-    for url in urls:
-        data = safe_get_json(url, timeout=18)
-        if not data:
-            last_msg = f"No JSON from {url}"
-            continue
-        objects = collect_objects(data)
-        by_id_any, by_key = build_maps(objects)
-        candidates = []
-        for obj in objects:
-            typ = obj_type(obj)
-            a = attrs(obj)
-            if "over_under_line" in typ or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value", "line"]):
-                candidates.append(obj)
-
-        for line_obj in candidates:
-            related = gather_related(line_obj, by_id_any, by_key)
-            blob = text_from(*related, include_json=False)
-            blob_json = text_from(*related, include_json=True)
-            if is_bad_sport_text(blob_json.lower()):
-                continue
-            # Keep MLB/baseball only when sport text is present; if omitted, strong player+market match is enough.
-            chosen_line, line_note = line_from_obj(*related)
-            if chosen_line is None:
-                continue
-            if not market_ok(blob_json, chosen_line):
-                continue
-            matched = player_name_from(*related)
-            score = underdog_player_score(blob_json, matched)
-            if score < 0.82:
-                continue
-            if not active_status_ok(*related):
-                continue
-            accepted_rows.append({
-                "Source": "Underdog", "Provider": "Underdog", "Player": player_name,
-                "Matched Name": matched or player_name,
-                "Market": market_label,
-                "Line": float(chosen_line),
-                "Match Score": round(float(score), 3),
-                "Line Evidence": line_note,
-                "Parser Mode": "relationship+recursive",
-                "Evidence": blob[:240],
-            })
-
-        # Ultra fallback for Underdog layouts that put everything inside one object blob.
-        for obj in objects:
-            try:
-                blob_json = json.dumps(obj, default=str)
-            except Exception:
-                continue
-            low = blob_json.lower()
-            if is_bad_sport_text(low):
-                continue
-            line, line_note = line_from_obj(obj)
-            if line is None:
-                continue
-            if not market_ok(low, line):
-                continue
-            score = underdog_player_score(blob_json)
-            if score < 0.86:
-                continue
-            if not active_status_ok(obj):
-                continue
-            accepted_rows.append({
-                "Source": "Underdog", "Provider": "Underdog", "Player": player_name,
-                "Matched Name": player_name,
-                "Market": market_label,
-                "Line": float(line),
-                "Match Score": round(float(score), 3),
-                "Line Evidence": line_note,
-                "Parser Mode": "object-blob fallback",
-                "Evidence": blob_json[:240],
-            })
-
-        if accepted_rows:
-            break
-
-    if not accepted_rows:
-        return {"status": "NO MATCH", "line": None, "rows": [], "message": last_msg or f"No active Underdog {market_label} line matched"}
-
-    # Dedup and choose the best live line.
-    # IMPORTANT: do NOT prefer the highest line. The first beta did that and grabbed
-    # alt Pitching Outs lines like 19.5 when the main board was 17.5.
-    dedup = {}
-    for r in accepted_rows:
-        key = (r.get("Matched Name"), r.get("Market"), r.get("Line"), r.get("Parser Mode"), r.get("Line Evidence"))
-        if key not in dedup or _beta_num(r.get("Match Score"), 0) > _beta_num(dedup[key].get("Match Score"), 0):
-            dedup[key] = r
-    rows = list(dedup.values())
-
-    def evidence_priority(r):
-        note = str(r.get("Line Evidence", "")).lower()
-        # Main board fields first; generic `line` and text fallback usually indicate alt rows.
-        if "stat_value" in note or "line_score" in note:
-            return 5
-        if "over_under_line" in note or "target_value" in note or "display_stat_value" in note:
-            return 4
-        if "half-line" in note:
-            return 1
-        if " line " in (" " + note + " "):
-            return 0
-        return 2
-
-    def parser_priority(r):
-        mode = str(r.get("Parser Mode", "")).lower()
-        if "relationship" in mode:
-            return 3
-        if "object-blob" in mode:
-            return 1
-        return 2
-
-    def rank_row(r):
-        half_bonus = 1 if abs(float(r.get("Line", 0)) * 2 - round(float(r.get("Line", 0)) * 2)) < 1e-9 else 0
-        # No line-value sorting here on purpose.
-        return (round(_beta_num(r.get("Match Score"), 0), 3), evidence_priority(r), parser_priority(r), half_bonus)
-
-    sorted_rows = sorted(rows, key=rank_row, reverse=True)
-    best = sorted_rows[0]
-    debug_lines = ", ".join([f"{float(r.get('Line', 0)):.1f}({str(r.get('Line Evidence',''))[:18]})" for r in sorted_rows[:5]])
-    return {"status": "FOUND", "line": float(best["Line"]), "rows": sorted_rows, "message": f"Matched Underdog {market_label} {float(best['Line']):.1f}", "debug_lines": debug_lines}
-
+# APP92 CLEANUP: superseded legacy Underdog fetcher removed.
 
 def _beta_projection_rows(board, market_kind="OUTS"):
     rows = []
@@ -33270,106 +32889,28 @@ except Exception:
     pass
 
 
-# =============================================================================
-# APP89 — COPY/PASTE SLATE USES THE TRUE ACTIVE FINAL K PROJECTION
-#
-# Fixes a display-only mismatch:
-# The old copy/paste builder still read "Line-Aware Smart Final K Projection",
-# which could show stale pre-App88 numbers and stale Over/Under directions.
-#
-# This override uses:
-#   APP88 Final K Projection
-#   APP88 Final Side
-#   current Underdog line
-# and falls back safely only when an App88 field is unavailable.
-#
-# Projection math and Pitching Outs are untouched.
-# =============================================================================
+# APP92 CLEANUP: unreachable App89 copy/paste block removed.
 
-def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
+
+# =============================================================================
+# APP92 SHARED ACTIVE-LAYER UTILITIES
+# =============================================================================
+def _safe_num_shared(value, default=float("nan")):
     try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return ""
+        result = float(value)
+        return result if np.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
 
-        d = df.copy()
+def _safe_pct_shared(value, default=float("nan")):
+    result = _safe_num_shared(value, default)
+    if not np.isfinite(result):
+        return default
+    return result / 100.0 if result > 1.0 else result
 
-        # Underdog only.
-        if "Line Source" in d.columns:
-            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
-
-        # Normalize the active line column.
-        if "UD/Line" not in d.columns:
-            d["UD/Line"] = d.get("Line")
-        d = d[~d["UD/Line"].astype(str).str.upper().isin(
-            ["NO LINE", "NO_UD_LINE", "", "NAN", "NONE"]
-        )].copy()
-
-        # One current/primary row per pitcher.
-        d = _owp_one_final_row_per_pitcher(d)
-
-        lines = []
-        for matchup, g in d.groupby("Matchup", sort=False):
-            block = []
-
-            for _, r in g.iterrows():
-                line = safe_float(r.get("UD/Line"), None)
-
-                # TRUE active projection priority.
-                proj = safe_float(r.get("APP88 Final K Projection"), None)
-                if proj is None:
-                    proj = safe_float(r.get("K PROJ"), None)
-                if proj is None:
-                    proj = safe_float(r.get("Final K Projection"), None)
-                if proj is None:
-                    proj = safe_float(r.get("Line-Aware Smart Final K Projection"), None)
-
-                # TRUE active side priority.
-                side = str(r.get("APP88 Final Side") or "").upper().strip()
-                if side not in {"OVER", "UNDER"} and proj is not None and line is not None:
-                    side = "OVER" if proj > line else "UNDER"
-
-                if side not in {"OVER", "UNDER"}:
-                    if not show_pass_notes:
-                        continue
-                    symbol = "PASS"
-                    edge = None
-                else:
-                    edge = None if proj is None or line is None else proj - line
-                    abs_edge = abs(edge) if edge is not None else 0.0
-
-                    # Match the user's clean slate style.
-                    prefix = "O" if side == "OVER" else "U"
-                    if abs_edge >= 1.00:
-                        symbol = f"🔥 {prefix}"
-                    elif abs_edge < 0.65:
-                        symbol = f"⚠️ {prefix}"
-                    else:
-                        symbol = prefix
-
-                ip = safe_float(r.get("IP Floor"), None)
-                if ip is None:
-                    ip = safe_float(r.get("IP PROJ"), None)
-                if ip is None:
-                    ip = safe_float(r.get("Projected IP"), None)
-
-                line_txt = "NO LINE" if line is None else f"{line:.1f}"
-                proj_txt = "—" if proj is None else f"{proj:.2f}"
-                ip_txt = "—" if ip is None else f"{ip:.2f}"
-
-                block.append(
-                    f"• {r.get('Pitcher')} — {symbol} {line_txt} — {proj_txt} K — IP {ip_txt}"
-                )
-
-            if block:
-                lines.append(str(matchup))
-                lines.extend(block)
-                lines.append("")
-
-        return "\n".join(lines).strip()
-
-    except Exception as e:
-        return f"Slate builder unavailable: {e}"
-
+def _clip_shared(value, low, high):
+    result = _safe_num_shared(value, 0.0)
+    return max(float(low), min(float(high), result))
 
 # =============================================================================
 # APP90 — FULL K ENGINE: TRUE ORIGINAL ANCHOR + STRONGER L5 + ELITE PROTECTION
@@ -33386,7 +32927,7 @@ def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=Fal
 # cannot replace the original successful projection.
 #
 # Original anchor priority:
-# Pre-App70 K PROJ -> other pre-calibration columns -> APP88 original base.
+# RAW BASE_K -> compatibility fallbacks only when RAW BASE_K is unavailable.
 # This intentionally bypasses later suppressive K calibration layers.
 #
 # Pitching Outs calculations are not modified.
@@ -33401,23 +32942,13 @@ APP90_MAX_ADJ_STANDARD = 0.35
 APP90_MAX_ADJ_ELITE = 0.25
 
 def _a90_num(v):
-    try:
-        x = float(v)
-        return x if _a90_np.isfinite(x) else _a90_np.nan
-    except Exception:
-        return _a90_np.nan
+    return _safe_num_shared(v)
 
 def _a90_pct(v):
-    x = _a90_num(v)
-    if not _a90_np.isfinite(x):
-        return _a90_np.nan
-    return x / 100.0 if x > 1.0 else x
+    return _safe_pct_shared(v)
 
 def _a90_clip(v, lo, hi):
-    try:
-        return max(lo, min(hi, float(v)))
-    except Exception:
-        return 0.0
+    return _clip_shared(v, lo, hi)
 
 def _a90_first(row, names):
     for name in names:
@@ -33431,6 +32962,7 @@ def _a90_original_base(row):
     # Pre-App70 is the earliest retained projection before the later
     # calibration/suppression wrappers. This is the best in-file OG anchor.
     return _a90_first(row, [
+        "RAW BASE_K",
         "Pre-App70 K PROJ",
         "Pre-App75 K PROJ",
         "Pre-App78 K PROJ",
@@ -33708,6 +33240,568 @@ def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=Fal
         return "\n".join(lines).strip()
     except Exception as exc:
         return f"Slate builder unavailable: {exc}"
+
+
+# =============================================================================
+# APP91 — STRICT LIVE UNDERDOG PITCHING OUTS MATCHER
+#
+# Fixes:
+# - stale/alternate Pitching Outs lines being selected
+# - wrong market values attached to a pitcher
+# - pitchers appearing when they do not currently have a live Outs line
+# - fuzzy name matches attaching another player's market
+#
+# Pitching Outs projection math is unchanged.
+# K projection math is unchanged.
+# =============================================================================
+
+import json as _app91_json
+import re as _app91_re
+from datetime import datetime as _app91_datetime
+
+APP91_VERSION = "APP91_STRICT_PITCHING_OUTS_LIVE_LINES_v1"
+
+def _app91_attrs(obj):
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    a = obj.get("attributes")
+    if isinstance(a, dict):
+        out.update(a)
+    for k, v in obj.items():
+        if k not in {"attributes", "relationships", "included", "data"} and k not in out:
+            out[k] = v
+    return out
+
+def _app91_type(obj, fallback=""):
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_")
+
+def _app91_id(obj):
+    if not isinstance(obj, dict):
+        return None
+    value = obj.get("id")
+    if value in [None, ""]:
+        value = _app91_attrs(obj).get("id")
+    return None if value in [None, ""] else str(value)
+
+def _app91_collect(data):
+    objects = []
+    def walk(x, parent=""):
+        if isinstance(x, dict):
+            item = dict(x)
+            if parent and "_parent_key" not in item:
+                item["_parent_key"] = parent
+            objects.append(item)
+            for k, v in x.items():
+                if isinstance(v, (dict, list)):
+                    walk(v, k)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item, parent)
+    walk(data)
+    return objects
+
+def _app91_maps(objects):
+    by_key, by_id = {}, {}
+    for obj in objects:
+        oid = _app91_id(obj)
+        if not oid:
+            continue
+        typ = _app91_type(obj)
+        by_id.setdefault(oid, []).append(obj)
+        for t in {typ, typ.rstrip("s"), typ + "s"}:
+            by_key[(t, oid)] = obj
+    return by_key, by_id
+
+def _app91_rel(obj, names, by_key, by_id):
+    if not isinstance(obj, dict):
+        return []
+    rels = obj.get("relationships") or {}
+    found = []
+    for name in names:
+        keys = {name, name.replace("_", "-"), name.rstrip("s"), name + "s"}
+        for key in keys:
+            node = rels.get(key)
+            if node is None:
+                continue
+            data = node.get("data") if isinstance(node, dict) else node
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                rid = item.get("id")
+                rtype = str(item.get("type") or key).lower().replace("-", "_")
+                if rid in [None, ""]:
+                    continue
+                obj2 = None
+                for t in [rtype, rtype.rstrip("s"), rtype + "s", key, key.rstrip("s"), key + "s"]:
+                    obj2 = by_key.get((t, str(rid)))
+                    if obj2 is not None:
+                        break
+                if obj2 is not None:
+                    found.append(obj2)
+                else:
+                    found.extend(by_id.get(str(rid), []))
+    return found
+
+def _app91_related(seed, by_key, by_id):
+    names = [
+        "over_under", "over_unders", "appearance", "appearances",
+        "appearance_stat", "appearance_stats", "player", "players",
+        "stat", "stats", "market", "markets", "game", "games",
+        "event", "events", "sport", "sports", "league", "leagues"
+    ]
+    queue = [seed]
+    out, seen = [], set()
+    while queue and len(out) < 16:
+        obj = queue.pop(0)
+        if not isinstance(obj, dict):
+            continue
+        key = (_app91_type(obj), _app91_id(obj), id(obj))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(obj)
+        queue.extend(_app91_rel(obj, names, by_key, by_id))
+    return out
+
+def _app91_text(*objs):
+    keys = [
+        "title", "display_title", "name", "display_name", "full_name",
+        "first_name", "last_name", "player_name", "short_name",
+        "stat", "stat_type", "appearance_stat", "display_stat",
+        "market", "market_name", "label", "description",
+        "sport", "sport_name", "league", "league_name",
+        "appearance_name", "category", "position"
+    ]
+    parts = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for d in (_app91_attrs(obj), obj):
+            if not isinstance(d, dict):
+                continue
+            for k in keys:
+                v = d.get(k)
+                if isinstance(v, dict):
+                    for vv in v.values():
+                        if vv not in [None, ""] and not isinstance(vv, (dict, list)):
+                            parts.append(str(vv))
+                elif v not in [None, ""] and not isinstance(v, (dict, list)):
+                    parts.append(str(v))
+    return " | ".join(parts)
+
+def _app91_exact_player_match(target, *objs):
+    target_norm = normalize_name(target)
+    target_parts = target_norm.split()
+    if len(target_parts) < 2:
+        return False, ""
+
+    names = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        a = _app91_attrs(obj)
+        first_last = (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip()
+        names.extend([
+            a.get("display_name"), a.get("full_name"), a.get("name"),
+            a.get("player_name"), a.get("short_name"), first_last
+        ])
+
+    target_initial = target_parts[0][0]
+    target_last = target_parts[-1]
+
+    for candidate in names:
+        if not candidate:
+            continue
+        cand_norm = normalize_name(candidate)
+        if cand_norm == target_norm:
+            return True, str(candidate)
+        cp = cand_norm.split()
+        if len(cp) >= 2 and cp[-1] == target_last and cp[0][:1] == target_initial:
+            return True, str(candidate)
+
+    # Only allow initial+last from structured display text, never broad fuzzy evidence.
+    blob_norm = normalize_name(_app91_text(*objs))
+    pattern = rf"(?:^|\s){_app91_re.escape(target_initial)}\s+{_app91_re.escape(target_last)}(?:\s|$)"
+    if _app91_re.search(pattern, blob_norm):
+        return True, f"{target_initial}. {target_last}"
+
+    return False, ""
+
+def _app91_market_is_exact_outs(*objs):
+    text = _app91_text(*objs).lower()
+    exact_terms = [
+        "pitching outs", "pitcher outs", "outs recorded", "recorded outs"
+    ]
+    bad_terms = [
+        "strikeout", "strikeouts", "earned run", "earned runs",
+        "hits allowed", "walks allowed", "fantasy points",
+        "batters faced", "pitch count", "quality start"
+    ]
+    promo_terms = [
+        "alternate", "alt line", "special", "scorcher", "discount",
+        "boosted", "promo", "rival", "pick'em", "pickem"
+    ]
+    if any(term in text for term in bad_terms):
+        return False
+    if any(term in text for term in promo_terms):
+        return False
+    return any(term in text for term in exact_terms)
+
+def _app91_active(*objs):
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        a = _app91_attrs(obj)
+        status = " ".join(str(a.get(k, "")) for k in [
+            "status", "state", "display_status", "over_status",
+            "under_status", "hidden", "active", "suspended"
+        ]).lower()
+        if any(x in status for x in [
+            "suspended", "removed", "inactive", "closed", "disabled",
+            "hidden true", "active false", "archived"
+        ]):
+            return False
+    return True
+
+def _app91_line(line_obj, market_obj=None):
+    # The line must come from the actual line/market object, not an arbitrary
+    # related object containing another stat value.
+    keys = ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value"]
+    for obj in [line_obj, market_obj]:
+        if not isinstance(obj, dict):
+            continue
+        for d in (_app91_attrs(obj), obj):
+            if not isinstance(d, dict):
+                continue
+            for key in keys:
+                value = _beta_num(d.get(key), None)
+                if value is not None and 6.5 <= value <= 26.5 and abs(value * 2 - round(value * 2)) < 1e-9:
+                    return float(value), f"{key} from exact Outs object"
+    return None, "no exact structured Outs line"
+
+def _app91_timestamp(*objs):
+    candidates = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        a = _app91_attrs(obj)
+        for key in ["updated_at", "updatedAt", "modified_at", "created_at", "createdAt"]:
+            raw = a.get(key) or obj.get(key)
+            if raw:
+                candidates.append(str(raw))
+    best = 0.0
+    for raw in candidates:
+        try:
+            dt = _app91_datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            best = max(best, dt.timestamp())
+        except Exception:
+            pass
+    return best
+
+
+def _app91_matchup_tokens(value):
+    raw = str(value or "").upper().replace(" VS ", " @ ").replace(" AT ", " @ ")
+    return {part.strip() for part in raw.split("@") if part.strip()}
+
+def _app91_matchup_matches(expected_matchup, *objs):
+    expected = _app91_matchup_tokens(expected_matchup)
+    if not expected:
+        return True
+    blob = _app91_text(*objs).upper()
+    if all(team in blob for team in expected):
+        return True
+    # Do not reject when the endpoint exposes no game/opponent metadata.
+    has_game_metadata = any(
+        token in blob.lower()
+        for token in ["matchup", "opponent", "away team", "home team", "game"]
+    )
+    return not has_game_metadata
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _beta_fetch_underdog_pitcher_market(player_name, market_kind, matchup=""):
+    mk = str(market_kind or "").upper()
+    if mk != "OUTS":
+        return {
+            "status": "NO MATCH", "line": None, "rows": [],
+            "message": "Only strict live Pitching Outs matching is enabled"
+        }
+
+    accepted = []
+    last_message = ""
+
+    for url_index, url in enumerate(UNDERDOG_URLS):
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            last_message = f"No JSON from {url}"
+            continue
+
+        objects = _app91_collect(data)
+        by_key, by_id = _app91_maps(objects)
+
+        line_candidates = []
+        for obj in objects:
+            typ = _app91_type(obj)
+            a = _app91_attrs(obj)
+            if "over_under_line" in typ or any(a.get(k) not in [None, ""] for k in [
+                "stat_value", "line_score", "over_under_line",
+                "target_value", "display_stat_value"
+            ]):
+                line_candidates.append(obj)
+
+        for line_obj in line_candidates:
+            related = _app91_related(line_obj, by_key, by_id)
+            market_objs = _app91_rel(line_obj, ["over_under", "over_unders", "market", "markets"], by_key, by_id)
+            market_obj = market_objs[0] if market_objs else None
+
+            # Require explicit Pitching Outs wording in structured related data.
+            if not _app91_market_is_exact_outs(*related):
+                continue
+            if not _app91_active(*related):
+                continue
+
+            matched, matched_name = _app91_exact_player_match(player_name, *related)
+            if not matched:
+                continue
+            if not _app91_matchup_matches(matchup, *related):
+                continue
+
+            line, evidence = _app91_line(line_obj, market_obj)
+            if line is None:
+                continue
+
+            sport_text = _app91_text(*related).lower()
+            if any(s in sport_text for s in [
+                "nba", "nfl", "nhl", "wnba", "soccer", "tennis",
+                "golf", "basketball", "football", "hockey"
+            ]):
+                continue
+
+            accepted.append({
+                "Source": "Underdog",
+                "Provider": "Underdog",
+                "Player": player_name,
+                "Requested Matchup": matchup,
+                "Matched Name": matched_name,
+                "Market": "Pitching Outs",
+                "Line": float(line),
+                "Line Evidence": evidence,
+                "Parser Mode": "strict-relationship",
+                "API Priority": -url_index,
+                "Updated Timestamp": _app91_timestamp(*related),
+                "Evidence": _app91_text(*related)[:260],
+            })
+
+        # Newest API version wins. Do not merge stale rows from older endpoints
+        # once an exact active market was found.
+        if accepted:
+            break
+
+    if not accepted:
+        return {
+            "status": "NO MATCH", "line": None, "rows": [],
+            "message": last_message or "No exact active Underdog Pitching Outs line"
+        }
+
+    # Deduplicate identical live rows.
+    dedup = {}
+    for row in accepted:
+        key = (
+            normalize_name(row.get("Matched Name")),
+            row.get("Market"),
+            float(row.get("Line"))
+        )
+        old = dedup.get(key)
+        if old is None or row.get("Updated Timestamp", 0) > old.get("Updated Timestamp", 0):
+            dedup[key] = row
+    rows = list(dedup.values())
+
+    # Select the newest exact standard market. If timestamps are absent, prefer
+    # the line occurring most often in the newest endpoint, then stable order.
+    counts = {}
+    for row in rows:
+        counts[row["Line"]] = counts.get(row["Line"], 0) + 1
+
+    rows.sort(
+        key=lambda r: (
+            r.get("Updated Timestamp", 0),
+            counts.get(r.get("Line"), 0),
+            r.get("API Priority", 0)
+        ),
+        reverse=True
+    )
+    best = rows[0]
+
+    # Ambiguous active lines without timestamps are not guessed.
+    unique_lines = sorted({float(r["Line"]) for r in rows})
+    timestamps = [r.get("Updated Timestamp", 0) for r in rows]
+    if len(unique_lines) > 1 and max(timestamps or [0]) <= 0:
+        return {
+            "status": "AMBIGUOUS", "line": None, "rows": rows,
+            "message": "Multiple active Outs lines found; refusing to guess",
+            "debug_lines": ", ".join(f"{x:.1f}" for x in unique_lines)
+        }
+
+    debug = ", ".join(
+        f"{float(r['Line']):.1f} ({r.get('Matched Name')}; exact live)"
+        for r in rows[:5]
+    )
+    return {
+        "status": "FOUND",
+        "line": float(best["Line"]),
+        "rows": rows,
+        "message": f"Exact live Underdog Pitching Outs {float(best['Line']):.1f}",
+        "debug_lines": debug,
+    }
+
+
+# Preserve all existing Pitching Outs projection calculations, but only display
+# pitchers who have a verified exact live Underdog Outs line.
+_app91_previous_beta_projection_rows = _beta_projection_rows
+
+def _beta_projection_rows(board, market_kind="OUTS"):
+    df = _app91_previous_beta_projection_rows(board, market_kind)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if str(market_kind or "").upper() != "OUTS":
+        return df
+
+    # Remove stale/unlisted/no-line players from the actionable Outs board.
+    if "Line Status" in df.columns:
+        df = df[df["Line Status"].astype(str).eq("FOUND")].copy()
+
+    if "UD Line" in df.columns:
+        numeric_line = pd.to_numeric(df["UD Line"], errors="coerce")
+        df = df[numeric_line.notna()].copy()
+        df["UD Line"] = numeric_line.loc[df.index]
+
+    # One verified row per pitcher.
+    if "Pitcher" in df.columns:
+        df["_app91_player_key"] = df["Pitcher"].astype(str).map(normalize_name)
+        df = df.drop_duplicates("_app91_player_key", keep="first").drop(columns=["_app91_player_key"])
+
+    if "Line Match Debug" in df.columns:
+        df["Line Match Debug"] = df.apply(
+            lambda r: f"VERIFIED LIVE OUTS: {float(r['UD Line']):.1f}",
+            axis=1
+        )
+
+    return df.reset_index(drop=True)
+
+
+# =============================================================================
+# APP92 AUTHORITATIVE ACTIVE INTERFACE
+# =============================================================================
+_APP92_ENRICHED_K_PIPELINE = build_kproj_table
+
+def build_kproj_table(board):
+    """Canonical public K-board entry point with immutable RAW BASE_K."""
+    df = _APP92_ENRICHED_K_PIPELINE(board)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    out = df.copy()
+    if "RAW BASE_K" not in out.columns:
+        for fallback in ["Pre-App70 K PROJ", "Original K PROJ", "APP90 TRUE ORIGINAL BASE_K"]:
+            if fallback in out.columns:
+                out["RAW BASE_K"] = pd.to_numeric(out[fallback], errors="coerce")
+                break
+
+    final_series = None
+    for candidate in ["APP90 Final K Projection", "APP88 Final K Projection", "K PROJ"]:
+        if candidate in out.columns:
+            series = pd.to_numeric(out[candidate], errors="coerce")
+            if series.notna().any():
+                final_series = series
+                break
+
+    if final_series is not None:
+        out["K PROJ"] = final_series
+        out["Final K Projection"] = final_series
+        out["Official K PROJ"] = final_series
+
+    if "UD/Line" in out.columns and "K PROJ" in out.columns:
+        line = pd.to_numeric(out["UD/Line"], errors="coerce")
+        proj = pd.to_numeric(out["K PROJ"], errors="coerce")
+        out["Official K Edge"] = (proj - line).round(2)
+
+    out["Active K Pipeline"] = "APP92_CANONICAL"
+    return out
+
+
+def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
+    """Canonical formatter; always uses the active final projection."""
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+
+        d = df.copy()
+        if "Line Source" in d.columns:
+            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
+        if "UD/Line" not in d.columns:
+            d["UD/Line"] = d.get("UD Line", d.get("Line"))
+        d["UD/Line"] = pd.to_numeric(d["UD/Line"], errors="coerce")
+        d = d[d["UD/Line"].notna()].copy()
+        d = _owp_one_final_row_per_pitcher(d)
+
+        projection_column = next(
+            (c for c in ["APP90 Final K Projection", "K PROJ", "Final K Projection"] if c in d.columns),
+            None,
+        )
+        if projection_column is None:
+            return ""
+
+        output = []
+        for matchup, group in d.groupby("Matchup", sort=False):
+            block = []
+            for _, row in group.iterrows():
+                line = _safe_num_shared(row.get("UD/Line"))
+                proj = _safe_num_shared(row.get(projection_column))
+                if not np.isfinite(line) or not np.isfinite(proj):
+                    continue
+
+                side = str(row.get("APP90 Final Side") or "").upper().strip()
+                if side not in {"OVER", "UNDER"}:
+                    side = "OVER" if proj > line else "UNDER"
+
+                edge = abs(proj - line)
+                prefix = "O" if side == "OVER" else "U"
+                symbol = f"🔥 {prefix}" if edge >= 1.00 else (f"⚠️ {prefix}" if edge < 0.65 else prefix)
+
+                ip = float("nan")
+                for column in ["IP Floor", "IP PROJ", "Projected IP"]:
+                    if column in row.index:
+                        candidate = _safe_num_shared(row.get(column))
+                        if np.isfinite(candidate):
+                            ip = candidate
+                            break
+
+                ip_text = "—" if not np.isfinite(ip) else f"{ip:.2f}"
+                block.append(
+                    f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K — IP {ip_text}"
+                )
+            if block:
+                output.append(str(matchup))
+                output.extend(block)
+                output.append("")
+        return "\n".join(output).strip()
+    except Exception as exc:
+        return f"Slate builder unavailable: {exc}"
+
+
+def app92_pipeline_audit():
+    return {
+        "version": "APP92_PIPELINE_CLEANUP_TRUE_RAW_BASE_MATCHUP_SAFE",
+        "raw_anchor": "RAW BASE_K",
+        "public_k_entrypoint": "build_kproj_table",
+        "copy_paste_source": "APP90 Final K Projection",
+        "outs_matching": "exact player + exact market + active + matchup-aware",
+        "card_guard": "try/finally",
+    }
+
 
 
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
