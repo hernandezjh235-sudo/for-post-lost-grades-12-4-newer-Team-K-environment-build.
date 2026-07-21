@@ -10893,30 +10893,24 @@ def render_kpis(picks, bankroll):
 _OFFICIAL_CARD_ROW_GUARD = False
 
 def official_card_k_row(p):
-    """Build a one-player K board row so the card matches the table exactly.
-
-    This is display-only. It prevents card projection/edge/decision from using
-    an earlier layer while the table is using the final post-stack K PROJ.
-    """
+    """Build one final K row with exception-safe re-entry protection."""
     global _OFFICIAL_CARD_ROW_GUARD
+    if _OFFICIAL_CARD_ROW_GUARD:
+        return {}
+
+    _OFFICIAL_CARD_ROW_GUARD = True
     try:
-        if _OFFICIAL_CARD_ROW_GUARD:
-            return {}
-        _OFFICIAL_CARD_ROW_GUARD = True
         df = build_kproj_table([p])
-        _OFFICIAL_CARD_ROW_GUARD = False
-        if df is not None and not df.empty:
-            row = df.iloc[0].to_dict()
-            # Display-only: card row is one-player, so overlay the slate-wide rank map.
-            if '_owp_overlay_full_board_pitcher_k_rank' in globals():
-                row = _owp_overlay_full_board_pitcher_k_rank(row)
-            return row
+        if df is None or df.empty:
+            return {}
+        row = df.iloc[0].to_dict()
+        if "_owp_overlay_full_board_pitcher_k_rank" in globals():
+            row = _owp_overlay_full_board_pitcher_k_rank(row)
+        return row
     except Exception:
-        try:
-            _OFFICIAL_CARD_ROW_GUARD = False
-        except Exception:
-            pass
-    return {}
+        return {}
+    finally:
+        _OFFICIAL_CARD_ROW_GUARD = False
 
 def official_card_k_projection(p):
     """Official card projection synced to the board K PROJ.
@@ -13718,6 +13712,8 @@ def build_kproj_table(board):
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
+            # Immutable raw projection captured before every later calibration/wrapper.
+            "RAW BASE_K": d.get("projection"),
             "K PROJ": d.get("projection"),
             "Floor": dist.get("floor"),
             "Median": dist.get("median"),
@@ -33270,6 +33266,30 @@ except Exception:
     pass
 
 
+
+# =============================================================================
+# APP95 SHARED FINAL-LAYER UTILITIES
+#
+# Legacy helpers remain for backward compatibility, but every new/canonical
+# path below uses this single implementation.
+# =============================================================================
+def _safe_num(value, default=float("nan")):
+    try:
+        result = float(value)
+        return result if np.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+def _safe_pct(value, default=float("nan")):
+    result = _safe_num(value, default)
+    if not np.isfinite(result):
+        return default
+    return result / 100.0 if result > 1.0 else result
+
+def _safe_clip(value, low, high):
+    result = _safe_num(value, 0.0)
+    return max(float(low), min(float(high), result))
+
 # =============================================================================
 # APP89 — COPY/PASTE SLATE USES THE TRUE ACTIVE FINAL K PROJECTION
 #
@@ -33369,6 +33389,154 @@ def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=Fal
 
     except Exception as e:
         return f"Slate builder unavailable: {e}"
+
+
+# =============================================================================
+# APP95 CANONICAL PUBLIC PIPELINE
+#
+# The historical wrapper chain is preserved internally for output parity.
+# All UI/export consumers below this point use this one public entry point.
+# RAW BASE_K is immutable and never reconstructed from a mid-pipeline field.
+# Strikeout-line and Pitching-Outs line parsers are not modified here.
+# =============================================================================
+_APP95_COMPATIBILITY_K_PIPELINE = build_kproj_table
+
+def build_kproj_table(board):
+    """Canonical public K table.
+
+    Runs the existing compatibility pipeline once, then normalizes the final
+    output while preserving the immutable RAW BASE_K snapshot.
+    """
+    df = _APP95_COMPATIBILITY_K_PIPELINE(board)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    out = df.copy()
+
+    # Compatibility only: old cached objects may not contain the new snapshot.
+    if "RAW BASE_K" not in out.columns:
+        for candidate in ["Pre-App70 K PROJ", "Original K PROJ", "K PROJ"]:
+            if candidate in out.columns:
+                out["RAW BASE_K"] = pd.to_numeric(out[candidate], errors="coerce")
+                break
+
+    # Resolve the currently active final projection without changing the math.
+    final_col = next(
+        (
+            c for c in [
+                "APP88 Final K Projection",
+                "Line-Aware Smart Final K Projection",
+                "WRS Final K Projection",
+                "TPS Final K Projection",
+                "K PROJ",
+            ]
+            if c in out.columns
+        ),
+        None,
+    )
+    if final_col is not None:
+        final_values = pd.to_numeric(out[final_col], errors="coerce")
+        out["K PROJ"] = final_values
+        out["Final K Projection"] = final_values
+        out["Official K PROJ"] = final_values
+
+    if "UD/Line" in out.columns and "K PROJ" in out.columns:
+        live_line = pd.to_numeric(out["UD/Line"], errors="coerce")
+        final_k = pd.to_numeric(out["K PROJ"], errors="coerce")
+        out["Official K Edge"] = (final_k - live_line).round(2)
+
+    out["Active K Pipeline"] = "APP95_CANONICAL"
+    return out
+
+
+# One final formatter only. It does not alter K lines, Outs lines, or projections.
+def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+
+        d = df.copy()
+        if "Line Source" in d.columns:
+            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
+
+        if "UD/Line" not in d.columns:
+            d["UD/Line"] = d.get("Line")
+        d["UD/Line"] = pd.to_numeric(d["UD/Line"], errors="coerce")
+        d = d[d["UD/Line"].notna()].copy()
+        d = _owp_one_final_row_per_pitcher(d)
+
+        projection_col = next(
+            (
+                c for c in [
+                    "APP88 Final K Projection",
+                    "K PROJ",
+                    "Final K Projection",
+                    "Line-Aware Smart Final K Projection",
+                ]
+                if c in d.columns
+            ),
+            None,
+        )
+        if projection_col is None:
+            return ""
+
+        output = []
+        for matchup, group in d.groupby("Matchup", sort=False):
+            block = []
+            for _, row in group.iterrows():
+                line = _safe_num(row.get("UD/Line"))
+                proj = _safe_num(row.get(projection_col))
+                if not np.isfinite(line) or not np.isfinite(proj):
+                    continue
+
+                side = str(row.get("APP88 Final Side") or "").upper().strip()
+                if side not in {"OVER", "UNDER"}:
+                    side = "OVER" if proj > line else "UNDER"
+
+                edge = abs(proj - line)
+                prefix = "O" if side == "OVER" else "U"
+                symbol = (
+                    f"🔥 {prefix}"
+                    if edge >= 1.00
+                    else (f"⚠️ {prefix}" if edge < 0.65 else prefix)
+                )
+
+                ip = float("nan")
+                for column in ["IP Floor", "IP PROJ", "Projected IP"]:
+                    if column in row.index:
+                        candidate = _safe_num(row.get(column))
+                        if np.isfinite(candidate):
+                            ip = candidate
+                            break
+
+                ip_text = "—" if not np.isfinite(ip) else f"{ip:.2f}"
+                block.append(
+                    f"• {row.get('Pitcher')} — {symbol} {line:.1f} — "
+                    f"{proj:.2f} K — IP {ip_text}"
+                )
+
+            if block:
+                output.append(str(matchup))
+                output.extend(block)
+                output.append("")
+
+        return "\n".join(output).strip()
+    except Exception as exc:
+        return f"Slate builder unavailable: {exc}"
+
+
+def app95_pipeline_audit():
+    """Internal architecture/version check."""
+    return {
+        "version": "APP95_REFACTOR_STAGE1_TRUE_RAW_BASE_SAFE",
+        "raw_anchor": "RAW BASE_K",
+        "public_k_entrypoint": "build_kproj_table",
+        "copy_paste": "single canonical final formatter",
+        "strikeout_line_parser_changed": False,
+        "pitching_outs_line_parser_changed": False,
+        "official_card_guard": "try/finally",
+    }
+
 
 
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
