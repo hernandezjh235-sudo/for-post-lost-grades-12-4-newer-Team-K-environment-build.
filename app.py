@@ -33371,6 +33371,345 @@ def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=Fal
         return f"Slate builder unavailable: {e}"
 
 
+# =============================================================================
+# APP90 — FULL K ENGINE: TRUE ORIGINAL ANCHOR + STRONGER L5 + ELITE PROTECTION
+#
+# Fixes the three observed problems:
+# 1) Prevents large automatic K reductions.
+# 2) Requires four independent signals before any O/U side flip.
+# 3) Protects elite strikeout pitchers from generic projection compression.
+#
+# Recent form:
+# - Established starters: Season 45%, L10 30%, L5 25%.
+# - Rookies / small samples / recent role changes: Season 25%, L10 35%, L5 40%.
+# L5 is materially stronger than before, but remains capped so one noisy start
+# cannot replace the original successful projection.
+#
+# Original anchor priority:
+# Pre-App70 K PROJ -> other pre-calibration columns -> APP88 original base.
+# This intentionally bypasses later suppressive K calibration layers.
+#
+# Pitching Outs calculations are not modified.
+# =============================================================================
+
+import numpy as _a90_np
+import pandas as _a90_pd
+
+APP90_VERSION = "APP90_FULL_K_ENGINE_ELITE_L5_PROTECTED_v1"
+APP90_REQUIRED_SIGNALS_FOR_FLIP = 4
+APP90_MAX_ADJ_STANDARD = 0.35
+APP90_MAX_ADJ_ELITE = 0.25
+
+def _a90_num(v):
+    try:
+        x = float(v)
+        return x if _a90_np.isfinite(x) else _a90_np.nan
+    except Exception:
+        return _a90_np.nan
+
+def _a90_pct(v):
+    x = _a90_num(v)
+    if not _a90_np.isfinite(x):
+        return _a90_np.nan
+    return x / 100.0 if x > 1.0 else x
+
+def _a90_clip(v, lo, hi):
+    try:
+        return max(lo, min(hi, float(v)))
+    except Exception:
+        return 0.0
+
+def _a90_first(row, names):
+    for name in names:
+        if name in row.index:
+            x = _a90_num(row.get(name))
+            if _a90_np.isfinite(x):
+                return x
+    return _a90_np.nan
+
+def _a90_original_base(row):
+    # Pre-App70 is the earliest retained projection before the later
+    # calibration/suppression wrappers. This is the best in-file OG anchor.
+    return _a90_first(row, [
+        "Pre-App70 K PROJ",
+        "Pre-App75 K PROJ",
+        "Pre-App78 K PROJ",
+        "Pre-LineAwareSmart K PROJ",
+        "Original K PROJ",
+        "APP88 Original BASE_K",
+        "APP87 Original BASE_K",
+        "APP85 BASE_K (Original Preserved)",
+        "K PROJ",
+    ])
+
+def _a90_is_rookie_or_small_sample(row):
+    starts = _a90_first(row, [
+        "Season Starts", "GS", "Games Started", "Starter Games",
+        "Current Season Starts", "Season GS"
+    ])
+    bf = _a90_first(row, ["Season BF", "Batters Faced", "BF"])
+    flag_text = " ".join(str(row.get(c, "")) for c in [
+        "Role Flags", "Flags", "Data Quality", "Pitch Limit Flags",
+        "APP85 Workload Risk"
+    ]).upper()
+    if any(k in flag_text for k in ["ROOKIE", "CALLUP", "CALL-UP", "RETURN", "REHAB", "SMALL_SAMPLE"]):
+        return True
+    if _a90_np.isfinite(starts) and starts < 8:
+        return True
+    if _a90_np.isfinite(bf) and bf < 150:
+        return True
+    return False
+
+def _a90_recent_form(row, base):
+    # Prefer actual recent K averages because they are in strikeout units.
+    l5 = _a90_first(row, [
+        "L5 K Avg", "Last 5 K Avg", "Recent L5 K Avg", "K L5 Avg",
+        "L5 Avg", "Recent K L5"
+    ])
+    l10 = _a90_first(row, [
+        "L10 K Avg", "Last 10 K Avg", "Recent L10 K Avg", "K L10 Avg",
+        "L10 Avg", "Recent K L10"
+    ])
+    season = _a90_first(row, [
+        "Season K Avg", "K/Game", "Season Avg", "Season K Per Start",
+        "Historical K Average"
+    ])
+
+    rookie = _a90_is_rookie_or_small_sample(row)
+    weights = {"L5": 0.40, "L10": 0.35, "SEASON": 0.25} if rookie else {
+        "L5": 0.25, "L10": 0.30, "SEASON": 0.45
+    }
+
+    vals = []
+    for key, val in [("L5", l5), ("L10", l10), ("SEASON", season)]:
+        if _a90_np.isfinite(val):
+            vals.append((val, weights[key]))
+    if vals:
+        recent_anchor = sum(v*w for v, w in vals) / sum(w for _, w in vals)
+        # Stronger L5 influence, but a capped projection contribution.
+        adj = _a90_clip((recent_anchor - base) * 0.16, -0.14, 0.14)
+        return recent_anchor, adj, weights, rookie
+
+    # Fallback to hit rates relative to current side.
+    l5_hit = _a90_pct(_a90_first(row, ["L5 Hit Rate", "Last 5 Hit Rate", "L5 Over %"]))
+    l10_hit = _a90_pct(_a90_first(row, ["L10 Hit Rate", "Last 10 Hit Rate", "L10 Over %"]))
+    if _a90_np.isfinite(l5_hit) or _a90_np.isfinite(l10_hit):
+        parts = []
+        if _a90_np.isfinite(l5_hit): parts.append((l5_hit, 0.60))
+        if _a90_np.isfinite(l10_hit): parts.append((l10_hit, 0.40))
+        rate = sum(v*w for v,w in parts) / sum(w for _,w in parts)
+        return _a90_np.nan, _a90_clip((rate-0.50)*0.20, -0.10, 0.10), weights, rookie
+
+    return _a90_np.nan, 0.0, weights, rookie
+
+def _a90_elite_status(row):
+    pk = _a90_pct(_a90_first(row, ["Pitcher K%", "APP85 Pitcher K%", "K%", "Season K%"]))
+    csw = _a90_pct(_a90_first(row, ["T12 CSW%", "CSW%", "CSW %"]))
+    sw = _a90_pct(_a90_first(row, ["T12 SwStr%", "SwStr%", "SwStr %"]))
+    putaway = _a90_pct(_a90_first(row, ["PutAway%", "Putaway Rate", "APP88 PutAway Rate"]))
+    bfk = _a90_first(row, ["APP85 BF-to-K Anchor", "BF-to-K Conversion Projection 2.2", "BF-K Expected K 2.1"])
+    base = _a90_original_base(row)
+
+    checks = [
+        _a90_np.isfinite(pk) and pk >= 0.275,
+        _a90_np.isfinite(csw) and csw >= 0.285,
+        _a90_np.isfinite(sw) and sw >= 0.125,
+        _a90_np.isfinite(putaway) and putaway >= 0.32,
+        _a90_np.isfinite(bfk) and _a90_np.isfinite(base) and bfk >= base - 0.10,
+    ]
+    score = sum(bool(x) for x in checks)
+    return score >= 3, score, pk, csw, sw, putaway
+
+def _a90_apply(df):
+    if df is None or not isinstance(df, _a90_pd.DataFrame) or df.empty:
+        return df
+
+    out = df.copy()
+    audit_rows = []
+
+    for _, row in out.iterrows():
+        base = _a90_original_base(row)
+        line = _a90_first(row, ["UD/Line", "UD Line", "Line", "K Line", "stat_value"])
+        elite, elite_score, pk, csw, sw, putaway = _a90_elite_status(row)
+
+        # Reuse the fully built APP88 matchup layers, but re-anchor them to the
+        # true pre-calibration original projection.
+        lineup_adj = _a90_num(row.get("APP88 Lineup K Adjustment"))
+        team_adj = _a90_num(row.get("APP88 Team K Environment Adjustment"))
+        arsenal_adj = _a90_num(row.get("APP88 Arsenal Adjustment"))
+        whiff_adj = _a90_num(row.get("APP88 Whiff Interaction Adjustment"))
+        workload_adj = _a90_num(row.get("APP88 Workload Adjustment"))
+        market_adj = _a90_num(row.get("APP88 Market Agreement Adjustment"))
+        line_adj = _a90_num(row.get("APP88 Line Difficulty Adjustment"))
+        bfk_adj = _a90_num(row.get("APP88 BF-to-K Adjustment"))
+
+        existing = [
+            0.0 if not _a90_np.isfinite(x) else float(x)
+            for x in [lineup_adj, team_adj, arsenal_adj, whiff_adj,
+                      workload_adj, market_adj, line_adj, bfk_adj]
+        ]
+
+        recent_anchor, recent_adj, recent_weights, rookie = _a90_recent_form(row, base)
+
+        # Elite downside protection:
+        # positive matchup evidence remains fully usable; negative evidence is
+        # reduced unless there are at least four genuinely negative signals.
+        raw_signals = existing + [recent_adj]
+        pre_neg = sum(1 for x in raw_signals if x <= -0.04)
+        protected_signals = []
+        for x in raw_signals:
+            if elite and x < 0 and pre_neg < 4:
+                protected_signals.append(x * 0.45)
+            else:
+                protected_signals.append(x)
+
+        pos = sum(1 for x in protected_signals if x >= 0.04)
+        neg = sum(1 for x in protected_signals if x <= -0.04)
+
+        raw_total = sum(protected_signals)
+        cap = APP90_MAX_ADJ_ELITE if elite else APP90_MAX_ADJ_STANDARD
+        total_adj = _a90_clip(raw_total, -cap, cap)
+        final_proj = base + total_adj if _a90_np.isfinite(base) else base
+
+        base_side = ""
+        candidate_side = ""
+        final_side = ""
+        flip_guard = "NO_LINE"
+        if _a90_np.isfinite(base) and _a90_np.isfinite(line):
+            base_side = "OVER" if base > line else "UNDER"
+            candidate_side = "OVER" if final_proj > line else "UNDER"
+            final_side = candidate_side
+            flip_guard = "NO_FLIP"
+
+            if candidate_side != base_side:
+                agreeing = pos if total_adj > 0 else neg
+                # Four independent signals + meaningful movement are required.
+                if agreeing < APP90_REQUIRED_SIGNALS_FOR_FLIP or abs(total_adj) < 0.30:
+                    final_side = base_side
+                    flip_guard = "ORIGINAL_SIDE_PROTECTED_4_SIGNAL_RULE"
+                    # Keep displayed projection on the original side of the line.
+                    epsilon = 0.01
+                    if base_side == "OVER" and final_proj <= line:
+                        final_proj = line + epsilon
+                    elif base_side == "UNDER" and final_proj >= line:
+                        final_proj = line - epsilon
+                else:
+                    flip_guard = "FLIP_ALLOWED_4_SIGNAL_CONFIRMATION"
+
+        if pos >= 4 and neg <= 1:
+            classification = "UPSIDE CONFIRMED"
+        elif neg >= 4 and pos <= 1:
+            classification = "‼️ DANGER CONFIRMED"
+        elif pos > neg:
+            classification = "UPSIDE LEAN"
+        elif neg > pos:
+            classification = "RISK LEAN"
+        else:
+            classification = "NEUTRAL"
+
+        audit_rows.append({
+            "APP90 Version": APP90_VERSION,
+            "APP90 TRUE ORIGINAL BASE_K": base,
+            "APP90 Recent Anchor K": recent_anchor,
+            "APP90 L5 Weight": recent_weights["L5"],
+            "APP90 L10 Weight": recent_weights["L10"],
+            "APP90 Season Weight": recent_weights["SEASON"],
+            "APP90 Rookie/Small Sample": rookie,
+            "APP90 Recent Form Adjustment": recent_adj,
+            "APP90 Elite K Protected": elite,
+            "APP90 Elite Signal Score": elite_score,
+            "APP90 Pitcher K%": pk*100 if _a90_np.isfinite(pk) else _a90_np.nan,
+            "APP90 CSW%": csw*100 if _a90_np.isfinite(csw) else _a90_np.nan,
+            "APP90 SwStr%": sw*100 if _a90_np.isfinite(sw) else _a90_np.nan,
+            "APP90 PutAway%": putaway*100 if _a90_np.isfinite(putaway) else _a90_np.nan,
+            "APP90 Positive Signals": pos,
+            "APP90 Negative Signals": neg,
+            "APP90 Adjustment Cap": cap,
+            "APP90 Total K Adjustment": total_adj,
+            "APP90 Final K Projection": final_proj,
+            "APP90 Original Side": base_side,
+            "APP90 Candidate Side": candidate_side,
+            "APP90 Final Side": final_side,
+            "APP90 Side Flip Guard": flip_guard,
+            "APP90 Risk/Upside Class": classification,
+        })
+
+    audit = _a90_pd.DataFrame(audit_rows, index=out.index)
+    for col in audit.columns:
+        out[col] = audit[col]
+
+    # Promote APP90 everywhere the production K board expects the final K.
+    for col in [
+        "K PROJ", "Final K Projection", "Line-Aware Smart Final K Projection",
+        "Official K PROJ", "Matchup Intelligence Final K Projection"
+    ]:
+        if col in out.columns:
+            out[col] = out["APP90 Final K Projection"]
+
+    return out
+
+try:
+    _a90_prev_build_kproj_table = build_kproj_table
+    def build_kproj_table(*args, **kwargs):
+        return _a90_apply(_a90_prev_build_kproj_table(*args, **kwargs))
+except Exception:
+    pass
+
+
+# APP90 copy/paste override: always mirrors the final production projection.
+def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+
+        d = df.copy()
+        if "Line Source" in d.columns:
+            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
+
+        if "UD/Line" not in d.columns:
+            d["UD/Line"] = d.get("UD Line", d.get("Line"))
+
+        d = d[~d["UD/Line"].astype(str).str.upper().isin(
+            ["NO LINE", "NO_UD_LINE", "", "NAN", "NONE"]
+        )].copy()
+        d = _owp_one_final_row_per_pitcher(d)
+
+        lines = []
+        for matchup, group in d.groupby("Matchup", sort=False):
+            block = []
+            for _, row in group.iterrows():
+                line = safe_float(row.get("UD/Line"), None)
+                proj = safe_float(row.get("APP90 Final K Projection"), None)
+                if proj is None:
+                    proj = safe_float(row.get("K PROJ"), None)
+
+                side = str(row.get("APP90 Final Side") or "").upper().strip()
+                if side not in {"OVER", "UNDER"} and proj is not None and line is not None:
+                    side = "OVER" if proj > line else "UNDER"
+                if side not in {"OVER", "UNDER"}:
+                    continue
+
+                edge = abs(proj - line) if proj is not None and line is not None else 0.0
+                prefix = "O" if side == "OVER" else "U"
+                symbol = f"🔥 {prefix}" if edge >= 1.00 else (f"⚠️ {prefix}" if edge < 0.65 else prefix)
+
+                ip = safe_float(row.get("IP Floor"), None)
+                if ip is None: ip = safe_float(row.get("IP PROJ"), None)
+                if ip is None: ip = safe_float(row.get("Projected IP"), None)
+
+                block.append(
+                    f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K — IP "
+                    f"{'—' if ip is None else f'{ip:.2f}'}"
+                )
+            if block:
+                lines.append(str(matchup))
+                lines.extend(block)
+                lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as exc:
+        return f"Slate builder unavailable: {exc}"
+
+
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
