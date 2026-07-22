@@ -14006,9 +14006,13 @@ def render_kproj_tab(board):
         "Data Enhanced K Projection", "K Data Adjustment", "K Data Completeness Score",
         "K Data Gaps", "K Data Projection Drivers", "K Projection Enhancement Mode",
         "Projection Ensemble Signal", "Projection Ensemble Note",
+        "Pitcher Stats Signal", "Pitcher Stats Note",
+        "Pitcher K% Used", "Pitcher K/9 Used", "Pitcher BB/9 Used", "Pitcher ERA Used", "Pitcher FIP Used",
         "Recent Skill Signal", "Recent Skill Note",
         "Lineup Quality Signal", "Lineup Quality Note",
+        "Opponent K% Used", "Opponent BB/K Used", "Opponent AVG Used", "Opponent OBP Used", "Opponent wOBA Used", "Opponent K Rank Used",
         "Pitch Mix Signal", "Pitch Mix Note",
+        "Pitch Arsenal Top Pitch Used", "Pitch Arsenal Top Usage Used", "Pitch Arsenal Usage Used",
         "Umpire Zone Signal", "Umpire Zone Note",
         "Hook/Role Signal", "Hook/Role Note", "Injury/Pitch Limit Flag",
         "Shared Workload K Audit", "Workload Confidence Adj"
@@ -14044,7 +14048,7 @@ def render_kproj_tab(board):
         "Do Not Bet Reason", "Official Support Signals",
         "Official Selector Blocks", "Official Selector Warnings",
         "Data Enhanced K Projection", "K Data Adjustment", "K Data Completeness Score", "K Data Gaps",
-        "Projection Ensemble Signal", "Recent Skill Signal", "Lineup Quality Signal",
+        "Projection Ensemble Signal", "Pitcher Stats Signal", "Recent Skill Signal", "Lineup Quality Signal",
         "Pitch Mix Signal", "Umpire Zone Signal", "Hook/Role Signal",
         "K Line Calibration Action", "K Damage Risk Label", "K Volume Risk",
         "K Missing Input Count", "K Missing Inputs"
@@ -34036,6 +34040,904 @@ def render_moneyline_edge_tab(board, dates=None):
 
 
 # =============================================================================
+# MONEYLINE REAL-DATA QUALITY / SELECTOR UPGRADE
+# Audit-only final layer for Moneyline. It does not touch K, PO, or slates.
+# =============================================================================
+MONEYLINE_DATA_QUALITY_VERSION = "MONEYLINE_DATA_QUALITY_2026_07_22"
+_MLDQ_PREV_BUILD_BOARD = ml_build_board if "ml_build_board" in globals() else None
+_MLDQ_PREV_RENDER = render_moneyline_edge_tab if "render_moneyline_edge_tab" in globals() else None
+
+
+def _mldq_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _mldq_pick(row, keys, default=""):
+    row = row if isinstance(row, dict) else {}
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, "", "—"):
+            return value
+    return default
+
+
+def _mldq_pick_side(row):
+    pick = str(_mldq_pick(row, ["Pick", "ML Final Pick", "Score Pick"], "") or "").upper().strip()
+    matchup = str(row.get("Matchup") or "")
+    away, home = "", ""
+    try:
+        if "@" in matchup:
+            away, home = [x.strip().upper() for x in matchup.split("@", 1)]
+    except Exception:
+        pass
+    side = "AWAY" if pick and pick == away else "HOME" if pick and pick == home else ""
+    return pick, side, away, home
+
+
+def _mldq_side_value(row, side, away_keys, home_keys, default=np.nan):
+    keys = away_keys if side == "AWAY" else home_keys if side == "HOME" else away_keys + home_keys
+    return _mldq_num(_mldq_pick(row, keys, default), default)
+
+
+def _mldq_opp_side(side):
+    return "HOME" if side == "AWAY" else "AWAY" if side == "HOME" else ""
+
+
+def _mldq_moneyline_profile(row):
+    pick, side, away, home = _mldq_pick_side(row)
+    opp = _mldq_opp_side(side)
+    reasons = []
+    supports = []
+    missing = []
+
+    score_edge = abs(_mldq_num(row.get("Score Edge"), _mldq_num(row.get("Expected Run Differential"), np.nan)))
+    value_edge = _mldq_num(row.get("ML Value Edge %"), _mldq_num(row.get("ML Sim Market Edge %"), _mldq_num(row.get("ML Edge %"), np.nan)))
+    true_conf = _mldq_num(row.get("ML True Win Confidence %"), _mldq_num(row.get("ML Final Confidence %"), _mldq_num(row.get("ML Confidence %"), np.nan)))
+    sim_pick = str(row.get("ML Sim Pick") or "").upper().strip()
+    score_pick = str(row.get("Score Pick") or "").upper().strip()
+    volatility = str(row.get("Game Volatility") or "").upper()
+    vol_score = _mldq_num(row.get("Volatility Score"), np.nan)
+
+    pick_sp = _mldq_side_value(row, side, ["Away SP Strength"], ["Home SP Strength"])
+    opp_sp = _mldq_side_value(row, opp, ["Away SP Strength"], ["Home SP Strength"])
+    pick_bp = _mldq_side_value(row, side, ["Away Bullpen"], ["Home Bullpen"])
+    opp_bp = _mldq_side_value(row, opp, ["Away Bullpen"], ["Home Bullpen"])
+    pick_wrc = _mldq_side_value(row, side, ["Away Team wRC+", "Away wRC+"], ["Home Team wRC+", "Home wRC+"])
+    opp_wrc = _mldq_side_value(row, opp, ["Away Team wRC+", "Away wRC+"], ["Home Team wRC+", "Home wRC+"])
+    pick_lineup = _mldq_side_value(row, side, ["Away Lineup Strength"], ["Home Lineup Strength"])
+    opp_lineup = _mldq_side_value(row, opp, ["Away Lineup Strength"], ["Home Lineup Strength"])
+    pick_rest = _mldq_side_value(row, side, ["Away Rest"], ["Home Rest"], 0.0)
+    opp_rest = _mldq_side_value(row, opp, ["Away Rest"], ["Home Rest"], 0.0)
+    park = _mldq_num(row.get("Park Factor"), np.nan)
+
+    if side == "":
+        missing.append("pick_side")
+    if not np.isfinite(score_edge):
+        missing.append("score_edge")
+    if not np.isfinite(true_conf):
+        missing.append("true_win_confidence")
+    if not np.isfinite(pick_sp) or not np.isfinite(opp_sp):
+        missing.append("starting_pitcher_strength")
+    if not np.isfinite(pick_bp) or not np.isfinite(opp_bp):
+        missing.append("bullpen_strength")
+    if not np.isfinite(pick_wrc) or not np.isfinite(opp_wrc):
+        missing.append("team_wrc_split")
+    if not np.isfinite(pick_lineup) or not np.isfinite(opp_lineup):
+        missing.append("confirmed_lineup_strength")
+    if not np.isfinite(park):
+        missing.append("park_factor")
+    if not np.isfinite(value_edge):
+        missing.append("market_value_edge")
+
+    sp_gap = pick_sp - opp_sp if np.isfinite(pick_sp) and np.isfinite(opp_sp) else np.nan
+    bp_gap = pick_bp - opp_bp if np.isfinite(pick_bp) and np.isfinite(opp_bp) else np.nan
+    wrc_gap = pick_wrc - opp_wrc if np.isfinite(pick_wrc) and np.isfinite(opp_wrc) else np.nan
+    lineup_gap = pick_lineup - opp_lineup if np.isfinite(pick_lineup) and np.isfinite(opp_lineup) else np.nan
+    rest_gap = pick_rest - opp_rest if np.isfinite(pick_rest) and np.isfinite(opp_rest) else 0.0
+
+    if np.isfinite(score_edge) and score_edge >= 0.65:
+        supports.append("score edge")
+    elif np.isfinite(score_edge) and score_edge < 0.45:
+        reasons.append("thin score edge")
+    if np.isfinite(value_edge) and value_edge >= 5.0:
+        supports.append("market value")
+    elif np.isfinite(value_edge) and value_edge < 3.0:
+        reasons.append("weak market value")
+    if np.isfinite(sp_gap):
+        if sp_gap >= 4.0:
+            supports.append("SP edge")
+        elif sp_gap <= -4.0:
+            reasons.append("SP disadvantage")
+    if np.isfinite(bp_gap):
+        if bp_gap >= 4.0:
+            supports.append("bullpen edge")
+        elif bp_gap <= -4.0:
+            reasons.append("bullpen disadvantage")
+    if np.isfinite(wrc_gap):
+        if wrc_gap >= 5.0:
+            supports.append("offense split edge")
+        elif wrc_gap <= -5.0:
+            reasons.append("offense split disadvantage")
+    if np.isfinite(lineup_gap):
+        if lineup_gap >= 4.0:
+            supports.append("lineup edge")
+        elif lineup_gap <= -4.0:
+            reasons.append("lineup disadvantage")
+    if rest_gap <= -1.0:
+        reasons.append("rest/travel disadvantage")
+    elif rest_gap >= 1.0:
+        supports.append("rest edge")
+    if volatility == "HIGH" or (np.isfinite(vol_score) and vol_score >= 63):
+        reasons.append("high volatility")
+    if sim_pick and pick and sim_pick != pick:
+        reasons.append("simulation disagrees")
+    if score_pick and pick and score_pick != pick:
+        reasons.append("score pick disagrees")
+
+    data_items = ["score_edge", "true_win_confidence", "starting_pitcher_strength", "bullpen_strength", "team_wrc_split", "confirmed_lineup_strength", "park_factor"]
+    completeness = int(round((len(data_items) - len([x for x in missing if x in data_items])) / len(data_items) * 100))
+    risk_penalty = min(22, len(reasons) * 4)
+    support_bonus = min(18, len(supports) * 3)
+    base = true_conf if np.isfinite(true_conf) else 55.0
+    quality_score = int(round(clamp(base + support_bonus - risk_penalty + (completeness - 70) * 0.12, 35, 92)))
+
+    if quality_score >= 78 and len(reasons) <= 1 and completeness >= 75:
+        tier = "OFFICIAL ML"
+    elif quality_score >= 68 and len(reasons) <= 3:
+        tier = "PLAYABLE ML"
+    elif quality_score >= 58:
+        tier = "LEAN / TRACK ML"
+    else:
+        tier = "PASS ML"
+
+    return {
+        "ML Official Tier": tier,
+        "ML Quality Score": quality_score,
+        "ML Data Completeness %": completeness,
+        "ML Missing Data": "; ".join(dict.fromkeys(missing)),
+        "ML Risk Reasons": "; ".join(dict.fromkeys(reasons)) or "signals aligned",
+        "ML Support Signals": "; ".join(dict.fromkeys(supports)),
+        "ML SP Gap": "" if not np.isfinite(sp_gap) else round(float(sp_gap), 1),
+        "ML Bullpen Gap": "" if not np.isfinite(bp_gap) else round(float(bp_gap), 1),
+        "ML Offense Split Gap": "" if not np.isfinite(wrc_gap) else round(float(wrc_gap), 1),
+        "ML Lineup Gap": "" if not np.isfinite(lineup_gap) else round(float(lineup_gap), 1),
+        "ML Rest Gap": "" if not np.isfinite(rest_gap) else round(float(rest_gap), 1),
+        "Moneyline Data Quality Version": MONEYLINE_DATA_QUALITY_VERSION,
+    }
+
+
+def _mldq_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_mldq_moneyline_profile(row))
+        except Exception as e:
+            row["ML Official Tier"] = "ML AUDIT ERROR"
+            row["ML Risk Reasons"] = str(e)[:120]
+            row["Moneyline Data Quality Version"] = MONEYLINE_DATA_QUALITY_VERSION
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    try:
+        order = {"OFFICIAL ML": 0, "PLAYABLE ML": 1, "LEAN / TRACK ML": 2, "PASS ML": 3, "ML AUDIT ERROR": 4}
+        out["_mldq_sort"] = out["ML Official Tier"].astype(str).map(lambda x: order.get(x, 9))
+        out["_mldq_score_sort"] = pd.to_numeric(out.get("ML Quality Score"), errors="coerce").fillna(-999)
+        out = out.sort_values(["_mldq_sort", "_mldq_score_sort"], ascending=[True, False]).drop(columns=["_mldq_sort", "_mldq_score_sort"])
+    except Exception:
+        pass
+    return out
+
+
+def ml_build_board(board):
+    if _MLDQ_PREV_BUILD_BOARD is None:
+        return pd.DataFrame()
+    return _mldq_apply(_MLDQ_PREV_BUILD_BOARD(board))
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    if _MLDQ_PREV_RENDER is not None:
+        _MLDQ_PREV_RENDER(board, dates)
+    else:
+        st.markdown("### 💰 Moneyline Edge")
+    try:
+        df = ml_build_board(board)
+        if df is None or df.empty:
+            return
+        st.markdown('<div class="section-title-pro">Moneyline Official Selector / Missing Data</div>', unsafe_allow_html=True)
+        cols = [c for c in [
+            "Matchup", "Pick", "ML Official Tier", "ML Quality Score", "ML Data Completeness %",
+            "Status", "ML Grade", "ML True Win Confidence %", "ML Value Edge %",
+            "ML SP Gap", "ML Bullpen Gap", "ML Offense Split Gap", "ML Lineup Gap", "ML Rest Gap",
+            "ML Support Signals", "ML Risk Reasons", "ML Missing Data",
+            "Projected Score", "Score Pick", "Away SP", "Home SP", "Moneyline Data Quality Version"
+        ] if c in df.columns]
+        if cols:
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Moneyline official selector unavailable: {e}")
+
+
+# =============================================================================
+# MONEYLINE SAVE / AFTER-GRADE RELIABILITY FIX
+# Handles newer ML Official Tier fields plus older ML Final Status rows.
+# =============================================================================
+MONEYLINE_AFTER_GRADE_FIX_VERSION = "MONEYLINE_AFTER_GRADE_FIX_2026_07_22"
+
+
+def _mlag_norm_team(x):
+    s = str(x or "").upper().strip().replace(".", "")
+    aliases = {
+        "WSN": "WSH", "WAS": "WSH",
+        "CHW": "CWS", "CHISOX": "CWS",
+        "KCR": "KC",
+        "OAK": "ATH", "ATHLETICS": "ATH",
+        "ARZ": "AZ",
+        "SFG": "SF",
+        "SDP": "SD",
+        "TBR": "TB",
+        "LAA": "LAA", "ANA": "LAA",
+        "LAD": "LAD",
+        "NYM": "NYM", "NYMETS": "NYM",
+        "NYY": "NYY",
+    }
+    return aliases.get(s, s)
+
+
+def _mlag_matchup_keys(matchup):
+    keys = set()
+    s = str(matchup or "").upper().strip()
+    if not s:
+        return keys
+    for sep in [" @ ", "@", " VS ", "VS"]:
+        if sep in s:
+            try:
+                a, h = [x.strip() for x in s.split(sep, 1)]
+                a, h = _mlag_norm_team(a), _mlag_norm_team(h)
+                if a and h:
+                    keys.add(f"{a} @ {h}")
+                    keys.add(f"{a}@{h}")
+                break
+            except Exception:
+                pass
+    keys.add(s)
+    return keys
+
+
+def _mlag_pick_from_row(row):
+    pick = _tpl_first(row, ["ML Official Pick", "ML Final Pick", "ML Sim Pick", "Pick", "Score Pick"], "")
+    return _mlag_norm_team(pick)
+
+
+def _mlag_should_save(row):
+    tier = str(row.get("ML Official Tier") or "").upper()
+    status = str(row.get("ML Final Status") or row.get("Status") or "").upper()
+    grade = str(row.get("ML Grade") or "").upper()
+    if any(x in tier for x in ["OFFICIAL ML", "PLAYABLE ML"]):
+        return True
+    if any(x in status for x in ["STRONG", "LEAN", "MODEL LEAN", "PLAYABLE"]):
+        return True
+    if any(x in grade for x in ["ML EDGE", "ML LEAN", "MODEL ML LEAN"]):
+        return True
+    return False
+
+
+def _ow_save_moneyline_board(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return {"saved": 0, "reason": "empty_board", "version": MONEYLINE_AFTER_GRADE_FIX_VERSION}
+    existing = load_json(ML_PICK_LOG, [])
+    if not isinstance(existing, list):
+        existing = []
+    today = _ow_line_source_date() if "_ow_line_source_date" in globals() else datetime.now().strftime("%Y-%m-%d")
+    added = 0
+    skipped = 0
+    for _, rr in df.iterrows():
+        r = rr.to_dict()
+        if not _mlag_should_save(r):
+            skipped += 1
+            continue
+        matchup = str(r.get("Matchup") or "").upper().strip()
+        pick = _mlag_pick_from_row(r)
+        if not matchup or not pick:
+            skipped += 1
+            continue
+        key = f"{today}|{matchup}|{pick}|{r.get('ML Official Tier') or r.get('ML Final Status') or r.get('Status')}"
+        if any(str(x.get("ml_key")) == key for x in existing if isinstance(x, dict)):
+            skipped += 1
+            continue
+        r.update({
+            "date": today,
+            "ml_key": key,
+            "graded_result": "PENDING",
+            "saved_at": datetime.now().isoformat(),
+            "Saved ML Pick": pick,
+            "Saved ML Matchup": matchup,
+            "ML Save Version": MONEYLINE_AFTER_GRADE_FIX_VERSION,
+        })
+        existing.append(r)
+        added += 1
+    save_json(ML_PICK_LOG, existing)
+    return {"saved": added, "skipped": skipped, "total_saved_rows": len(existing), "path": ML_PICK_LOG, "version": MONEYLINE_AFTER_GRADE_FIX_VERSION}
+
+
+def _ow_fetch_final_scores_for_dates(date_list):
+    scores = {}
+    for d in date_list or []:
+        if not d:
+            continue
+        try:
+            url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={d}"
+            data = requests.get(url, timeout=12).json()
+            for day in data.get("dates", []):
+                for g in day.get("games", []):
+                    status = str((g.get("status") or {}).get("detailedState", ""))
+                    if "Final" not in status and status not in ["Game Over", "Completed Early"]:
+                        continue
+                    teams = g.get("teams") or {}
+                    away_team = (((teams.get("away") or {}).get("team") or {}).get("abbreviation"))
+                    home_team = (((teams.get("home") or {}).get("team") or {}).get("abbreviation"))
+                    away_score = (teams.get("away") or {}).get("score")
+                    home_score = (teams.get("home") or {}).get("score")
+                    if away_team and home_team and away_score is not None and home_score is not None:
+                        away_team = _mlag_norm_team(away_team)
+                        home_team = _mlag_norm_team(home_team)
+                        winner = away_team if int(away_score) > int(home_score) else home_team
+                        rec = {
+                            "away": away_team,
+                            "home": home_team,
+                            "away_score": int(away_score),
+                            "home_score": int(home_score),
+                            "winner": winner,
+                            "game_pk": g.get("gamePk"),
+                            "status": status,
+                        }
+                        for key in _mlag_matchup_keys(f"{away_team} @ {home_team}"):
+                            scores[key] = rec
+        except Exception as e:
+            scores[f"ERROR_{d}"] = {"error": str(e)[:160]}
+            continue
+    return scores
+
+
+def _ow_grade_moneyline_saved():
+    picks = load_json(ML_PICK_LOG, [])
+    if not isinstance(picks, list) or not picks:
+        return {"graded": 0, "saved": 0, "reason": "no_saved_moneyline_picks", "version": MONEYLINE_AFTER_GRADE_FIX_VERSION}
+    dates_to_check = sorted({str(p.get("date") or "") for p in picks if isinstance(p, dict) and str(p.get("graded_result") or "PENDING").upper() == "PENDING"})
+    scores = _ow_fetch_final_scores_for_dates(dates_to_check)
+    score_keys = sorted([k for k in scores.keys() if not str(k).startswith("ERROR_")])
+    results = load_json(ML_RESULT_LOG, [])
+    if not isinstance(results, list):
+        results = []
+    graded = 0
+    unmatched = []
+    pending = 0
+    for p in picks:
+        if not isinstance(p, dict) or str(p.get("graded_result") or "PENDING").upper() != "PENDING":
+            continue
+        pending += 1
+        matchup = str(p.get("Saved ML Matchup") or p.get("Matchup") or "").upper().strip()
+        sc = None
+        for key in _mlag_matchup_keys(matchup):
+            sc = scores.get(key)
+            if sc:
+                break
+        if not sc:
+            unmatched.append(matchup)
+            continue
+        pick = _mlag_pick_from_row(p)
+        result = "WIN" if pick and pick == sc.get("winner") else "LOSS"
+        p["graded_result"] = result
+        p["actual_winner"] = sc.get("winner")
+        p["final_score"] = f"{sc.get('away')} {sc.get('away_score')} - {sc.get('home')} {sc.get('home_score')}"
+        p["graded_at"] = datetime.now().isoformat()
+        p["ML Grade Version"] = MONEYLINE_AFTER_GRADE_FIX_VERSION
+        results.append(dict(p))
+        graded += 1
+    save_json(ML_PICK_LOG, picks)
+    save_json(ML_RESULT_LOG, results)
+    return {
+        "graded": graded,
+        "pending_before": pending,
+        "unmatched": len(unmatched),
+        "unmatched_matchups": unmatched[:20],
+        "pending_checked_dates": dates_to_check,
+        "final_scores_found": len(score_keys),
+        "score_keys_sample": score_keys[:20],
+        "pick_log": ML_PICK_LOG,
+        "result_log": ML_RESULT_LOG,
+        "version": MONEYLINE_AFTER_GRADE_FIX_VERSION,
+    }
+
+
+# =============================================================================
+# MONEYLINE REAL DATA OVERRIDES / SOURCE GUIDE
+# Lets daily bullpen, lineup, weather, odds, injury, and starter-confirmation data
+# feed the Moneyline board when the user pastes or uploads it.
+# =============================================================================
+MONEYLINE_REAL_DATA_VERSION = "MONEYLINE_REAL_DATA_OVERRIDES_2026_07_22"
+ML_REAL_DATA_FILE = os.path.join(STORAGE_DIR, "moneyline_real_data_overrides.csv")
+_ML_REAL_DATA_PREV_BUILD_BOARD = ml_build_board if "ml_build_board" in globals() else None
+_ML_REAL_DATA_PREV_RENDER = render_moneyline_edge_tab if "render_moneyline_edge_tab" in globals() else None
+
+
+ML_REAL_DATA_TEMPLATE_COLUMNS = [
+    "Matchup", "Away Lineup Confirmed", "Home Lineup Confirmed",
+    "Away Bullpen Available", "Home Bullpen Available",
+    "Away Closer Available", "Home Closer Available",
+    "Away High Leverage Available", "Home High Leverage Available",
+    "Away Bullpen Pitches 1D", "Home Bullpen Pitches 1D",
+    "Away Bullpen Pitches 3D", "Home Bullpen Pitches 3D",
+    "Away Starter Confirmed", "Home Starter Confirmed",
+    "Away SP Role Flag", "Home SP Role Flag",
+    "Away wRC+ vs Hand", "Home wRC+ vs Hand",
+    "Away OPS vs Hand", "Home OPS vs Hand",
+    "Away ISO vs Hand", "Home ISO vs Hand",
+    "Away HardHit% vs Hand", "Home HardHit% vs Hand",
+    "Away Defense Rating", "Home Defense Rating",
+    "Away Baserunning Rating", "Home Baserunning Rating",
+    "Park Weather Factor", "Temperature", "Wind MPH", "Wind Direction", "Roof",
+    "Away Open ML", "Home Open ML", "Away Current ML", "Home Current ML",
+    "Away Injury Flag", "Home Injury Flag", "Notes"
+]
+
+
+def _mlrd_bool(value):
+    s = str(value or "").strip().upper()
+    if s in ["Y", "YES", "TRUE", "1", "AVAILABLE", "CONFIRMED", "OPEN"]:
+        return True
+    if s in ["N", "NO", "FALSE", "0", "UNAVAILABLE", "OUT", "LIMITED", "CLOSED"]:
+        return False
+    return None
+
+
+def _mlrd_load_overrides():
+    try:
+        if os.path.exists(ML_REAL_DATA_FILE):
+            return pd.read_csv(ML_REAL_DATA_FILE)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _mlrd_save_overrides(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return {"saved": 0, "path": ML_REAL_DATA_FILE}
+        out = df.copy()
+        if "Matchup" not in out.columns:
+            return {"saved": 0, "error": "Missing Matchup column", "path": ML_REAL_DATA_FILE}
+        out["_mlrd_key"] = out["Matchup"].astype(str).map(lambda x: sorted(_mlag_matchup_keys(x))[0] if _mlag_matchup_keys(x) else str(x).upper())
+        old = _mlrd_load_overrides()
+        if isinstance(old, pd.DataFrame) and not old.empty:
+            old["_mlrd_key"] = old["Matchup"].astype(str).map(lambda x: sorted(_mlag_matchup_keys(x))[0] if _mlag_matchup_keys(x) else str(x).upper())
+            out = pd.concat([old, out], ignore_index=True, sort=False)
+            out = out.drop_duplicates("_mlrd_key", keep="last")
+        out = out.drop(columns=["_mlrd_key"], errors="ignore")
+        out.to_csv(ML_REAL_DATA_FILE, index=False)
+        return {"saved": len(out), "path": ML_REAL_DATA_FILE, "version": MONEYLINE_REAL_DATA_VERSION}
+    except Exception as e:
+        return {"saved": 0, "error": str(e)[:160], "path": ML_REAL_DATA_FILE}
+
+
+def _mlrd_parse_uploaded(uploaded_file=None, text=""):
+    frames = []
+    try:
+        if uploaded_file is not None:
+            frames.append(pd.read_csv(uploaded_file))
+    except Exception:
+        pass
+    try:
+        if text and str(text).strip():
+            from io import StringIO
+            frames.append(pd.read_csv(StringIO(str(text).strip())))
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def _mlrd_get_override(row, overrides):
+    if overrides is None or not isinstance(overrides, pd.DataFrame) or overrides.empty:
+        return {}
+    matchup = str(row.get("Matchup") or "")
+    keys = _mlag_matchup_keys(matchup)
+    if not keys:
+        return {}
+    try:
+        d = overrides.copy()
+        d["_keyset"] = d["Matchup"].astype(str).map(lambda x: _mlag_matchup_keys(x))
+        for _, rr in d.iterrows():
+            if keys.intersection(rr.get("_keyset") or set()):
+                return rr.drop(labels=["_keyset"], errors="ignore").to_dict()
+    except Exception:
+        return {}
+    return {}
+
+
+def _mlrd_side_prefix(row, side):
+    return "Away" if side == "AWAY" else "Home" if side == "HOME" else ""
+
+
+def _mlrd_apply_row(row, override):
+    if not override:
+        row["ML Real Data Override"] = "NO"
+        row["ML Real Data Version"] = MONEYLINE_REAL_DATA_VERSION
+        return row
+    out = dict(row)
+    pick, side, away, home = _mldq_pick_side(out) if "_mldq_pick_side" in globals() else ("", "", "", "")
+    opp = _mldq_opp_side(side) if "_mldq_opp_side" in globals() else ""
+    pfx = _mlrd_side_prefix(out, side)
+    opfx = _mlrd_side_prefix(out, opp)
+    used = []
+    reasons = []
+    supports = []
+
+    for col in ML_REAL_DATA_TEMPLATE_COLUMNS:
+        if col in override and override.get(col) not in (None, "", "—"):
+            out[f"ML Real {col}"] = override.get(col)
+
+    for p in ["Away", "Home"]:
+        lineup = _mlrd_bool(override.get(f"{p} Lineup Confirmed"))
+        bp = _mlrd_bool(override.get(f"{p} Bullpen Available"))
+        closer = _mlrd_bool(override.get(f"{p} Closer Available"))
+        lev = _mlrd_bool(override.get(f"{p} High Leverage Available"))
+        starter = _mlrd_bool(override.get(f"{p} Starter Confirmed"))
+        if lineup is not None:
+            used.append(f"{p} lineup")
+            out[f"{p} Lineup Confirmed Override"] = "YES" if lineup else "NO"
+        if bp is not None:
+            used.append(f"{p} bullpen")
+            out[f"{p} Bullpen Available Override"] = "YES" if bp else "NO"
+        if closer is not None:
+            used.append(f"{p} closer")
+            out[f"{p} Closer Available Override"] = "YES" if closer else "NO"
+        if lev is not None:
+            used.append(f"{p} high leverage")
+            out[f"{p} High Leverage Available Override"] = "YES" if lev else "NO"
+        if starter is not None:
+            used.append(f"{p} starter")
+            out[f"{p} Starter Confirmed Override"] = "YES" if starter else "NO"
+
+    if pfx:
+        if _mlrd_bool(override.get(f"{pfx} Lineup Confirmed")) is False:
+            reasons.append("pick lineup not confirmed")
+        elif _mlrd_bool(override.get(f"{pfx} Lineup Confirmed")) is True:
+            supports.append("pick lineup confirmed")
+        if _mlrd_bool(override.get(f"{pfx} Bullpen Available")) is False:
+            reasons.append("pick bullpen not available")
+        elif _mlrd_bool(override.get(f"{pfx} Bullpen Available")) is True:
+            supports.append("pick bullpen available")
+        if _mlrd_bool(override.get(f"{pfx} Closer Available")) is False:
+            reasons.append("pick closer unavailable")
+        if _mlrd_bool(override.get(f"{pfx} High Leverage Available")) is False:
+            reasons.append("pick high leverage arms unavailable")
+        if _mlrd_bool(override.get(f"{pfx} Starter Confirmed")) is False:
+            reasons.append("pick starter not confirmed")
+        elif _mlrd_bool(override.get(f"{pfx} Starter Confirmed")) is True:
+            supports.append("pick starter confirmed")
+        role_flag = str(override.get(f"{pfx} SP Role Flag") or "").strip()
+        if role_flag:
+            reasons.append(f"pick SP role flag: {role_flag}")
+
+    if opfx:
+        if _mlrd_bool(override.get(f"{opfx} Bullpen Available")) is False:
+            supports.append("opponent bullpen short")
+        if _mlrd_bool(override.get(f"{opfx} Starter Confirmed")) is False:
+            supports.append("opponent starter uncertainty")
+
+    weather_factor = _mldq_num(override.get("Park Weather Factor"), np.nan) if "_mldq_num" in globals() else np.nan
+    wind_mph = _mldq_num(override.get("Wind MPH"), np.nan) if "_mldq_num" in globals() else np.nan
+    roof = str(override.get("Roof") or "").strip()
+    if np.isfinite(weather_factor):
+        used.append("park/weather factor")
+        out["Park Factor"] = weather_factor
+        if weather_factor >= 1.08:
+            reasons.append("hitter weather/park volatility")
+        elif weather_factor <= 0.94:
+            supports.append("pitcher-friendly run environment")
+    if np.isfinite(wind_mph):
+        used.append("wind")
+    if roof:
+        used.append("roof")
+
+    for p in ["Away", "Home"]:
+        current = _mldq_num(override.get(f"{p} Current ML"), np.nan) if "_mldq_num" in globals() else np.nan
+        opened = _mldq_num(override.get(f"{p} Open ML"), np.nan) if "_mldq_num" in globals() else np.nan
+        if np.isfinite(current):
+            used.append(f"{p} current ML")
+            out[f"{p} Current ML Override"] = current
+        if np.isfinite(opened):
+            used.append(f"{p} open ML")
+            out[f"{p} Open ML Override"] = opened
+
+    old_risk = str(out.get("ML Risk Reasons") or "")
+    old_support = str(out.get("ML Support Signals") or "")
+    out["ML Risk Reasons"] = "; ".join([x for x in [old_risk] + reasons if x])
+    out["ML Support Signals"] = "; ".join([x for x in [old_support] + supports if x])
+    out["ML Real Data Override"] = "YES"
+    out["ML Real Data Used"] = "; ".join(dict.fromkeys(used))
+    out["ML Real Data Version"] = MONEYLINE_REAL_DATA_VERSION
+    return out
+
+
+def _mlrd_apply_overrides(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    overrides = _mlrd_load_overrides()
+    if overrides is None or overrides.empty:
+        out = df.copy()
+        out["ML Real Data Override"] = "NO"
+        out["ML Real Data Version"] = MONEYLINE_REAL_DATA_VERSION
+        return out
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        row = _mlrd_apply_row(row, _mlrd_get_override(row, overrides))
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    try:
+        if "_mldq_apply" in globals():
+            out = _mldq_apply(out)
+    except Exception:
+        pass
+    return out
+
+
+def ml_build_board(board):
+    if _ML_REAL_DATA_PREV_BUILD_BOARD is None:
+        return pd.DataFrame()
+    return _mlrd_apply_overrides(_ML_REAL_DATA_PREV_BUILD_BOARD(board))
+
+
+def _mlrd_source_guide_table():
+    return pd.DataFrame([
+        {"Data Need": "Probable/confirmed starters + final scores", "Good Source": "MLB Stats API schedule/game feed", "Why It Helps": "SP confirmation, grading, postponed/final game state"},
+        {"Data Need": "Team expected stats, xwOBA, hard hit", "Good Source": "Baseball Savant Statcast leaderboards/search", "Why It Helps": "Offense quality and pitcher contact quality"},
+        {"Data Need": "Bullpen ERA/FIP/xFIP/rest", "Good Source": "FanGraphs/team bullpen tables or MLB game logs", "Why It Helps": "Late-game win probability and blown lead risk"},
+        {"Data Need": "Daily park/weather/roof/wind", "Good Source": "BallparkPal or trusted park/weather board", "Why It Helps": "Run environment and volatility"},
+        {"Data Need": "Current/opening moneylines", "Good Source": "Odds API / sportsbook consensus", "Why It Helps": "No-vig value and market disagreement"},
+        {"Data Need": "Confirmed starting lineups/injuries", "Good Source": "MLB lineups feed / RotoWire-style lineup page", "Why It Helps": "Real offense strength instead of projected lineup"},
+    ])
+
+
+def _mlrd_json(url, params=None, timeout=14):
+    try:
+        if "safe_get_json" in globals():
+            return safe_get_json(url, params=params, timeout=timeout)
+    except Exception:
+        pass
+    try:
+        return requests.get(url, params=params, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}).json()
+    except Exception:
+        return {}
+
+
+def _mlrd_dates(dates=None):
+    try:
+        vals = [str(x) for x in (dates or []) if str(x).strip()]
+        if vals:
+            return vals
+    except Exception:
+        pass
+    try:
+        return [datetime.now().strftime("%Y-%m-%d")]
+    except Exception:
+        return []
+
+
+def _mlrd_boxscore(game_pk):
+    if not game_pk:
+        return {}
+    return _mlrd_json(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore", timeout=14)
+
+
+def _mlrd_team_batting_order_count(box, side):
+    try:
+        team_box = (((box.get("teams") or {}).get(side) or {}))
+        order = team_box.get("battingOrder") or []
+        return len(order)
+    except Exception:
+        return 0
+
+
+def _mlrd_pitcher_pitches_from_box(box, side):
+    try:
+        team_box = ((box.get("teams") or {}).get(side) or {})
+        players = team_box.get("players") or {}
+        rows = []
+        for _, pdata in players.items():
+            pitching = ((pdata.get("stats") or {}).get("pitching") or {})
+            if not pitching:
+                continue
+            pc = _mldq_num(pitching.get("numberOfPitches") or pitching.get("pitchesThrown") or pitching.get("pitchCount"), np.nan)
+            ip_raw = pitching.get("inningsPitched")
+            ip = _tpl_num(ip_raw, np.nan) if "_tpl_num" in globals() else np.nan
+            gs = _mldq_num(pitching.get("gamesStarted"), 0)
+            rows.append({"pitches": pc, "ip": ip, "gs": gs})
+        if not rows:
+            return 0
+        relievers = [r for r in rows if np.isfinite(r.get("pitches", np.nan)) and not (_mldq_num(r.get("gs"), 0) >= 1)]
+        if not relievers:
+            # Fallback for boxscores that do not expose gamesStarted: skip the longest IP row.
+            sorted_rows = sorted([r for r in rows if np.isfinite(r.get("pitches", np.nan))], key=lambda x: _mldq_num(x.get("ip"), 0), reverse=True)
+            relievers = sorted_rows[1:] if len(sorted_rows) > 1 else []
+        return int(sum(_mldq_num(r.get("pitches"), 0) for r in relievers))
+    except Exception:
+        return 0
+
+
+def _mlrd_recent_bullpen_usage(team_abbr, as_of_date, days=3):
+    team_abbr = _mlag_norm_team(team_abbr)
+    try:
+        dt = datetime.strptime(str(as_of_date), "%Y-%m-%d")
+    except Exception:
+        dt = datetime.now()
+    start = (dt - timedelta(days=int(days))).strftime("%Y-%m-%d")
+    end = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    data = _mlrd_json(
+        "https://statsapi.mlb.com/api/v1/schedule",
+        params={"sportId": 1, "startDate": start, "endDate": end, "hydrate": "team"},
+        timeout=14,
+    )
+    pitches_by_day = {}
+    games_checked = 0
+    try:
+        for day in data.get("dates", []) or []:
+            dstr = day.get("date") or ""
+            for g in day.get("games", []) or []:
+                teams = g.get("teams") or {}
+                away = _mlag_norm_team((((teams.get("away") or {}).get("team") or {}).get("abbreviation")))
+                home = _mlag_norm_team((((teams.get("home") or {}).get("team") or {}).get("abbreviation")))
+                if team_abbr not in [away, home]:
+                    continue
+                state = str(((g.get("status") or {}).get("detailedState") or ""))
+                if "Final" not in state and state not in ["Game Over", "Completed Early"]:
+                    continue
+                side = "away" if team_abbr == away else "home"
+                box = _mlrd_boxscore(g.get("gamePk"))
+                pitches = _mlrd_pitcher_pitches_from_box(box, side)
+                pitches_by_day[dstr] = pitches_by_day.get(dstr, 0) + pitches
+                games_checked += 1
+    except Exception:
+        pass
+    one_day = pitches_by_day.get(end, 0)
+    three_day = sum(pitches_by_day.values())
+    return {
+        "pitches_1d": int(one_day),
+        "pitches_3d": int(three_day),
+        "games_checked": int(games_checked),
+        "bullpen_available": "YES" if one_day <= 65 and three_day <= 150 else "NO",
+        "closer_available": "YES" if one_day <= 42 else "NO",
+        "high_leverage_available": "YES" if one_day <= 55 and three_day <= 130 else "NO",
+    }
+
+
+def _mlrd_auto_pull_mlb_data(dates=None):
+    rows = []
+    diagnostics = []
+    for d in _mlrd_dates(dates):
+        data = _mlrd_json(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId": 1, "date": d, "hydrate": "probablePitcher,venue"},
+            timeout=16,
+        )
+        try:
+            games = []
+            for day in data.get("dates", []) or []:
+                games.extend(day.get("games", []) or [])
+            diagnostics.append({"date": d, "games": len(games)})
+            for g in games:
+                teams = g.get("teams") or {}
+                away = _mlag_norm_team((((teams.get("away") or {}).get("team") or {}).get("abbreviation")))
+                home = _mlag_norm_team((((teams.get("home") or {}).get("team") or {}).get("abbreviation")))
+                if not away or not home:
+                    continue
+                matchup = f"{away} @ {home}"
+                game_pk = g.get("gamePk")
+                away_prob = (((teams.get("away") or {}).get("probablePitcher") or {}).get("fullName") or "")
+                home_prob = (((teams.get("home") or {}).get("probablePitcher") or {}).get("fullName") or "")
+                venue = (g.get("venue") or {}).get("name") or ""
+                state = str(((g.get("status") or {}).get("detailedState") or ""))
+                box = _mlrd_boxscore(game_pk)
+                away_order = _mlrd_team_batting_order_count(box, "away")
+                home_order = _mlrd_team_batting_order_count(box, "home")
+                away_bp = _mlrd_recent_bullpen_usage(away, d, days=3)
+                home_bp = _mlrd_recent_bullpen_usage(home, d, days=3)
+                row = {col: "" for col in ML_REAL_DATA_TEMPLATE_COLUMNS}
+                row.update({
+                    "Matchup": matchup,
+                    "Away Lineup Confirmed": "YES" if away_order >= 9 else "NO",
+                    "Home Lineup Confirmed": "YES" if home_order >= 9 else "NO",
+                    "Away Bullpen Available": away_bp.get("bullpen_available"),
+                    "Home Bullpen Available": home_bp.get("bullpen_available"),
+                    "Away Closer Available": away_bp.get("closer_available"),
+                    "Home Closer Available": home_bp.get("closer_available"),
+                    "Away High Leverage Available": away_bp.get("high_leverage_available"),
+                    "Home High Leverage Available": home_bp.get("high_leverage_available"),
+                    "Away Bullpen Pitches 1D": away_bp.get("pitches_1d"),
+                    "Home Bullpen Pitches 1D": home_bp.get("pitches_1d"),
+                    "Away Bullpen Pitches 3D": away_bp.get("pitches_3d"),
+                    "Home Bullpen Pitches 3D": home_bp.get("pitches_3d"),
+                    "Away Starter Confirmed": "YES" if away_prob else "NO",
+                    "Home Starter Confirmed": "YES" if home_prob else "NO",
+                    "Away SP Role Flag": "" if away_prob else "PROBABLE_MISSING",
+                    "Home SP Role Flag": "" if home_prob else "PROBABLE_MISSING",
+                    "Roof": "UNKNOWN",
+                    "Notes": f"Auto MLB pull {d}; gamePk {game_pk}; venue {venue}; status {state}; away SP {away_prob or 'missing'}; home SP {home_prob or 'missing'}; lineup counts {away_order}/{home_order}; bullpen games checked {away_bp.get('games_checked')}/{home_bp.get('games_checked')}",
+                    "Auto Pull Date": d,
+                    "Auto Pull Source": "MLB Stats API schedule + boxscore",
+                    "Auto Pull Version": MONEYLINE_REAL_DATA_VERSION,
+                })
+                rows.append(row)
+        except Exception as e:
+            diagnostics.append({"date": d, "error": str(e)[:160]})
+    df = pd.DataFrame(rows)
+    save_status = _mlrd_save_overrides(df) if not df.empty else {"saved": 0, "path": ML_REAL_DATA_FILE}
+    return {"rows": len(df), "save_status": save_status, "diagnostics": diagnostics, "version": MONEYLINE_REAL_DATA_VERSION}, df
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### Moneyline Real Data Inputs")
+    st.caption("Paste daily real data here when you have it. These fields improve the ML selector/audit only; K and PO stay untouched.")
+    st.dataframe(_mlrd_source_guide_table(), use_container_width=True, hide_index=True)
+    template = pd.DataFrame([{col: "" for col in ML_REAL_DATA_TEMPLATE_COLUMNS}])
+    st.download_button("Download ML real-data template CSV", template.to_csv(index=False), file_name="moneyline_real_data_template.csv", mime="text/csv")
+    if st.button("Auto Pull MLB Moneyline Data", use_container_width=True, key="auto_pull_mlb_ml_real_data"):
+        status, pulled = _mlrd_auto_pull_mlb_data(dates)
+        st.write(status)
+        if isinstance(pulled, pd.DataFrame) and not pulled.empty:
+            st.dataframe(pulled, use_container_width=True, hide_index=True)
+    upload = st.file_uploader("Upload Moneyline real-data CSV", type=["csv"], key="ml_real_data_upload")
+    text = st.text_area("Or paste Moneyline real-data CSV", height=100, key="ml_real_data_text")
+    parsed = _mlrd_parse_uploaded(upload, text)
+    if not parsed.empty:
+        st.dataframe(parsed.head(25), use_container_width=True, hide_index=True)
+    if st.button("Save Moneyline Real Data Overrides", use_container_width=True, key="save_ml_real_data_overrides"):
+        st.write(_mlrd_save_overrides(parsed))
+    current_overrides = _mlrd_load_overrides()
+    if isinstance(current_overrides, pd.DataFrame) and not current_overrides.empty:
+        with st.expander("Current Moneyline Real Data Overrides", expanded=False):
+            st.dataframe(current_overrides.tail(50), use_container_width=True, hide_index=True)
+
+    if _ML_REAL_DATA_PREV_RENDER is not None:
+        _ML_REAL_DATA_PREV_RENDER(board, dates)
+    else:
+        df = ml_build_board(board)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    try:
+        df = ml_build_board(board)
+        if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">Moneyline Real Data Override Audit</div>', unsafe_allow_html=True)
+            cols = [c for c in [
+                "Matchup", "Pick", "ML Official Tier", "ML Quality Score", "ML Data Completeness %",
+                "ML Real Data Override", "ML Real Data Used", "ML Risk Reasons", "ML Support Signals",
+                "Away Lineup Confirmed Override", "Home Lineup Confirmed Override",
+                "Away Bullpen Available Override", "Home Bullpen Available Override",
+                "Away Closer Available Override", "Home Closer Available Override",
+                "Away Starter Confirmed Override", "Home Starter Confirmed Override",
+                "Park Factor", "ML Real Park Weather Factor", "ML Real Wind MPH", "ML Real Roof",
+                "ML Real Data Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Moneyline real-data audit unavailable: {e}")
+
+
+# =============================================================================
 # TRUE PROJECTION / LOSS LAB
 # Diagnostic layer for K Upside, Pitching Outs, and Moneyline.
 # It targets repeat loss types without globally moving projections.
@@ -34814,6 +35716,63 @@ def _tpl_k_line_calibration_profile(row):
     }
 
 
+def _tpl_pct_value(row, keys, default=None):
+    val = _tpl_num(_tpl_first(row, keys, None), None)
+    if val is None:
+        return default
+    if abs(val) <= 1.0:
+        return val * 100.0
+    return val
+
+
+def _tpl_pitcher_stats_audit(row):
+    k_pct = _tpl_pct_value(row, ["Pitcher K%", "K%", "Season K%", "Pitcher K Rate", "K Rate %"], None)
+    k9 = _tpl_num(_tpl_first(row, ["K/9", "K9", "Pitcher K/9", "Season K/9", "K Per 9"], None), None)
+    bb9 = _tpl_num(_tpl_first(row, ["BB/9", "Walks/9", "Walk/9", "Pitcher BB/9", "Season BB/9"], None), None)
+    era = _tpl_num(_tpl_first(row, ["ERA", "Pitcher ERA", "Season ERA"], None), None)
+    fip = _tpl_num(_tpl_first(row, ["FIP", "xFIP", "SIERA", "Pitcher FIP"], None), None)
+    support = 0
+    caution = 0
+    notes = []
+    if k_pct is not None:
+        if k_pct >= 25.0: support += 1
+        elif k_pct <= 19.0: caution += 1
+        notes.append(f"K% {k_pct:.1f}")
+    if k9 is not None:
+        if k9 >= 9.3: support += 1
+        elif k9 <= 7.2: caution += 1
+        notes.append(f"K/9 {k9:.1f}")
+    if bb9 is not None:
+        if bb9 >= 3.7: caution += 1
+        elif bb9 <= 2.4: support += 1
+        notes.append(f"BB/9 {bb9:.1f}")
+    if era is not None:
+        if era >= 4.75: caution += 1
+        elif era <= 3.40: support += 1
+        notes.append(f"ERA {era:.2f}")
+    if fip is not None:
+        if fip >= 4.65: caution += 1
+        elif fip <= 3.55: support += 1
+        notes.append(f"FIP {fip:.2f}")
+    if support >= 2 and caution <= 1:
+        signal = "PITCHER_STATS_SUPPORT"
+    elif caution >= 2:
+        signal = "PITCHER_STATS_CAUTION"
+    elif notes:
+        signal = "PITCHER_STATS_MIXED"
+    else:
+        signal = "PITCHER_STATS_MISSING"
+    return {
+        "Pitcher Stats Signal": signal,
+        "Pitcher Stats Note": "; ".join(notes) or "missing pitcher K%/K9/BB9/ERA/FIP",
+        "Pitcher K% Used": "" if k_pct is None else round(k_pct, 1),
+        "Pitcher K/9 Used": "" if k9 is None else round(k9, 2),
+        "Pitcher BB/9 Used": "" if bb9 is None else round(bb9, 2),
+        "Pitcher ERA Used": "" if era is None else round(era, 2),
+        "Pitcher FIP Used": "" if fip is None else round(fip, 2),
+    }
+
+
 def _tpl_recent_skill_audit(row):
     csw = _tpl_num(_tpl_first(row, ["Recent CSW%", "T12 CSW%", "CSW%", "statcast_csw"], None), None)
     swstr = _tpl_num(_tpl_first(row, ["Recent SwStr%", "T12 SwStr%", "SwStr%", "Whiff%", "statcast_whiff"], None), None)
@@ -34844,7 +35803,14 @@ def _tpl_recent_skill_audit(row):
         notes.append(f"VeloDelta {velo_delta:.1f}")
     if pitch_trend is not None:
         notes.append(f"PitchTrend {pitch_trend:.1f}")
-    signal = "SKILL_SUPPORT" if support >= 2 and caution == 0 else "SKILL_CAUTION" if caution >= 2 else "SKILL_THIN" if not notes else "SKILL_MIXED"
+    pstats = _tpl_pitcher_stats_audit(row)
+    if pstats.get("Pitcher Stats Signal") == "PITCHER_STATS_SUPPORT":
+        support += 1
+    elif pstats.get("Pitcher Stats Signal") == "PITCHER_STATS_CAUTION":
+        caution += 1
+    if pstats.get("Pitcher Stats Note") and pstats.get("Pitcher Stats Signal") != "PITCHER_STATS_MISSING":
+        notes.append(pstats.get("Pitcher Stats Note"))
+    signal = "SKILL_SUPPORT" if support >= 2 and caution <= 1 else "SKILL_CAUTION" if caution >= 2 else "SKILL_THIN" if not notes else "SKILL_MIXED"
     return {"Recent Skill Signal": signal, "Recent Skill Note": "; ".join(notes) or "missing recent CSW/SwStr/chase/velo trend"}
 
 
@@ -34853,30 +35819,84 @@ def _tpl_lineup_quality_audit(row):
         "Opponent K% vs Pitcher Hand", "APP86 Daily Lineup K% vs Pitcher Hand",
         "APP88 Batter Lineup K%", "Team Batter K% Overall Official", "Opp K%"
     ], None), None)
+    bbk = _tpl_num(_tpl_first(row, ["Opponent BB/K vs Pitcher Hand", "Opp BB/K", "BB/K", "Team BB/K", "L30 BB/K"], None), None)
+    avg = _tpl_num(_tpl_first(row, ["Opponent AVG vs Pitcher Hand", "Opp AVG", "AVG", "L30 AVG"], None), None)
+    obp = _tpl_num(_tpl_first(row, ["Opponent OBP vs Pitcher Hand", "Opp OBP", "OBP", "L30 OBP"], None), None)
+    woba = _tpl_num(_tpl_first(row, ["Opponent wOBA vs Pitcher Hand", "Opp wOBA", "wOBA", "L30 wOBA"], None), None)
+    k_rank = _tpl_num(_tpl_first(row, ["Opponent K Rank vs Pitcher Hand", "Opp K Rank", "K% Rank", "L30 K Rank"], None), None)
     batter_count = _tpl_num(_tpl_first(row, ["APP88 Batter Count", "Confirmed Batter Count", "Lineup Batter Count"], None), None)
     lineup_status = str(_tpl_first(row, ["Lineup Status", "lineup_status", "Projection Source"], "")).upper()
+    support = 0
+    caution = 0
     notes = []
     if opp_k is not None:
+        if opp_k >= 24: support += 1
+        elif opp_k <= 20: caution += 1
         notes.append(f"lineup K {opp_k:.1f}")
+    if k_rank is not None:
+        if k_rank <= 8: support += 1
+        elif k_rank >= 24: caution += 1
+        notes.append(f"K rank {int(k_rank)}")
+    if bbk is not None:
+        if bbk <= 0.45: support += 1
+        elif bbk >= 0.70: caution += 1
+        notes.append(f"BB/K {bbk:.2f}")
+    if avg is not None:
+        if avg <= 0.235: support += 1
+        elif avg >= 0.270: caution += 1
+        notes.append(f"AVG {avg:.3f}")
+    if obp is not None:
+        if obp <= 0.305: support += 1
+        elif obp >= 0.340: caution += 1
+        notes.append(f"OBP {obp:.3f}")
+    if woba is not None:
+        if woba <= 0.300: support += 1
+        elif woba >= 0.335: caution += 1
+        notes.append(f"wOBA {woba:.3f}")
     if batter_count is not None:
         notes.append(f"batters {int(batter_count)}")
     if lineup_status:
         notes.append(lineup_status[:32])
     if "CONFIRMED" not in lineup_status and (batter_count is None or batter_count < 9):
         signal = "LINEUP_NOT_CONFIRMED"
-    elif opp_k is not None and opp_k >= 24:
+    elif support >= 2 and caution <= 1:
         signal = "LINEUP_K_SUPPORT"
-    elif opp_k is not None and opp_k <= 20:
+    elif caution >= 2:
         signal = "LINEUP_CONTACT_CAUTION"
     else:
         signal = "LINEUP_NEUTRAL"
-    return {"Lineup Quality Signal": signal, "Lineup Quality Note": "; ".join(notes) or "missing batter-level confirmed lineup split"}
+    return {
+        "Lineup Quality Signal": signal,
+        "Lineup Quality Note": "; ".join(notes) or "missing batter-level confirmed lineup split",
+        "Opponent K% Used": "" if opp_k is None else round(opp_k, 1),
+        "Opponent BB/K Used": "" if bbk is None else round(bbk, 2),
+        "Opponent AVG Used": "" if avg is None else round(avg, 3),
+        "Opponent OBP Used": "" if obp is None else round(obp, 3),
+        "Opponent wOBA Used": "" if woba is None else round(woba, 3),
+        "Opponent K Rank Used": "" if k_rank is None else int(k_rank),
+    }
 
 
 def _tpl_pitch_mix_audit(row):
     factor = _tpl_num(_tpl_first(row, ["Pitch-Type Factor", "pitch_type_factor", "APP88 Arsenal Adjustment", "Arsenal Adjustment"], None), None)
     score = _tpl_num(_tpl_first(row, ["APP88 Arsenal Matchup Score", "Pitch Mix Matchup Score"], None), None)
     note = str(_tpl_first(row, ["Pitch-Type Note", "pitch_type_note", "K Env Details", "Arsenal Matchup Note"], "") or "")
+    arsenal = []
+    for label, keys in [
+        ("FA", ["Fastball %", "FA%", "Four-Seam %", "Pitch Arsenal Fastball %"]),
+        ("SL", ["Slider %", "SL%", "Pitch Arsenal Slider %"]),
+        ("CU", ["Curveball %", "CU%", "CB%", "Pitch Arsenal Curveball %"]),
+        ("CH", ["Changeup %", "CH%", "Pitch Arsenal Changeup %"]),
+        ("SI", ["Sinker %", "SI%", "Pitch Arsenal Sinker %"]),
+    ]:
+        val = _tpl_pct_value(row, keys, None)
+        if val is not None and val > 0:
+            arsenal.append((label, val))
+    top_pitch = ""
+    if arsenal:
+        top_pitch, top_usage = sorted(arsenal, key=lambda x: x[1], reverse=True)[0]
+    else:
+        top_usage = None
     signal = "PITCH_MIX_UNKNOWN"
     if factor is not None:
         if factor >= 1.04:
@@ -34892,9 +35912,17 @@ def _tpl_pitch_mix_audit(row):
         parts.append(f"factor {factor:.3f}")
     if score is not None:
         parts.append(f"score {score:.1f}")
+    if top_pitch:
+        parts.append(f"top {top_pitch} {top_usage:.1f}%")
     if note:
         parts.append(note[:90])
-    return {"Pitch Mix Signal": signal, "Pitch Mix Note": "; ".join(parts) or "missing pitch-type matchup/arsenal whiff data"}
+    return {
+        "Pitch Mix Signal": signal,
+        "Pitch Mix Note": "; ".join(parts) or "missing pitch-type matchup/arsenal whiff data",
+        "Pitch Arsenal Top Pitch Used": top_pitch,
+        "Pitch Arsenal Top Usage Used": "" if top_usage is None else round(top_usage, 1),
+        "Pitch Arsenal Usage Used": "; ".join(f"{k} {v:.1f}%" for k, v in sorted(arsenal, key=lambda x: x[1], reverse=True)),
+    }
 
 
 def _tpl_umpire_zone_audit(row):
@@ -35037,7 +36065,31 @@ def _tpl_data_enhanced_k_projection(row):
     hook = str(row.get("Hook/Role Signal") or "")
     damage = str(row.get("K Damage Risk Label") or "")
     line_action = str(row.get("K Line Calibration Action") or "")
+    pitcher_stats = str(row.get("Pitcher Stats Signal") or "")
+    k_pct = _tpl_num(row.get("Pitcher K% Used"), None)
+    k9 = _tpl_num(row.get("Pitcher K/9 Used"), None)
+    bb9 = _tpl_num(row.get("Pitcher BB/9 Used"), None)
+    fip = _tpl_num(row.get("Pitcher FIP Used"), None)
+    opp_k = _tpl_num(row.get("Opponent K% Used"), None)
+    opp_bbk = _tpl_num(row.get("Opponent BB/K Used"), None)
+    opp_woba = _tpl_num(row.get("Opponent wOBA Used"), None)
 
+    if pitcher_stats == "PITCHER_STATS_SUPPORT":
+        add(0.10, "pitcher K/K9/FIP")
+    elif pitcher_stats == "PITCHER_STATS_CAUTION":
+        add(-0.10, "pitcher K/K9/FIP")
+    if k_pct is not None and k_pct >= 28:
+        add(0.06, "elite K%")
+    elif k_pct is not None and k_pct <= 18:
+        add(-0.06, "low K%")
+    if k9 is not None and k9 >= 10.0:
+        add(0.05, "elite K/9")
+    elif k9 is not None and k9 <= 7.0:
+        add(-0.05, "low K/9")
+    if bb9 is not None and bb9 >= 4.0:
+        add(-0.05, "BB/9 volume risk")
+    if fip is not None and fip >= 4.80:
+        add(-0.05, "FIP damage risk")
     if recent == "SKILL_SUPPORT":
         add(0.10, "recent skill")
     elif recent == "SKILL_CAUTION":
@@ -35046,6 +36098,14 @@ def _tpl_data_enhanced_k_projection(row):
         add(0.12, "lineup K")
     elif lineup == "LINEUP_CONTACT_CAUTION":
         add(-0.12, "lineup contact")
+    if opp_k is not None and opp_k <= 18.5:
+        add(-0.06, "opp low K%")
+    elif opp_k is not None and opp_k >= 25.5:
+        add(0.06, "opp high K%")
+    if opp_bbk is not None and opp_bbk >= 0.70:
+        add(-0.05, "opp BB/K contact")
+    if opp_woba is not None and opp_woba >= 0.340:
+        add(-0.05, "opp wOBA traffic")
     if pitch_mix == "PITCH_MIX_SUPPORT":
         add(0.15, "pitch mix")
     elif pitch_mix == "PITCH_MIX_CAUTION":
@@ -35195,6 +36255,108 @@ def _tpl_app_modularization_health():
         }])
     except Exception as e:
         return pd.DataFrame([{"App Health Item": "App file size / modularization", "Status": "UNKNOWN", "Note": str(e)[:120]}])
+
+
+def _tpl_overall_model_readiness(kdf=None, true_actuals=None, coverage_summary=None, po_summary=None, ml_summary=None):
+    rows = []
+
+    def add(area, score, status, missing, action):
+        rows.append({
+            "Area": area,
+            "Score": int(max(0, min(100, round(score)))),
+            "Status": status,
+            "Missing / Risk": missing,
+            "Next Action": action,
+        })
+
+    try:
+        kdf = kdf if isinstance(kdf, pd.DataFrame) else pd.DataFrame()
+        if not kdf.empty:
+            official = int(kdf.get("Official Card Tier", pd.Series(dtype=str)).astype(str).eq("OFFICIAL").sum())
+            playable = int(kdf.get("Official Card Tier", pd.Series(dtype=str)).astype(str).eq("PLAYABLE").sum())
+            pass_ct = int(kdf.get("Official Card Tier", pd.Series(dtype=str)).astype(str).eq("PASS").sum())
+            avg_complete = pd.to_numeric(kdf.get("K Data Completeness Score", pd.Series(dtype=float)), errors="coerce").mean()
+            avg_complete = 0 if pd.isna(avg_complete) else float(avg_complete)
+            score = 55 + (avg_complete * 0.35) + min(10, official * 2) + min(5, playable) - min(12, pass_ct * 0.5)
+            status = "GOOD" if score >= 82 else "USABLE" if score >= 68 else "NEEDS_DATA"
+            add("K Props", score, status, f"official {official}, playable {playable}, pass {pass_ct}, data {avg_complete:.0f}%", "Use Official Card Builder first; track enhanced projection vs OG.")
+        else:
+            add("K Props", 55, "WAITING_FOR_BOARD", "no refreshed K board", "Refresh live board.")
+    except Exception:
+        add("K Props", 55, "UNKNOWN", "K readiness unavailable", "Refresh board and check K tab.")
+
+    try:
+        true_actuals = true_actuals if isinstance(true_actuals, pd.DataFrame) else pd.DataFrame()
+        graded = len(true_actuals)
+        rich_cols = ["Actual BF", "Pitches", "ER", "H", "BB", "HR"]
+        rich_have = 0
+        if not true_actuals.empty:
+            for col in rich_cols:
+                if col in true_actuals.columns and pd.to_numeric(true_actuals[col], errors="coerce").notna().any():
+                    rich_have += 1
+        score = min(100, 35 + min(35, graded * 0.35) + rich_have * 5)
+        status = "GOOD" if score >= 82 else "BUILDING" if score >= 60 else "NEEDS_GRADES"
+        add("Actuals / Calibration", score, status, f"graded rows {graded}, rich fields {rich_have}/6", "Grade daily with Actual BF, pitches, ER, H, BB, HR.")
+    except Exception:
+        add("Actuals / Calibration", 45, "UNKNOWN", "actuals readiness unavailable", "Check Loss Lab true actuals table.")
+
+    try:
+        coverage_summary = coverage_summary if isinstance(coverage_summary, pd.DataFrame) else pd.DataFrame()
+        avg_cov = pd.to_numeric(coverage_summary.get("Coverage %", pd.Series(dtype=float)), errors="coerce").mean()
+        avg_cov = 0 if pd.isna(avg_cov) else float(avg_cov)
+        low = []
+        if not coverage_summary.empty:
+            for _, rr in coverage_summary.iterrows():
+                if _tpl_num(rr.get("Coverage %"), 0) < 70:
+                    low.append(str(rr.get("Real Data Need")))
+        status = "GOOD" if avg_cov >= 80 else "PARTIAL" if avg_cov >= 55 else "THIN"
+        add("Real Data Coverage", avg_cov, status, "; ".join(low[:4]) or "coverage mostly clean", "Confirm lineups; verify pitch mix and pitch-count/leash feeds.")
+    except Exception:
+        add("Real Data Coverage", 50, "UNKNOWN", "coverage readiness unavailable", "Check Real Data Coverage section.")
+
+    try:
+        po_summary = po_summary if isinstance(po_summary, pd.DataFrame) else pd.DataFrame()
+        po_losses = int(pd.to_numeric(po_summary.get("Losses", pd.Series(dtype=float)), errors="coerce").sum()) if not po_summary.empty else 0
+        score = 82 if po_losses == 0 else max(58, 82 - min(24, po_losses * 2))
+        status = "GOOD" if score >= 80 else "WATCH_LOSS_BUCKETS"
+        add("Pitching Outs", score, status, f"tracked PO loss buckets {len(po_summary)}", "Keep grading PO with actual IP/outs and hook reasons.")
+    except Exception:
+        add("Pitching Outs", 70, "UNKNOWN", "PO readiness unavailable", "Check PO Loss Lab.")
+
+    try:
+        ml_summary = ml_summary if isinstance(ml_summary, pd.DataFrame) else pd.DataFrame()
+        ml_losses = int(pd.to_numeric(ml_summary.get("Losses", pd.Series(dtype=float)), errors="coerce").sum()) if not ml_summary.empty else 0
+        score = 75 if ml_losses == 0 else max(52, 75 - min(23, ml_losses * 2))
+        status = "SECONDARY" if score >= 70 else "TRACK_ONLY"
+        add("Moneyline", score, status, f"tracked ML loss buckets {len(ml_summary)}", "Use as secondary until SP/data review is consistently clean.")
+    except Exception:
+        add("Moneyline", 65, "UNKNOWN", "ML readiness unavailable", "Check Moneyline Loss Lab.")
+
+    try:
+        health = _tpl_app_modularization_health()
+        status = str(health.iloc[0].get("Status", "UNKNOWN")) if isinstance(health, pd.DataFrame) and not health.empty else "UNKNOWN"
+        lines = _tpl_num(health.iloc[0].get("Current Lines"), 0) if isinstance(health, pd.DataFrame) and not health.empty else 0
+        score = 55 if status == "MODULARIZE_SOON" else 72 if status == "LARGE_BUT_WORKABLE" else 90
+        add("App Maintainability", score, status, f"{int(lines)} lines", "Later split into k_projection, pitching_outs, moneyline, loss_lab, data_feeds, calibration.")
+    except Exception:
+        add("App Maintainability", 60, "UNKNOWN", "file health unavailable", "Run modularization health check.")
+
+    out = pd.DataFrame(rows)
+    try:
+        overall = int(round(pd.to_numeric(out["Score"], errors="coerce").mean()))
+        status = "READY" if overall >= 82 else "USABLE_WITH_FILTERS" if overall >= 70 else "DATA_BUILDING"
+        top_missing = "; ".join(out.sort_values("Score").head(3)["Area"].astype(str).tolist())
+        head = pd.DataFrame([{
+            "Area": "OVERALL",
+            "Score": overall,
+            "Status": status,
+            "Missing / Risk": f"lowest areas: {top_missing}",
+            "Next Action": "Bet from Official Card Builder; keep grading full actuals daily.",
+        }])
+        out = pd.concat([head, out], ignore_index=True, sort=False)
+    except Exception:
+        pass
+    return out
 
 
 def _tpl_official_play_selector(row):
@@ -35421,10 +36583,28 @@ def render_true_projection_loss_lab_tab():
     ml_summary = build_ml_loss_lab_summary()
     true_actuals = build_true_actuals_dataset()
     cal_tables = build_projection_error_calibration_tables()
+    kdf_for_readiness = pd.DataFrame()
+    coverage_summary_for_readiness = pd.DataFrame()
+    try:
+        kdf_for_readiness = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        coverage_summary_for_readiness, _coverage_detail_for_readiness = _tpl_real_data_coverage_table(kdf_for_readiness)
+    except Exception:
+        kdf_for_readiness = pd.DataFrame()
+        coverage_summary_for_readiness = pd.DataFrame()
     a, b, c = st.columns(3)
     a.metric("K Loss Buckets", 0 if k_summary.empty else len(k_summary))
     b.metric("PO Loss Buckets", 0 if po_summary.empty else len(po_summary))
     c.metric("ML Loss Buckets", 0 if ml_summary.empty else len(ml_summary))
+    st.markdown("### Overall Model Readiness")
+    readiness = _tpl_overall_model_readiness(
+        kdf=kdf_for_readiness,
+        true_actuals=true_actuals,
+        coverage_summary=coverage_summary_for_readiness,
+        po_summary=po_summary,
+        ml_summary=ml_summary,
+    )
+    if isinstance(readiness, pd.DataFrame) and not readiness.empty:
+        st.dataframe(readiness, use_container_width=True, hide_index=True)
     st.markdown("### True Actuals Dataset")
     if not true_actuals.empty:
         actual_cols = [c for c in [
@@ -35454,7 +36634,7 @@ def render_true_projection_loss_lab_tab():
         st.info("Projection error calibration needs graded K rows with line, projection, side, and actual K.")
     st.markdown("### K Upside Missing Inputs")
     try:
-        kdf = build_kproj_table(board) if "board" in globals() else pd.DataFrame()
+        kdf = kdf_for_readiness if isinstance(kdf_for_readiness, pd.DataFrame) and not kdf_for_readiness.empty else build_kproj_table(board) if "board" in globals() else pd.DataFrame()
         coverage_summary, coverage_detail = _tpl_real_data_coverage_table(kdf)
         st.markdown("### Real Data Coverage")
         if not coverage_summary.empty:
@@ -35475,6 +36655,9 @@ def render_true_projection_loss_lab_tab():
             "Pitcher", "Matchup", "UD/Line", "K PROJ", "Official K Edge", "Decision",
             "Data Enhanced K Projection", "K Data Adjustment", "K Data Completeness Score",
             "K Data Gaps", "K Data Projection Drivers",
+            "Pitcher Stats Signal", "Pitcher K% Used", "Pitcher K/9 Used", "Pitcher BB/9 Used", "Pitcher ERA Used", "Pitcher FIP Used",
+            "Opponent K% Used", "Opponent BB/K Used", "Opponent AVG Used", "Opponent OBP Used", "Opponent wOBA Used", "Opponent K Rank Used",
+            "Pitch Arsenal Top Pitch Used", "Pitch Arsenal Top Usage Used", "Pitch Arsenal Usage Used",
             "Official Card Tier", "Official Selector Side", "Official Selector Edge",
             "Do Not Bet Reason", "Official Support Signals",
             "Official Selector Blocks", "Official Selector Warnings",
