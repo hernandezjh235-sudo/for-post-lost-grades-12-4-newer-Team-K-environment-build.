@@ -36682,6 +36682,1023 @@ def render_true_projection_loss_lab_tab():
     st.dataframe(ml_summary, use_container_width=True, hide_index=True) if not ml_summary.empty else st.info("No ML losses graded yet.")
 
 
+# =============================================================================
+# OG SLATE IMPORT + PO CONSERVATIVE SELECTOR
+# Final operational layer:
+# - Lets the stronger separate OG slate become the active K projection source.
+# - Adds a PO selector guard so under-heavy outs picks are downgraded when
+#   starter durability/workload risk is not actually confirmed.
+# =============================================================================
+OG_SLATE_IMPORT_VERSION = "OG_SLATE_IMPORT_2026_07_23"
+OG_SLATE_OVERRIDE_FILE = os.path.join(STORAGE_DIR, "og_k_projection_override.csv")
+PO_CONSERVATIVE_SELECTOR_VERSION = "PO_CONSERVATIVE_SELECTOR_2026_07_23"
+
+
+def _og_parse_result_tail(text):
+    raw = str(text or "")
+    status = "WIN" if "✅" in raw else "LOSS" if "❌" in raw else ""
+    tail = ""
+    if "✅" in raw:
+        tail = raw.split("✅", 1)[-1]
+    elif "❌" in raw:
+        tail = raw.split("❌", 1)[-1]
+    actual_k, actual_ip = "", ""
+    try:
+        if "-" in tail:
+            k_txt, ip_txt = tail.split("-", 1)
+            actual_k = _tpl_num(k_txt.strip(), "")
+            actual_ip = str(ip_txt).replace("IP", "").strip()
+    except Exception:
+        pass
+    return status, actual_k, actual_ip
+
+
+def _og_parse_slate_text(text, source_label="OG"):
+    rows = []
+    matchup = ""
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "@" in line and not line.startswith("•"):
+            matchup = line.strip()
+            continue
+        if not line.startswith("•") or "—" not in line:
+            continue
+        try:
+            parts = [p.strip() for p in line.replace("🔥", "").replace("⚠️", "").split("—")]
+            if len(parts) < 4:
+                continue
+            pitcher = parts[0].replace("•", "").strip()
+            side_line = parts[1].strip().split()
+            if len(side_line) < 2:
+                continue
+            side = side_line[0].upper()
+            if side not in ["O", "U"]:
+                continue
+            k_line = _tpl_num(side_line[1], None)
+            proj = _tpl_num(str(parts[2]).replace("K", "").strip(), None)
+            ip_txt = str(parts[3]).replace("IP", "").strip()
+            ip = _tpl_num(ip_txt.split()[0] if ip_txt.split() else ip_txt, None)
+            result, actual_k, actual_ip = _og_parse_result_tail(line)
+            if pitcher and proj is not None:
+                rows.append({
+                    "Pitcher": pitcher,
+                    "Matchup": matchup,
+                    "OG Side": side,
+                    "OG Line": k_line,
+                    "OG K Projection": round(float(proj), 2),
+                    "OG IP Projection": "" if ip is None else round(float(ip), 2),
+                    "OG Result": result,
+                    "OG Actual K": actual_k,
+                    "OG Actual IP": actual_ip,
+                    "OG Source": source_label,
+                    "OG Import Version": OG_SLATE_IMPORT_VERSION,
+                })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def _og_load_overrides():
+    try:
+        if os.path.exists(OG_SLATE_OVERRIDE_FILE):
+            return pd.read_csv(OG_SLATE_OVERRIDE_FILE)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _og_save_overrides(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return {"saved": 0, "path": OG_SLATE_OVERRIDE_FILE}
+        out = df.copy()
+        out["_name"] = out["Pitcher"].astype(str).map(_tpl_norm_name)
+        old = _og_load_overrides()
+        if isinstance(old, pd.DataFrame) and not old.empty:
+            old["_name"] = old["Pitcher"].astype(str).map(_tpl_norm_name)
+            out = pd.concat([old, out], ignore_index=True, sort=False)
+        out = out.drop_duplicates("_name", keep="last").drop(columns=["_name"], errors="ignore")
+        out.to_csv(OG_SLATE_OVERRIDE_FILE, index=False)
+        return {"saved": len(out), "path": OG_SLATE_OVERRIDE_FILE, "version": OG_SLATE_IMPORT_VERSION}
+    except Exception as e:
+        return {"saved": 0, "error": str(e)[:160], "path": OG_SLATE_OVERRIDE_FILE}
+
+
+def _og_apply_to_kdf(df):
+    overrides = _og_load_overrides()
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty or overrides.empty:
+        return df
+    out = df.copy()
+    omap = {}
+    for _, rr in overrides.iterrows():
+        name = _tpl_norm_name(rr.get("Pitcher"))
+        if name:
+            omap[name] = rr.to_dict()
+    imported, deltas, sources = [], [], []
+    for idx, rr in out.iterrows():
+        row = rr.to_dict()
+        og = omap.get(_tpl_norm_name(row.get("Pitcher")))
+        if not og:
+            imported.append("")
+            deltas.append("")
+            sources.append("")
+            continue
+        old_proj = _tpl_num(row.get("K PROJ"), None)
+        og_proj = _tpl_num(og.get("OG K Projection"), None)
+        if og_proj is None:
+            imported.append("")
+            deltas.append("")
+            sources.append("")
+            continue
+        imported.append(round(float(og_proj), 2))
+        deltas.append("" if old_proj is None else round(float(og_proj) - float(old_proj), 2))
+        sources.append(og.get("OG Source") or "OG")
+        for col in ["K PROJ", "Final K Projection", "Official K PROJ", "Line-Aware Smart Final K Projection", "Matchup Intelligence Final K Projection"]:
+            out.at[idx, col] = round(float(og_proj), 2)
+        out.at[idx, "OG Imported Side"] = og.get("OG Side", "")
+        out.at[idx, "OG Imported Line"] = og.get("OG Line", "")
+        out.at[idx, "OG Imported IP"] = og.get("OG IP Projection", "")
+        out.at[idx, "OG Imported Result"] = og.get("OG Result", "")
+        out.at[idx, "OG Imported Actual K"] = og.get("OG Actual K", "")
+        line = _tpl_num(row.get("UD/Line") if row.get("UD/Line") not in ["NO LINE", "NO_UD_LINE"] else row.get("Line"), None)
+        if line is not None:
+            edge = round(float(og_proj) - float(line), 2)
+            side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PASS"
+            for col in ["Official K Edge", "Line-Aware Smart Edge", "Edge Gap"]:
+                out.at[idx, col] = edge
+            for col in ["Decision", "Line-Aware Smart Decision", "Final Decision"]:
+                out.at[idx, col] = side if abs(edge) >= 0.35 else "PASS"
+    out["Imported OG K Projection"] = imported
+    out["OG Projection Delta"] = deltas
+    out["OG Projection Source"] = sources
+    out["OG Import Active"] = ["YES" if v not in ["", None] else "NO" for v in imported]
+    out["OG Import Version"] = OG_SLATE_IMPORT_VERSION
+    try:
+        out = _tpl_apply_k_audit(out)
+    except Exception:
+        pass
+    return out
+
+
+_OG_IMPORT_PREV_BUILD_KPROJ = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _OG_IMPORT_PREV_BUILD_KPROJ is None:
+        return pd.DataFrame()
+    return _og_apply_to_kdf(_OG_IMPORT_PREV_BUILD_KPROJ(board))
+
+
+def _po_official_selector(row):
+    side = str(row.get("Beta Lean") or "").upper()
+    edge = abs(_tpl_num(row.get("Beta Edge"), 0) or 0)
+    proj = _tpl_num(row.get("Beta Projection"), None)
+    line = _tpl_num(row.get("UD Line"), None)
+    beta_ip = _tpl_num(row.get("Beta IP"), None)
+    original_ip = _tpl_num(row.get("Original IP"), None)
+    deep = _tpl_num(row.get("Deep Start Rate"), None)
+    hook = _tpl_num(row.get("Recent Hook Rate"), None)
+    conf = _tpl_num(row.get("IP Confidence"), 50) or 50
+    k_proj = _tpl_num(row.get("K PROJ (unchanged)"), None)
+    flags = []
+    warns = []
+    support = []
+    if proj is None or line is None or side not in ["OVER", "UNDER"]:
+        return {"PO Official Tier": "PASS PO", "PO Do Not Bet Reason": "missing line/projection", "PO Support Signals": "", "PO Selector Version": PO_CONSERVATIVE_SELECTOR_VERSION}
+    if edge < 1.25:
+        flags.append("edge under 1.25 outs")
+    elif edge >= 3.0:
+        support.append("clear outs edge")
+    if conf < 52:
+        warns.append("low IP confidence")
+    if side == "UNDER":
+        if original_ip is not None and original_ip >= 4.75 and beta_ip is not None and beta_ip <= 4.25:
+            flags.append("under relies on aggressive IP cut")
+        if deep is not None and deep >= 38 and edge < 3.5:
+            flags.append("starter has deep-start risk")
+        if k_proj is not None and k_proj >= 5.6 and line <= 16.5:
+            flags.append("K projection supports workload/outs")
+        if hook is not None and hook >= 45:
+            support.append("recent hook support")
+    elif side == "OVER":
+        if beta_ip is not None and beta_ip >= 5.4:
+            support.append("projected starter length")
+        if hook is not None and hook >= 45 and edge < 2.5:
+            flags.append("over exposed to hook risk")
+    if flags:
+        tier = "TRACK ONLY PO"
+    elif edge >= 3.0 and len(warns) <= 1:
+        tier = "OFFICIAL PO"
+    elif edge >= 1.75 and len(warns) <= 2:
+        tier = "PLAYABLE PO"
+    else:
+        tier = "LEAN / TRACK PO"
+    return {
+        "PO Official Tier": tier,
+        "PO Do Not Bet Reason": "; ".join(dict.fromkeys(flags + (warns if tier in ["LEAN / TRACK PO", "TRACK ONLY PO"] else []))),
+        "PO Support Signals": "; ".join(dict.fromkeys(support)),
+        "PO Selector Version": PO_CONSERVATIVE_SELECTOR_VERSION,
+    }
+
+
+_PO_SELECTOR_PREV_ROWS = _beta_projection_rows if "_beta_projection_rows" in globals() else None
+
+
+def _beta_projection_rows(board, market_kind="OUTS"):
+    df = _PO_SELECTOR_PREV_ROWS(board, market_kind) if _PO_SELECTOR_PREV_ROWS is not None else pd.DataFrame()
+    if market_kind != "OUTS" or df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    profiles = []
+    for _, rr in df.iterrows():
+        profiles.append(_po_official_selector(rr.to_dict()))
+    try:
+        pdf = pd.DataFrame(profiles, index=df.index)
+        out = df.copy()
+        for col in pdf.columns:
+            out[col] = pdf[col]
+        return out
+    except Exception:
+        return df
+
+
+_OG_PO_PREV_RENDER_KPROJ = render_kproj_tab if "render_kproj_tab" in globals() else None
+
+
+def render_kproj_tab(board):
+    st.markdown("### OG Projection Import")
+    st.caption("Paste the separate OG slate here when it is outperforming. Saved rows become the active K projection source in this file and show OG delta columns.")
+    og_text = st.text_area("Paste OG K slate", height=130, key="og_k_slate_import_text")
+    parsed = _og_parse_slate_text(og_text, "OG_PASTE") if og_text.strip() else pd.DataFrame()
+    if not parsed.empty:
+        st.dataframe(parsed, use_container_width=True, hide_index=True)
+    if st.button("Save OG K Projection Override", use_container_width=True, key="save_og_projection_override"):
+        st.write(_og_save_overrides(parsed))
+    existing = _og_load_overrides()
+    if isinstance(existing, pd.DataFrame) and not existing.empty:
+        with st.expander("Current OG Projection Overrides", expanded=False):
+            st.dataframe(existing.tail(100), use_container_width=True, hide_index=True)
+    if _OG_PO_PREV_RENDER_KPROJ is not None:
+        _OG_PO_PREV_RENDER_KPROJ(board)
+
+
+_OG_PO_PREV_RENDER_PO = render_beta_pitching_outs_tab if "render_beta_pitching_outs_tab" in globals() else None
+
+
+def render_beta_pitching_outs_tab(board):
+    if _OG_PO_PREV_RENDER_PO is not None:
+        _OG_PO_PREV_RENDER_PO(board)
+    try:
+        df = _beta_projection_rows(board, "OUTS")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">Pitching Outs Official Selector</div>', unsafe_allow_html=True)
+            cols = [c for c in [
+                "Pitcher", "Matchup", "UD Line", "Beta Projection", "Beta Lean", "Beta Edge",
+                "PO Official Tier", "PO Do Not Bet Reason", "PO Support Signals",
+                "Original IP", "Beta IP", "Recent Hook Rate", "Deep Start Rate",
+                "IP Confidence", "K PROJ (unchanged)", "PO Selector Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Pitching Outs selector unavailable: {e}")
+
+
+ATLAS_K_AUDIT_VERSION = "ATLAS_K_STRUCTURE_AUDIT_2026_07_23"
+
+
+def _atlas_fair_american(prob):
+    try:
+        p = max(1.0, min(99.0, float(prob))) / 100.0
+        if p >= 0.5:
+            return int(round(-100 * p / max(1 - p, 0.0001)))
+        return int(round(100 * (1 - p) / max(p, 0.0001)))
+    except Exception:
+        return ""
+
+
+def _atlas_grade(score):
+    try:
+        s = float(score)
+        if s >= 86:
+            return "A+"
+        if s >= 78:
+            return "A"
+        if s >= 70:
+            return "B+"
+        if s >= 62:
+            return "B"
+        if s >= 54:
+            return "C"
+        return "TRACK"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _atlas_l10_context(row):
+    pitcher = _tpl_first(row, ["Pitcher", "pitcher", "Player"], "")
+    line = _tpl_num(_tpl_first(row, ["UD/Line", "Line", "K Line"], None), None)
+    side = str(_tpl_first(row, ["Decision", "Line-Aware Smart Decision", "Final Decision"], "")).upper()
+    side = "OVER" if "OVER" in side else "UNDER" if "UNDER" in side else ""
+    vals = _tpl_k_values_from_logs(pitcher) if "_tpl_k_values_from_logs" in globals() else []
+    vals10 = [float(v) for v in vals[:10] if v is not None]
+    if not vals10:
+        return {"Atlas L10 Avg K": "", "Atlas L10 Hit %": "", "Atlas L3 Avg K": "", "Atlas Line vs L10": "", "Atlas Line History Flag": "NO_LOGS"}
+    avg10 = sum(vals10) / len(vals10)
+    vals3 = vals10[:3]
+    avg3 = sum(vals3) / len(vals3) if vals3 else avg10
+    hit = ""
+    if line is not None and side in ["OVER", "UNDER"]:
+        wins = sum(1 for v in vals10 if (v > line if side == "OVER" else v < line))
+        hit = round(wins / len(vals10) * 100, 1)
+    line_delta = "" if line is None else round(avg10 - float(line), 2)
+    if line is None:
+        flag = "NO_LINE"
+    elif side == "OVER" and avg10 >= float(line) + 0.7 and hit != "" and hit >= 60:
+        flag = "LINE_BELOW_HISTORY_STRONG_OVER"
+    elif side == "UNDER" and avg10 <= float(line) - 0.7 and hit != "" and hit >= 60:
+        flag = "LINE_ABOVE_HISTORY_STRONG_UNDER"
+    elif hit != "" and hit < 45:
+        flag = "HISTORY_DISAGREES"
+    else:
+        flag = "HISTORY_MIXED"
+    return {"Atlas L10 Avg K": round(avg10, 2), "Atlas L10 Hit %": hit, "Atlas L3 Avg K": round(avg3, 2), "Atlas Line vs L10": line_delta, "Atlas Line History Flag": flag}
+
+
+def _atlas_k_profile(row):
+    proj = _tpl_num(_tpl_first(row, ["K PROJ", "Final K Projection", "Official K PROJ"], None), None)
+    line = _tpl_num(_tpl_first(row, ["UD/Line", "Line", "K Line"], None), None)
+    edge = None if proj is None or line is None else float(proj) - float(line)
+    abs_edge = 0 if edge is None else abs(edge)
+    putaway = _tpl_pct_value(row, ["Putaway/Whiff", "Putaway %", "PutAway%", "Whiff%", "SwStr%", "Recent SwStr%"], None)
+    pitcher_k = _tpl_pct_value(row, ["Pitcher K% Used", "Pitcher K%", "K%", "APP85 Pitcher K%"], None)
+    opp_k = _tpl_pct_value(row, ["Opponent K% Used", "Opponent K% vs Pitcher Hand", "APP85 Opponent K%", "Opp K%"], None)
+    exp_bf = _tpl_num(_tpl_first(row, ["Exp BF", "Expected BF", "Projected BF", "Beta BF"], None), None)
+    ceiling = _tpl_num(_tpl_first(row, ["Ceiling", "K Ceiling", "P80", "80th Percentile K"], None), None)
+    if ceiling is None and proj is not None:
+        ceiling = float(proj) + max(1.4, min(3.2, abs_edge + 1.1))
+    pitch_score = _tpl_num(_tpl_first(row, ["APP88 Arsenal Matchup Score", "Pitch Mix Matchup Score", "Pitch Arsenal Matchup Score"], None), None)
+    top_pitch = str(_tpl_first(row, ["Pitch Arsenal Top Pitch Used", "Top Pitch", "Primary Pitch"], "") or "")
+    top_usage = _tpl_num(_tpl_first(row, ["Pitch Arsenal Top Usage Used", "Top Pitch Usage"], None), None)
+    completeness = _tpl_num(row.get("K Data Completeness Score"), 50) or 50
+    l10 = _atlas_l10_context(row)
+    prob = 50.0 + min(18.0, abs_edge * 7.0)
+    if putaway is not None:
+        prob += max(-5.0, min(6.0, (putaway - 31.0) * 0.35))
+    if pitcher_k is not None:
+        prob += max(-5.0, min(7.0, (pitcher_k - 23.0) * 0.45))
+    if opp_k is not None:
+        prob += max(-6.0, min(7.0, (opp_k - 22.0) * 0.55))
+    if exp_bf is not None:
+        prob += max(-5.0, min(5.0, (exp_bf - 21.0) * 0.8))
+    if pitch_score is not None:
+        prob += max(-5.0, min(6.0, (pitch_score - 50.0) * 0.12))
+    hit = _tpl_num(l10.get("Atlas L10 Hit %"), None)
+    if hit is not None:
+        prob += max(-7.0, min(7.0, (hit - 50.0) * 0.18))
+    prob += max(-4.0, min(4.0, (completeness - 70.0) * 0.08))
+    prob = round(max(35.0, min(88.0, prob)), 1)
+    if pitch_score is None:
+        arsenal_grade = "UNKNOWN"
+    elif pitch_score >= 70:
+        arsenal_grade = "A+"
+    elif pitch_score >= 60:
+        arsenal_grade = "A"
+    elif pitch_score >= 50:
+        arsenal_grade = "B"
+    elif pitch_score >= 42:
+        arsenal_grade = "C"
+    else:
+        arsenal_grade = "RISK"
+    return {
+        "Atlas Model Probability %": prob,
+        "Atlas Fair Odds": _atlas_fair_american(prob),
+        "Atlas Edge vs Line": "" if edge is None else round(edge, 2),
+        "Atlas Grade": _atlas_grade(prob),
+        "Atlas Putaway Used": "" if putaway is None else round(putaway, 1),
+        "Atlas Pitcher K% Used": "" if pitcher_k is None else round(pitcher_k, 1),
+        "Atlas Opponent K% Used": "" if opp_k is None else round(opp_k, 1),
+        "Atlas Expected BF Used": "" if exp_bf is None else round(exp_bf, 1),
+        "Atlas Ceiling K": "" if ceiling is None else round(float(ceiling), 1),
+        "Atlas Top Pitch": top_pitch,
+        "Atlas Top Pitch Usage": "" if top_usage is None else round(top_usage, 1),
+        "Atlas Arsenal Grade": arsenal_grade,
+        "Atlas Structure Version": ATLAS_K_AUDIT_VERSION,
+        **l10,
+    }
+
+
+def _atlas_apply_k(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_atlas_k_profile(row))
+        except Exception as e:
+            row["Atlas Structure Version"] = ATLAS_K_AUDIT_VERSION
+            row["Atlas Audit Error"] = str(e)[:120]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+_ATLAS_PREV_BUILD_KPROJ = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _ATLAS_PREV_BUILD_KPROJ is None:
+        return pd.DataFrame()
+    return _atlas_apply_k(_ATLAS_PREV_BUILD_KPROJ(board))
+
+
+_ATLAS_PREV_RENDER_KPROJ = render_kproj_tab if "render_kproj_tab" in globals() else None
+
+
+def render_kproj_tab(board):
+    if _ATLAS_PREV_RENDER_KPROJ is not None:
+        _ATLAS_PREV_RENDER_KPROJ(board)
+    try:
+        df = build_kproj_table(board)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">Atlas-Style K Structure Audit</div>', unsafe_allow_html=True)
+            cols = [c for c in [
+                "Pitcher", "Matchup", "UD/Line", "K PROJ", "Decision",
+                "Atlas Model Probability %", "Atlas Fair Odds", "Atlas Grade", "Atlas Edge vs Line",
+                "Atlas Putaway Used", "Atlas Pitcher K% Used", "Atlas Opponent K% Used",
+                "Atlas Expected BF Used", "Atlas Ceiling K", "Atlas Top Pitch", "Atlas Top Pitch Usage",
+                "Atlas Arsenal Grade", "Atlas L10 Avg K", "Atlas L10 Hit %",
+                "Atlas L3 Avg K", "Atlas Line vs L10", "Atlas Line History Flag",
+                "Official Card Tier", "Do Not Bet Reason", "Atlas Structure Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Atlas-style K audit unavailable: {e}")
+
+
+TRUE_PROB_SIM_VERSION = "TRUE_PROB_MONTE_CARLO_2026_07_23"
+TRUE_PROB_SIM_SIMS = 10000
+
+
+def _sim_stable_rng(*parts):
+    try:
+        import hashlib
+        seed_text = "|".join(str(p) for p in (TRUE_PROB_SIM_VERSION,) + tuple(parts))
+        seed = int(hashlib.sha256(seed_text.encode("utf-8")).hexdigest()[:16], 16) % (2 ** 32)
+        return np.random.default_rng(seed)
+    except Exception:
+        return np.random.default_rng(20260723)
+
+
+def _sim_prob_fair_odds(prob_pct):
+    try:
+        if "_atlas_fair_american" in globals():
+            return _atlas_fair_american(prob_pct)
+        p = max(1.0, min(99.0, float(prob_pct))) / 100.0
+        if p >= 0.5:
+            return int(round(-100 * p / max(1 - p, 0.0001)))
+        return int(round(100 * (1 - p) / max(p, 0.0001)))
+    except Exception:
+        return ""
+
+
+def _sim_side_from_text(value):
+    txt = str(value or "").upper()
+    if "PASS" in txt:
+        return "PASS"
+    if "OVER" in txt or txt.strip().startswith("O"):
+        return "OVER"
+    if "UNDER" in txt or txt.strip().startswith("U"):
+        return "UNDER"
+    return ""
+
+
+def _k_sim_volatility(row, mean, line):
+    completeness = _tpl_num(row.get("K Data Completeness Score"), 65) or 65
+    vol = 1.16
+    if completeness < 50:
+        vol += 0.24
+    elif completeness < 70:
+        vol += 0.12
+    vol_txt = str(row.get("K Volume Risk") or row.get("Volume Risk") or "").upper()
+    dmg_txt = str(row.get("K Damage Risk Label") or row.get("Damage Risk Label") or "").upper()
+    role_txt = str(row.get("Role/Pitch Limit Flag") or row.get("Role Risk") or "").upper()
+    if "HIGH" in vol_txt:
+        vol += 0.24
+    elif "MED" in vol_txt:
+        vol += 0.12
+    if "HIGH" in dmg_txt:
+        vol += 0.18
+    elif "MED" in dmg_txt:
+        vol += 0.08
+    if any(x in role_txt for x in ["OPENER", "BULK", "LIMIT", "IL", "CALL-UP", "TANDEM"]):
+        vol += 0.22
+    if mean is not None and line is not None and abs(float(mean) - float(line)) < 0.45:
+        vol += 0.08
+    return max(1.05, min(1.95, vol))
+
+
+def _simulate_k_row(row, sims=TRUE_PROB_SIM_SIMS):
+    pitcher = _tpl_first(row, ["Pitcher", "pitcher", "Player"], "")
+    line = _tpl_num(_tpl_first(row, ["UD/Line", "Line", "K Line"], None), None)
+    mean = _tpl_num(_tpl_first(row, ["K PROJ", "Final K Projection", "Official K PROJ", "Line-Aware Smart Final K Projection"], None), None)
+    decision = _sim_side_from_text(_tpl_first(row, ["Decision", "Line-Aware Smart Decision", "Final Decision", "Official Pick"], ""))
+    out = {
+        "K Sim Version": TRUE_PROB_SIM_VERSION,
+        "K Sim Runs": int(sims),
+        "K Sim Note": "",
+    }
+    if mean is None or line is None:
+        out.update({
+            "K Sim Over %": "",
+            "K Sim Under %": "",
+            "K Sim Pick": "",
+            "K Sim True Prob %": "",
+            "K Sim Current Side Prob %": "",
+            "K Sim Fair Odds": "",
+            "K Sim Mean": "",
+            "K Sim P10": "",
+            "K Sim P50": "",
+            "K Sim P90": "",
+            "K Sim Volatility": "",
+            "K Sim Note": "missing mean or line",
+        })
+        return out
+    mean = max(0.1, min(14.0, float(mean)))
+    line = float(line)
+    vol = _k_sim_volatility(row, mean, line)
+    rng = _sim_stable_rng("K", pitcher, line, round(mean, 3), sims)
+    variance = max(mean + 0.05, mean * vol + 0.35)
+    try:
+        if variance <= mean + 0.05:
+            samples = rng.poisson(mean, int(sims))
+        else:
+            shape = max(0.35, (mean * mean) / max(variance - mean, 0.05))
+            scale = max(0.05, (variance - mean) / max(mean, 0.05))
+            lambdas = rng.gamma(shape, scale, int(sims))
+            samples = rng.poisson(lambdas)
+    except Exception:
+        samples = rng.poisson(mean, int(sims))
+    over_prob = float(np.mean(samples > line) * 100.0)
+    under_prob = float(np.mean(samples < line) * 100.0)
+    pick = "OVER" if over_prob >= under_prob else "UNDER"
+    true_prob = max(over_prob, under_prob)
+    current_prob = over_prob if decision == "OVER" else under_prob if decision == "UNDER" else ""
+    note = "sim agrees with current side" if decision in ["OVER", "UNDER"] and decision == pick else "sim disagrees with current side" if decision in ["OVER", "UNDER"] else "no current side"
+    out.update({
+        "K Sim Over %": round(over_prob, 1),
+        "K Sim Under %": round(under_prob, 1),
+        "K Sim Pick": pick,
+        "K Sim True Prob %": round(true_prob, 1),
+        "K Sim Current Side Prob %": "" if current_prob == "" else round(float(current_prob), 1),
+        "K Sim Fair Odds": _sim_prob_fair_odds(true_prob),
+        "K Sim Mean": round(float(np.mean(samples)), 2),
+        "K Sim P10": int(np.percentile(samples, 10)),
+        "K Sim P50": int(np.percentile(samples, 50)),
+        "K Sim P90": int(np.percentile(samples, 90)),
+        "K Sim Volatility": round(vol, 2),
+        "K Sim Note": note,
+    })
+    return out
+
+
+def _apply_k_true_probability_sim(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_simulate_k_row(row))
+        except Exception as e:
+            row["K Sim Version"] = TRUE_PROB_SIM_VERSION
+            row["K Sim Note"] = f"simulation error: {str(e)[:100]}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _simulate_po_row(row, sims=TRUE_PROB_SIM_SIMS):
+    pitcher = _tpl_first(row, ["Pitcher", "pitcher", "Player"], "")
+    line = _tpl_num(_tpl_first(row, ["UD Line", "Line", "Outs Line"], None), None)
+    mean = _tpl_num(_tpl_first(row, ["Beta Projection", "Projection", "Projected Outs"], None), None)
+    lean = _sim_side_from_text(_tpl_first(row, ["PO Official Tier", "Beta Lean", "Lean"], ""))
+    out = {
+        "PO Sim Version": TRUE_PROB_SIM_VERSION,
+        "PO Sim Runs": int(sims),
+        "PO Sim Note": "",
+    }
+    if mean is None or line is None:
+        out.update({
+            "PO Sim Over %": "",
+            "PO Sim Under %": "",
+            "PO Sim Pick": "",
+            "PO Sim True Prob %": "",
+            "PO Sim Current Side Prob %": "",
+            "PO Sim Fair Odds": "",
+            "PO Sim Mean Outs": "",
+            "PO Sim P10 Outs": "",
+            "PO Sim P50 Outs": "",
+            "PO Sim P90 Outs": "",
+            "PO Sim SD Outs": "",
+            "PO Sim Official Tier": row.get("PO Official Tier", ""),
+            "PO Sim Note": "missing mean or line",
+        })
+        return out
+    mean = max(1.0, min(27.0, float(mean)))
+    line = float(line)
+    vol_score = _tpl_num(row.get("IP Volatility Score"), 50) or 50
+    hook = _tpl_num(row.get("Recent Hook Rate"), None)
+    deep = _tpl_num(row.get("Deep Start Rate"), None)
+    conf = str(row.get("IP Confidence") or "").upper()
+    sd = 2.25 + max(0.0, min(80.0, float(vol_score))) / 32.0
+    if hook is not None and hook >= 35:
+        sd += 0.45
+    if deep is not None and deep <= 20:
+        sd += 0.35
+    if "LOW" in conf:
+        sd += 0.65
+    elif "MED" in conf:
+        sd += 0.25
+    sd = max(1.7, min(5.8, sd))
+    rng = _sim_stable_rng("PO", pitcher, line, round(mean, 3), sims)
+    samples = np.rint(rng.normal(mean, sd, int(sims))).astype(int)
+    samples = np.clip(samples, 0, 27)
+    over_prob = float(np.mean(samples > line) * 100.0)
+    under_prob = float(np.mean(samples < line) * 100.0)
+    pick = "OVER" if over_prob >= under_prob else "UNDER"
+    true_prob = max(over_prob, under_prob)
+    current_prob = over_prob if lean == "OVER" else under_prob if lean == "UNDER" else ""
+    current_tier = str(row.get("PO Official Tier") or "")
+    sim_tier = current_tier
+    if current_tier and current_prob != "" and float(current_prob) < 53.0:
+        sim_tier = "TRACK ONLY PO"
+    elif pick in ["OVER", "UNDER"] and true_prob >= 60.0 and ("TRACK" in current_tier.upper() or not current_tier):
+        sim_tier = f"SIM PLAYABLE {pick}"
+    note = "sim agrees with current side" if lean in ["OVER", "UNDER"] and lean == pick else "sim disagrees with current side" if lean in ["OVER", "UNDER"] else "no current side"
+    out.update({
+        "PO Sim Over %": round(over_prob, 1),
+        "PO Sim Under %": round(under_prob, 1),
+        "PO Sim Pick": pick,
+        "PO Sim True Prob %": round(true_prob, 1),
+        "PO Sim Current Side Prob %": "" if current_prob == "" else round(float(current_prob), 1),
+        "PO Sim Fair Odds": _sim_prob_fair_odds(true_prob),
+        "PO Sim Mean Outs": round(float(np.mean(samples)), 2),
+        "PO Sim P10 Outs": int(np.percentile(samples, 10)),
+        "PO Sim P50 Outs": int(np.percentile(samples, 50)),
+        "PO Sim P90 Outs": int(np.percentile(samples, 90)),
+        "PO Sim SD Outs": round(sd, 2),
+        "PO Sim Official Tier": sim_tier,
+        "PO Sim Note": note,
+    })
+    return out
+
+
+def _apply_po_true_probability_sim(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_simulate_po_row(row))
+        except Exception as e:
+            row["PO Sim Version"] = TRUE_PROB_SIM_VERSION
+            row["PO Sim Note"] = f"simulation error: {str(e)[:100]}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+_SIM_PREV_BUILD_KPROJ = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _SIM_PREV_BUILD_KPROJ is None:
+        return pd.DataFrame()
+    return _apply_k_true_probability_sim(_SIM_PREV_BUILD_KPROJ(board))
+
+
+_SIM_PREV_PO_ROWS = _beta_projection_rows if "_beta_projection_rows" in globals() else None
+
+
+def _beta_projection_rows(board, market_kind="OUTS"):
+    if _SIM_PREV_PO_ROWS is None:
+        return pd.DataFrame()
+    return _apply_po_true_probability_sim(_SIM_PREV_PO_ROWS(board, market_kind))
+
+
+_SIM_PREV_RENDER_KPROJ = render_kproj_tab if "render_kproj_tab" in globals() else None
+
+
+def render_kproj_tab(board):
+    if _SIM_PREV_RENDER_KPROJ is not None:
+        _SIM_PREV_RENDER_KPROJ(board)
+    try:
+        df = build_kproj_table(board)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">Monte Carlo True Probability - K Props</div>', unsafe_allow_html=True)
+            st.caption(f"{TRUE_PROB_SIM_SIMS:,} stable simulations per pitcher. Uses final K projection, line, role/volume risk, damage risk, and data completeness as volatility inputs.")
+            cols = [c for c in [
+                "Pitcher", "Matchup", "UD/Line", "Decision", "K PROJ",
+                "K Sim Pick", "K Sim True Prob %", "K Sim Current Side Prob %",
+                "K Sim Over %", "K Sim Under %", "K Sim Fair Odds",
+                "K Sim Mean", "K Sim P10", "K Sim P50", "K Sim P90",
+                "K Sim Volatility", "K Sim Note", "K Sim Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"K Monte Carlo simulation unavailable: {e}")
+
+
+_SIM_PREV_RENDER_PO = render_beta_pitching_outs_tab if "render_beta_pitching_outs_tab" in globals() else None
+
+
+def render_beta_pitching_outs_tab(board):
+    if _SIM_PREV_RENDER_PO is not None:
+        _SIM_PREV_RENDER_PO(board)
+    try:
+        df = _beta_projection_rows(board, "OUTS")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">Monte Carlo True Probability - Pitching Outs</div>', unsafe_allow_html=True)
+            st.caption(f"{TRUE_PROB_SIM_SIMS:,} stable simulations per pitcher. Uses projected outs, IP confidence, hook rate, deep-start rate, and IP volatility.")
+            cols = [c for c in [
+                "Pitcher", "Matchup", "UD Line", "Beta Projection", "Beta Lean", "PO Official Tier",
+                "PO Sim Official Tier", "PO Sim Pick", "PO Sim True Prob %",
+                "PO Sim Current Side Prob %", "PO Sim Over %", "PO Sim Under %",
+                "PO Sim Fair Odds", "PO Sim Mean Outs", "PO Sim P10 Outs",
+                "PO Sim P50 Outs", "PO Sim P90 Outs", "PO Sim SD Outs",
+                "PO Sim Note", "PO Sim Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Pitching Outs Monte Carlo simulation unavailable: {e}")
+
+
+MONEYLINE_CARD_AUDIT_VERSION = "MONEYLINE_CARD_AUDIT_2026_07_23"
+
+
+def _mlcard_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _mlcard_matchup_teams(row):
+    matchup = str(row.get("Matchup") or "")
+    try:
+        if "@" in matchup:
+            away, home = [x.strip().upper() for x in matchup.split("@", 1)]
+            return away, home
+    except Exception:
+        pass
+    return "AWAY", "HOME"
+
+
+def _mlcard_parse_score(row):
+    txt = str(row.get("ML Sim Projected Score") or row.get("Projected Score") or "")
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", txt)
+    if len(nums) >= 2:
+        return _mlcard_num(nums[-2], np.nan), _mlcard_num(nums[-1], np.nan)
+    return np.nan, np.nan
+
+
+def _mlcard_projected_runs(row):
+    away = _mlcard_num(row.get("Away Projected Runs"), np.nan)
+    home = _mlcard_num(row.get("Home Projected Runs"), np.nan)
+    if not np.isfinite(away) or not np.isfinite(home):
+        parsed_away, parsed_home = _mlcard_parse_score(row)
+        away = parsed_away if not np.isfinite(away) else away
+        home = parsed_home if not np.isfinite(home) else home
+    return away, home
+
+
+def _mlcard_total_line(row):
+    for key in ["Total Line", "Game Total", "Vegas Total", "O/U", "OU Line", "Market Total", "Run Total"]:
+        val = _mlcard_num(row.get(key), np.nan)
+        if np.isfinite(val):
+            return val
+    return np.nan
+
+
+def _mlcard_moneyline_price(row, side):
+    prefix = "Away" if side == "AWAY" else "Home" if side == "HOME" else ""
+    if not prefix:
+        return np.nan
+    for key in [f"{prefix} Current ML Override", f"ML Real {prefix} Current ML", f"{prefix} Current ML", f"{prefix} ML", f"{prefix} Moneyline"]:
+        val = _mlcard_num(row.get(key), np.nan)
+        if np.isfinite(val):
+            return val
+    return np.nan
+
+
+def _mlcard_implied_from_american(price):
+    try:
+        px = float(price)
+        if px < 0:
+            return abs(px) / (abs(px) + 100.0) * 100.0
+        if px > 0:
+            return 100.0 / (px + 100.0) * 100.0
+    except Exception:
+        pass
+    return np.nan
+
+
+def _mlcard_side_probability(row, pick, away, home):
+    pick = str(pick or "").upper().strip()
+    if pick == away:
+        for key in ["ML Sim Away Win %", "Away Model %", "Away Win %", "Away ML %"]:
+            v = _mlcard_num(row.get(key), np.nan)
+            if np.isfinite(v):
+                return v
+    if pick == home:
+        for key in ["ML Sim Home Win %", "Home Model %", "Home Win %", "Home ML %"]:
+            v = _mlcard_num(row.get(key), np.nan)
+            if np.isfinite(v):
+                return v
+    for key in ["ML Sim Pick %", "ML True Win Confidence %", "ML Final Confidence %", "ML Confidence %"]:
+        v = _mlcard_num(row.get(key), np.nan)
+        if np.isfinite(v):
+            return v
+    return np.nan
+
+
+def _mlcard_sim_row(row, sims=10000):
+    away_team, home_team = _mlcard_matchup_teams(row)
+    away_runs, home_runs = _mlcard_projected_runs(row)
+    if not np.isfinite(away_runs):
+        away_runs = 4.3
+    if not np.isfinite(home_runs):
+        home_runs = 4.3
+    away_sp = _mlcard_num(row.get("Away SP Strength"), 50.0)
+    home_sp = _mlcard_num(row.get("Home SP Strength"), 50.0)
+    away_bp = _mlcard_num(row.get("Away Bullpen"), 50.0)
+    home_bp = _mlcard_num(row.get("Home Bullpen"), 50.0)
+    adj_away = max(0.4, min(10.5, away_runs - ((home_sp - 50.0) * 0.012) - ((home_bp - 50.0) * 0.006)))
+    adj_home = max(0.4, min(10.5, home_runs - ((away_sp - 50.0) * 0.012) - ((away_bp - 50.0) * 0.006)))
+    try:
+        rng = stable_rng("ML_CARD_AUDIT", MONEYLINE_CARD_AUDIT_VERSION, row.get("Matchup"), round(adj_away, 2), round(adj_home, 2), sims)
+    except Exception:
+        rng = _sim_stable_rng("ML_CARD_AUDIT", row.get("Matchup"), round(adj_away, 2), round(adj_home, 2), sims) if "_sim_stable_rng" in globals() else np.random.default_rng(20260723)
+    away_s = rng.poisson(adj_away, int(sims))
+    home_s = rng.poisson(adj_home, int(sims))
+    ties = away_s == home_s
+    if ties.any():
+        home_extra = rng.binomial(1, 0.53, int(ties.sum()))
+        away_s[ties] += (1 - home_extra)
+        home_s[ties] += home_extra
+    away_win = float(np.mean(away_s > home_s) * 100.0)
+    home_win = 100.0 - away_win
+    total_line = _mlcard_total_line(row)
+    total_mean = float(np.mean(away_s + home_s))
+    if np.isfinite(total_line):
+        over_total = float(np.mean((away_s + home_s) > total_line) * 100.0)
+        total_pick = "OVER" if over_total >= 50.0 else "UNDER"
+        total_prob = over_total if total_pick == "OVER" else 100.0 - over_total
+    else:
+        total_pick = "NO TOTAL"
+        total_prob = np.nan
+    away_cover_plus = float(np.mean((away_s + 1.5) > home_s) * 100.0)
+    home_cover_plus = float(np.mean((home_s + 1.5) > away_s) * 100.0)
+    away_cover_minus = float(np.mean((away_s - 1.5) > home_s) * 100.0)
+    home_cover_minus = float(np.mean((home_s - 1.5) > away_s) * 100.0)
+    return {
+        "ML Card Away Win %": round(away_win, 1),
+        "ML Card Home Win %": round(home_win, 1),
+        "ML Card Total Mean": round(total_mean, 2),
+        "ML Card Total Line": "" if not np.isfinite(total_line) else round(float(total_line), 1),
+        "ML Card Total Pick": total_pick,
+        "ML Card Total Prob %": "" if not np.isfinite(total_prob) else round(float(total_prob), 1),
+        "ML Card Away +1.5 %": round(away_cover_plus, 1),
+        "ML Card Home +1.5 %": round(home_cover_plus, 1),
+        "ML Card Away -1.5 %": round(away_cover_minus, 1),
+        "ML Card Home -1.5 %": round(home_cover_minus, 1),
+        "ML Card Sim Runs": int(sims),
+    }
+
+
+def _mlcard_profile(row):
+    away, home = _mlcard_matchup_teams(row)
+    sim = _mlcard_sim_row(row)
+    pick = str(row.get("ML Official Pick") or row.get("ML Final Pick") or row.get("Pick") or row.get("ML Sim Pick") or "").upper().strip()
+    if pick not in [away, home]:
+        pick = away if sim.get("ML Card Away Win %", 50) >= sim.get("ML Card Home Win %", 50) else home
+    pick_side = "AWAY" if pick == away else "HOME" if pick == home else ""
+    pick_prob = _mlcard_side_probability({**row, **sim}, pick, away, home)
+    if not np.isfinite(pick_prob):
+        pick_prob = sim.get("ML Card Away Win %", 50) if pick == away else sim.get("ML Card Home Win %", 50)
+    price = _mlcard_moneyline_price(row, pick_side)
+    implied = _mlcard_implied_from_american(price)
+    value = round(float(pick_prob - implied), 1) if np.isfinite(implied) else _mlcard_num(row.get("ML Value Edge %"), np.nan)
+    score_edge = abs(_mlcard_num(row.get("Score Edge"), _mlcard_num(row.get("Expected Run Differential"), 0.0)))
+    quality = _mlcard_num(row.get("ML Quality Score"), _mlcard_num(row.get("ML True Win Confidence %"), pick_prob))
+    risk_txt = str(row.get("ML Risk Reasons") or "")
+    supports_txt = str(row.get("ML Support Signals") or "")
+    risk_penalty = 0
+    if risk_txt and "signals aligned" not in risk_txt.lower():
+        risk_penalty += min(14, len([x for x in risk_txt.split(";") if x.strip()]) * 3)
+    support_bonus = min(8, len([x for x in supports_txt.split(";") if x.strip()]) * 2)
+    rating_score = float(quality) * 0.48 + float(pick_prob) * 0.35 + min(10.0, max(0.0, score_edge * 4.0)) + support_bonus - risk_penalty
+    if np.isfinite(value):
+        rating_score += max(-6.0, min(8.0, value * 0.9))
+    rating_score = round(max(35.0, min(92.0, rating_score)), 1)
+    if rating_score >= 84:
+        rating = f"ELITE {rating_score:.0f}%"
+    elif rating_score >= 76:
+        rating = f"HIGH {rating_score:.0f}%"
+    elif rating_score >= 66:
+        rating = f"MEDIUM {rating_score:.0f}%"
+    elif rating_score >= 58:
+        rating = f"TRACK {rating_score:.0f}%"
+    else:
+        rating = f"PASS {rating_score:.0f}%"
+    cover_pick = ""
+    cover_prob = np.nan
+    if pick == away:
+        cover_pick = f"{away} CVR +1.5" if sim["ML Card Away +1.5 %"] >= sim["ML Card Away -1.5 %"] else f"{away} CVR -1.5"
+        cover_prob = max(sim["ML Card Away +1.5 %"], sim["ML Card Away -1.5 %"])
+    elif pick == home:
+        cover_pick = f"{home} CVR +1.5" if sim["ML Card Home +1.5 %"] >= sim["ML Card Home -1.5 %"] else f"{home} CVR -1.5"
+        cover_prob = max(sim["ML Card Home +1.5 %"], sim["ML Card Home -1.5 %"])
+    away_runs, home_runs = _mlcard_projected_runs(row)
+    out = {
+        **sim,
+        "ML Card Best Play": f"{pick} ML" if pick else "",
+        "ML Card Best Play Prob %": round(float(pick_prob), 1),
+        "ML Card Fair Odds": _sim_prob_fair_odds(pick_prob) if "_sim_prob_fair_odds" in globals() else _ow_american_from_prob(pick_prob),
+        "ML Card Market Price": "" if not np.isfinite(price) else int(price),
+        "ML Card Value Edge %": "" if not np.isfinite(value) else value,
+        "ML Card Cover Lean": cover_pick,
+        "ML Card Cover Prob %": "" if not np.isfinite(cover_prob) else round(float(cover_prob), 1),
+        "ML Card Rating": rating,
+        "ML Card Rating Score": rating_score,
+        "ML Card Away Projected Runs": "" if not np.isfinite(away_runs) else round(float(away_runs), 1),
+        "ML Card Home Projected Runs": "" if not np.isfinite(home_runs) else round(float(home_runs), 1),
+        "ML Card Version": MONEYLINE_CARD_AUDIT_VERSION,
+    }
+    return out
+
+
+def _mlcard_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_mlcard_profile(row))
+        except Exception as e:
+            row["ML Card Version"] = MONEYLINE_CARD_AUDIT_VERSION
+            row["ML Card Error"] = str(e)[:120]
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    try:
+        out["_mlcard_sort"] = pd.to_numeric(out.get("ML Card Rating Score"), errors="coerce").fillna(-999)
+        out = out.sort_values("_mlcard_sort", ascending=False).drop(columns=["_mlcard_sort"])
+    except Exception:
+        pass
+    return out
+
+
+_MLCARD_PREV_BUILD_BOARD = ml_build_board if "ml_build_board" in globals() else None
+
+
+def ml_build_board(board):
+    if _MLCARD_PREV_BUILD_BOARD is None:
+        return pd.DataFrame()
+    return _mlcard_apply(_MLCARD_PREV_BUILD_BOARD(board))
+
+
+_MLCARD_PREV_RENDER = render_moneyline_edge_tab if "render_moneyline_edge_tab" in globals() else None
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    if _MLCARD_PREV_RENDER is not None:
+        _MLCARD_PREV_RENDER(board, dates)
+    else:
+        st.markdown("### Moneyline Edge")
+    try:
+        df = ml_build_board(board)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">Moneyline Card Audit - Win Prob / Total / Cover</div>', unsafe_allow_html=True)
+            st.caption("Final ML audit modeled after the card view: team projected runs, win probability, best ML side, cover lean, total lean, fair odds, and overall rating.")
+            cols = [c for c in [
+                "Matchup", "ML Card Rating", "ML Card Best Play", "ML Card Best Play Prob %",
+                "ML Card Fair Odds", "ML Card Market Price", "ML Card Value Edge %",
+                "ML Card Away Projected Runs", "ML Card Home Projected Runs",
+                "ML Card Away Win %", "ML Card Home Win %",
+                "ML Card Cover Lean", "ML Card Cover Prob %",
+                "ML Card Total Pick", "ML Card Total Prob %", "ML Card Total Mean", "ML Card Total Line",
+                "Pick", "ML Official Tier", "ML Quality Score", "ML Risk Reasons", "ML Support Signals",
+                "ML Card Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Moneyline card audit unavailable: {e}")
+
+
 
 tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
