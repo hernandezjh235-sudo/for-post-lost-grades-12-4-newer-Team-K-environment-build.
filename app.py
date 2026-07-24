@@ -30605,9 +30605,24 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
         ]
         bad_terms = [
             "strikeout", "strikeouts", "earned run", "earned runs", "er allowed",
-            "hits allowed", "walks", "fantasy", "batters faced", "h+r", "rbis"
+            "hits allowed", "walks", "fantasy", "batters faced", "h+r", "rbis",
+            "pitch count", "pitchcount", "first inning", "1st inning", "1st inn",
+            "first-inning", "1st-inning", "inning 1 pitches", "1st inning pitches"
         ]
         lo, hi = 6.5, 24.5
+    elif mk in ["FI_PITCHES", "FIRST_INNING_PITCH_COUNT", "1ST_INNING_PITCH_COUNT"]:
+        market_label = "1st Inning Pitch Count"
+        market_terms = [
+            "1st inning pitch count", "first inning pitch count", "1st-inning pitch count",
+            "first-inning pitch count", "1st inning pitches", "first inning pitches",
+            "inning 1 pitch count", "1st inn pitch count"
+        ]
+        bad_terms = [
+            "pitching outs", "pitcher outs", "outs recorded", "recorded outs",
+            "strikeout", "strikeouts", "earned run", "earned runs", "hits allowed",
+            "walks allowed", "fantasy points", "batters faced"
+        ]
+        lo, hi = 5.5, 35.5
     else:
         market_label = "Earned Runs Allowed"
         market_terms = [
@@ -30821,7 +30836,10 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
             return False
         # Outs can safely infer from 10.5+ pitcher prop lines when player matches strongly.
         if mk == "OUTS" and line is not None and line >= 10.5:
-            if not any(x in low for x in ["strikeout", "earned", "hit", "walk", "fantasy"]):
+            if not any(x in low for x in [
+                "strikeout", "earned", "hit", "walk", "fantasy", "pitch count",
+                "pitchcount", "first inning", "1st inning", "1st inn", "first-inning", "1st-inning"
+            ]):
                 return True
         return any(t in low for t in market_terms)
 
@@ -31032,7 +31050,12 @@ def _beta_projection_rows(board, market_kind="OUTS"):
 
 
 def _beta_market_slug(market_kind):
-    return "outs" if str(market_kind).upper() == "OUTS" else "er_allowed"
+    mk = str(market_kind or "").upper()
+    if mk == "OUTS":
+        return "outs"
+    if mk in ["FI_PITCHES", "FIRST_INNING_PITCH_COUNT", "1ST_INNING_PITCH_COUNT"]:
+        return "first_inning_pitch_count"
+    return "er_allowed"
 
 def _beta_market_dir():
     d = Path("mlb_engine")
@@ -37700,9 +37723,732 @@ def render_moneyline_edge_tab(board, dates=None):
 
 
 
-tab_kproj, tab_beta_outs, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# ============================================================
+# 1ST INNING PITCH COUNT — ISOLATED MODEL + UNDERDOG TAB
+# Added 2026-07-23. Does not change K or Pitching Outs projection math.
+# ============================================================
+FIRST_INNING_PC_VERSION = "FI_PITCH_COUNT_V2_2026_07_23"
+FI_SIMULATIONS = 10000
+
+
+def _fi_num(v, default=None):
+    try:
+        if v in [None, "", "—"]:
+            return default
+        x = float(v)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _fi_first(row, keys, default=None):
+    for k in keys:
+        if isinstance(row, dict) and k in row:
+            v = row.get(k)
+            if v not in [None, "", "—"]:
+                return v
+    return default
+
+
+def _fi_pct(v, default):
+    x = _fi_num(v, default)
+    if x is None:
+        return default
+    return x / 100.0 if x > 1 else x
+
+
+def _fi_history_detail(pitcher_id=None, pitcher_name=None, line=None, results=None):
+    """Recent/season first-inning pitch-count distribution from our graded result log."""
+    results = load_json(RESULT_LOG, []) if results is None else (results or [])
+    pid_s = str(pitcher_id) if pitcher_id is not None else ""
+    name_s = str(pitcher_name or "").strip().lower()
+    vals = []
+    for r in results:
+        try:
+            rid = str(r.get("pitcher_id") or r.get("Pitcher ID") or "")
+            rn = str(r.get("pitcher") or r.get("Pitcher") or "").strip().lower()
+            if pid_s and rid:
+                if rid != pid_s:
+                    continue
+            elif name_s and rn != name_s:
+                continue
+            fp = _fi_num(r.get("first_inning_pitches_actual"), None)
+            if fp is None:
+                continue
+            dt = str(r.get("date") or r.get("game_date") or r.get("graded_at") or "")
+            vals.append((dt, float(fp)))
+        except Exception:
+            continue
+    # Dates are ISO-like throughout this app; descending lexical sort is adequate here.
+    vals = sorted(vals, key=lambda x: x[0], reverse=True)
+    pitches = [x[1] for x in vals]
+    def avg(xs): return None if not xs else round(float(np.mean(xs)), 2)
+    def med(xs): return None if not xs else round(float(np.median(xs)), 2)
+    l5, l10 = pitches[:5], pitches[:10]
+    exact_u = exact_o = None
+    if line is not None and pitches:
+        exact_u = round(sum(v < float(line) for v in pitches) / len(pitches) * 100.0, 1)
+        exact_o = round(sum(v > float(line) for v in pitches) / len(pitches) * 100.0, 1)
+    return {
+        "samples": len(pitches), "values": pitches,
+        "l5_avg": avg(l5), "l10_avg": avg(l10), "season_avg": avg(pitches),
+        "median": med(pitches),
+        "sd": None if len(pitches) < 2 else round(float(np.std(pitches, ddof=1)), 2),
+        "under_line_pct": exact_u, "over_line_pct": exact_o,
+    }
+
+
+def _fi_top_order_profile(p):
+    """Top-of-order context. Uses batter-specific rows where available, then safe team fallbacks."""
+    rows = [r for r in (p.get("lineup_rows") or []) if isinstance(r, dict)] if isinstance(p, dict) else []
+    rows = sorted(rows, key=lambda r: _fi_num(r.get("Order"), 99))[:4]
+    kvals = []
+    for r in rows:
+        kv = _fi_pct(_fi_first(r, ["Raw_K_Rate", "Used K%", "Split K%", "Season K%"], None), None)
+        if kv is not None:
+            kvals.append(kv)
+    top_k = float(np.mean(kvals)) if kvals else _fi_pct(_fi_first(p, ["opp_k_rate", "Opp K%", "Opponent K%"], 0.225), 0.225)
+    opp_bb = _fi_pct(_fi_first(p, ["opp_bb_rate", "Opp BB%", "Opponent BB%", "Team BB%"], 0.082), 0.082)
+    opp_obp = _fi_num(_fi_first(p, ["opp_obp", "Opp OBP", "Opponent OBP"], 0.318), 0.318)
+    opp_ppa = _fi_num(_fi_first(p, ["opp_ppa", "Opp PPA", "Opponent Pitches Per PA", "Pitches/PA"], 3.92), 3.92)
+    lineup_status = str(_fi_first(p, ["lineup_status", "Lineup Status", "projection_source", "Projection Source"], "UNKNOWN"))
+    confirmed = any(x in lineup_status.upper() for x in ["CONFIRMED", "LOCKED", "OFFICIAL"])
+    return {
+        "top4_k": top_k, "opp_bb": opp_bb, "opp_obp": opp_obp, "opp_ppa": max(3.45, min(4.55, opp_ppa)),
+        "top4_count": len(rows), "lineup_status": lineup_status, "lineup_confirmed": confirmed,
+    }
+
+
+def _fi_base_inputs(p, line=None):
+    pid = _fi_first(p, ["pitcher_id", "Pitcher ID", "id"], None)
+    name = _fi_first(p, ["pitcher", "Pitcher", "Player", "name"], "UNKNOWN")
+    hist = _fi_history_detail(pid, name, line=line)
+    top = _fi_top_order_profile(p)
+
+    k_rate = _fi_pct(_fi_first(p, ["pitcher_k_rate", "K%", "Season K%", "k_rate"], 0.225), 0.225)
+    bb_rate = _fi_pct(_fi_first(p, ["pitcher_bb_rate", "BB%", "Season BB%", "bb_rate"], 0.080), 0.080)
+    whiff = _fi_pct(_fi_first(p, ["whiff_rate", "Whiff %", "Whiff%", "swstr_rate"], 0.275), 0.275)
+    first_strike = _fi_pct(_fi_first(p, ["first_strike_rate", "First Strike %", "First-Strike %"], 0.610), 0.610)
+    zone = _fi_pct(_fi_first(p, ["zone_rate", "Zone %", "In Zone %"], 0.500), 0.500)
+
+    recent_pitch = _fi_num(_fi_first(p, ["pitch_count_avg_l3", "Pitch Count Avg L3", "pitch_count_avg_l5"], None), None)
+    expected_bf_game = _fi_num(_fi_first(p, ["expected_bf", "Expected BF", "bf_projection", "BF"], None), None)
+    pitcher_ppa = None
+    if recent_pitch is not None and expected_bf_game is not None and expected_bf_game >= 15:
+        pitcher_ppa = recent_pitch / expected_bf_game
+    if pitcher_ppa is None:
+        pitcher_ppa = _fi_num(_fi_first(p, ["Pitches/PA", "Pitches Per PA", "Pitch/PA"], 3.95), 3.95)
+
+    # Pitcher and today's top-of-order both influence how long each PA lasts.
+    ppa = 0.58 * max(3.45, min(4.75, pitcher_ppa)) + 0.42 * top["opp_ppa"]
+    ppa += max(-0.16, min(0.22, (bb_rate - 0.08) * 2.8))
+    ppa += max(-0.14, min(0.16, (0.61 - first_strike) * 1.4))
+    ppa += max(-0.10, min(0.12, (0.50 - zone) * 1.0))
+    ppa = max(3.40, min(4.85, ppa))
+
+    # Approximate per-PA reach probability. OBP is the anchor, with command and top-order K context.
+    reach = top["opp_obp"]
+    reach += (bb_rate - 0.080) * 0.80 + (top["opp_bb"] - 0.082) * 0.55
+    reach -= (k_rate - 0.225) * 0.20 + (top["top4_k"] - 0.225) * 0.12
+    reach = max(0.22, min(0.43, reach))
+
+    return {
+        "pid": pid, "name": name, "history": hist, "top": top,
+        "k_rate": k_rate, "bb_rate": bb_rate, "whiff": whiff, "first_strike": first_strike, "zone": zone,
+        "ppa": ppa, "reach": reach,
+    }
+
+
+def _fi_simulate(p, line=None, n=FI_SIMULATIONS):
+    """Monte Carlo first-inning workload simulation. Deterministic per pitcher/date for stable UI."""
+    inp = _fi_base_inputs(p, line=line)
+    seed_text = f"{inp['name']}|{_fi_first(p,['date','Date'],'')}|{line}|{FIRST_INNING_PC_VERSION}"
+    import hashlib
+    seed = int(hashlib.sha256(seed_text.encode("utf-8")).hexdigest()[:8], 16)
+    rng = np.random.default_rng(seed)
+    totals = np.zeros(int(n), dtype=float)
+    bfs = np.zeros(int(n), dtype=float)
+    clean = 0
+    for i in range(int(n)):
+        outs = 0; bf = 0; pitches = 0.0; reached = 0
+        while outs < 3 and bf < 10:
+            bf += 1
+            # PA pitch distribution centered on today's blended P/PA. Walk-prone profiles get a slightly fatter tail.
+            pa_sd = 1.48 + max(0.0, inp["bb_rate"] - 0.08) * 3.0
+            pc = int(round(rng.normal(inp["ppa"], pa_sd)))
+            pc = max(1, min(12, pc))
+            # Ks typically consume a little more count depth than balls in play; first-strike skill offsets it.
+            if rng.random() < inp["k_rate"]:
+                pc = max(3, pc + (1 if rng.random() < 0.35 else 0))
+            if inp["first_strike"] >= 0.64 and rng.random() < 0.24:
+                pc = max(1, pc - 1)
+            pitches += pc
+            if rng.random() < inp["reach"]:
+                reached += 1
+            else:
+                outs += 1
+        totals[i] = pitches
+        bfs[i] = bf
+        if bf == 3 and reached == 0:
+            clean += 1
+
+    sim_mean = float(np.mean(totals)); sim_med = float(np.median(totals)); sim_sd = float(np.std(totals))
+    hist = inp["history"]; hs = hist["samples"]
+    # Actual FI logs become primary only after a meaningful sample develops.
+    hist_w = 0.0
+    if hist.get("season_avg") is not None:
+        hist_w = min(0.38, max(0.08, hs * 0.035))
+    projection = sim_mean * (1.0 - hist_w) + (hist.get("season_avg") or sim_mean) * hist_w
+    if hist.get("l10_avg") is not None and hs >= 5:
+        projection = projection * 0.90 + hist["l10_avg"] * 0.10
+
+    # Probability blends simulated distribution with exact-line history as history matures.
+    over_sim = under_sim = None
+    if line is not None:
+        under_sim = float(np.mean(totals < float(line))) * 100.0
+        over_sim = float(np.mean(totals > float(line))) * 100.0
+        hist_prob_w = min(0.30, hs * 0.025)
+        if hist.get("under_line_pct") is not None:
+            under_sim = under_sim * (1-hist_prob_w) + hist["under_line_pct"] * hist_prob_w
+            over_sim = over_sim * (1-hist_prob_w) + hist["over_line_pct"] * hist_prob_w
+
+    return {
+        "Projection": round(max(7.0, min(30.0, projection)), 2),
+        "Median": round(sim_med, 1),
+        "P10": round(float(np.percentile(totals, 10)), 1), "P90": round(float(np.percentile(totals, 90)), 1),
+        "Sim SD": round(sim_sd, 2), "Expected BF 1st": round(float(np.mean(bfs)), 2),
+        "Expected Pitches/PA": round(inp["ppa"], 2), "1-2-3 Inning %": round(clean / n * 100.0, 1),
+        "Under %": None if under_sim is None else round(under_sim, 1), "Over %": None if over_sim is None else round(over_sim, 1),
+        "Reach/PA %": round(inp["reach"]*100, 1), "Top4 K%": round(inp["top"]["top4_k"]*100, 1),
+        "Top4 Count": inp["top"]["top4_count"], "Lineup Status": inp["top"]["lineup_status"], "Lineup Confirmed": inp["top"]["lineup_confirmed"],
+        "FI Samples": hs, "FI L5 Avg": hist.get("l5_avg"), "FI L10 Avg": hist.get("l10_avg"),
+        "FI Season Avg": hist.get("season_avg"), "FI Median": hist.get("median"), "FI Hist SD": hist.get("sd"),
+        "FI Under Line %": hist.get("under_line_pct"), "FI Over Line %": hist.get("over_line_pct"),
+        "History Weight": round(hist_w, 2),
+    }
+
+
+def _fi_probability(proj, line, sigma=4.25, sim_profile=None):
+    if proj is None or line is None:
+        return None, None
+    if isinstance(sim_profile, dict):
+        over = _fi_num(sim_profile.get("Over %"), None)
+        under = _fi_num(sim_profile.get("Under %"), None)
+        if over is not None and under is not None:
+            if proj > line:
+                return "OVER", round(over, 1)
+            if proj < line:
+                return "UNDER", round(under, 1)
+            return "PASS", 50.0
+    sigma = max(2.75, float(sigma or 4.25))
+    z = (float(line) - float(proj)) / sigma
+    under = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    over = 1.0 - under
+    return ("OVER", round(over*100,1)) if proj > line else (("UNDER", round(under*100,1)) if proj < line else ("PASS",50.0))
+
+
+def _fi_projection_profile(p, line=None):
+    sim = _fi_simulate(p, line=line)
+    samples = int(sim.get("FI Samples") or 0)
+    confidence = 48
+    confidence += min(18, samples * 2)
+    confidence += 7 if sim.get("Lineup Confirmed") else -5
+    confidence += 4 if sim.get("Top4 Count", 0) >= 4 else -3
+    hist_sd = _fi_num(sim.get("FI Hist SD"), None)
+    if hist_sd is not None:
+        confidence += 5 if hist_sd <= 4.0 else (-5 if hist_sd >= 7.0 else 0)
+    confidence = int(max(25, min(90, confidence)))
+    sim["FI Confidence Score"] = confidence
+    sim["FI Confidence"] = "HIGH" if confidence >= 75 else ("MEDIUM" if confidence >= 58 else "LOW")
+    sim["Sigma"] = max(2.8, min(6.5, _fi_num(sim.get("Sim SD"), 4.25)))
+    return sim
+
+def build_first_inning_pitch_count_board(board):
+    rows = []
+    for p in board or []:
+        try:
+            name = _fi_first(p, ["pitcher", "Pitcher", "Player", "name"], None)
+            if not name:
+                continue
+            line_info = _beta_fetch_underdog_pitcher_market(str(name), "FI_PITCHES")
+            line = _fi_num(line_info.get("line"), None)
+            prof = _fi_projection_profile(p, line=line)
+            side, prob = _fi_probability(prof.get("Projection"), line, prof.get("Sigma"), sim_profile=prof)
+            edge = None if line is None else round(float(prof["Projection"]) - float(line), 2)
+            abs_edge = abs(edge) if edge is not None else 0.0
+            if line is None:
+                decision = "NO LINE"
+            elif prob is not None and prob >= 62 and abs_edge >= 1.75:
+                decision = f"🔥 {side}"
+            elif prob is not None and prob >= 57 and abs_edge >= 1.00:
+                decision = f"⚠️ {side}"
+            else:
+                decision = f"PASS {side}" if side in ["OVER", "UNDER"] else "PASS"
+            rows.append({
+                "Pitcher": name,
+                "Matchup": _fi_first(p, ["matchup", "Matchup"], ""),
+                "UD Line": line if line is not None else "—",
+                "Projection": prof.get("Projection"),
+                "Pick": decision,
+                "Edge": edge if edge is not None else "—",
+                "Hit %": prob if prob is not None else "—",
+                "Expected BF 1st": prof.get("Expected BF 1st"),
+                "Expected Pitches/PA": prof.get("Expected Pitches/PA"),
+                "1-2-3 Inning %": prof.get("1-2-3 Inning %"),
+                "Median": prof.get("Median"),
+                "P10-P90": f"{prof.get('P10')}–{prof.get('P90')}",
+                "L5 FI Avg": prof.get("FI L5 Avg") if prof.get("FI L5 Avg") is not None else "—",
+                "L10 FI Avg": prof.get("FI L10 Avg") if prof.get("FI L10 Avg") is not None else "—",
+                "Season FI Avg": prof.get("FI Season Avg") if prof.get("FI Season Avg") is not None else "—",
+                "FI Median": prof.get("FI Median") if prof.get("FI Median") is not None else "—",
+                "FI Hist SD": prof.get("FI Hist SD") if prof.get("FI Hist SD") is not None else "—",
+                "FI Exact-Line O%": prof.get("FI Over Line %") if prof.get("FI Over Line %") is not None else "—",
+                "FI Exact-Line U%": prof.get("FI Under Line %") if prof.get("FI Under Line %") is not None else "—",
+                "FI Samples": prof.get("FI Samples"),
+                "Top4 K%": prof.get("Top4 K%"),
+                "Top4 Count": prof.get("Top4 Count"),
+                "Lineup Status": prof.get("Lineup Status"),
+                "Lineup Confirmed": prof.get("Lineup Confirmed"),
+                "Reach/PA %": prof.get("Reach/PA %"),
+                "FI Confidence": prof.get("FI Confidence"),
+                "FI Confidence Score": prof.get("FI Confidence Score"),
+                "Line Status": line_info.get("status"),
+                "Line Debug": line_info.get("debug_lines") or line_info.get("message"),
+                "Version": FIRST_INNING_PC_VERSION,
+            })
+        except Exception as e:
+            rows.append({"Pitcher": str(_fi_first(p, ["pitcher", "Pitcher"], "UNKNOWN")), "Error": str(e)[:160], "Version": FIRST_INNING_PC_VERSION})
+    return pd.DataFrame(rows)
+
+
+def render_first_inning_pitch_count_tab(board):
+    st.markdown('<div class="section-title-pro">⚾ 1st Inning Pitch Count</div>', unsafe_allow_html=True)
+    st.caption("V2 first-inning model: 10,000 simulations + true FI history + top-of-order context. Completely separated from Pitching Outs and K projections.")
+    df = build_first_inning_pitch_count_board(board)
+    if df.empty:
+        st.info("No first-inning pitch-count rows yet. Refresh the main board first.")
+        return
+    found = int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0
+    plays = int(df["Pick"].astype(str).str.startswith(("🔥", "⚠️")).sum()) if "Pick" in df.columns else 0
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pitchers", len(df)); c2.metric("UD FI Lines", found); c3.metric("Model Plays", plays)
+    if st.button("💾 Save 1st Inning Official Board", key="save_fi_pc_board", use_container_width=True):
+        ok, msg = _beta_save_official_board(df, "FI_PITCHES")
+        (st.success if ok else st.warning)(msg)
+    cols = [c for c in ["Pitcher","Matchup","UD Line","Projection","Pick","Edge","Hit %","Median","P10-P90","Expected BF 1st","Expected Pitches/PA","1-2-3 Inning %","L5 FI Avg","L10 FI Avg","Season FI Avg","FI Samples","Top4 K%","Lineup Confirmed","FI Confidence","FI Confidence Score","Line Status"] if c in df.columns]
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    with st.expander("1st Inning Model Debug", expanded=False):
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# MONEYLINE MOBILE MATCHUP CARDS — DISPLAY ONLY
+# Underlying Moneyline math is unchanged.
+# ============================================================
+_ML_TEAM_IDS = {"ARI":109,"ATL":144,"BAL":110,"BOS":111,"CHC":112,"CWS":145,"CHW":145,"CIN":113,"CLE":114,"COL":115,"DET":116,"HOU":117,"KC":118,"KCR":118,"LAA":108,"LAD":119,"MIA":146,"MIL":158,"MIN":142,"NYM":121,"NYY":147,"ATH":133,"OAK":133,"PHI":143,"PIT":134,"SD":135,"SDP":135,"SEA":136,"SF":137,"SFG":137,"STL":138,"TB":139,"TBR":139,"TEX":140,"TOR":141,"WSH":120,"WAS":120}
+
+
+def _ml_ui_logo(team):
+    tid = _ML_TEAM_IDS.get(str(team or "").upper())
+    return f"https://www.mlbstatic.com/team-logos/{tid}.svg" if tid else ""
+
+
+def _ml_ui_val(row, *keys, default="—"):
+    for k in keys:
+        if k in row and row.get(k) not in [None, "", "nan"]:
+            return row.get(k)
+    return default
+
+
+def _ml_ui_pct(v, default=50.0):
+    x = _fi_num(v, default)
+    return default if x is None else max(0.0, min(100.0, float(x)))
+
+
+def _render_ml_matchup_card(row):
+    away, home = _mlcard_matchup_teams(row) if "_mlcard_matchup_teams" in globals() else ("AWAY", "HOME")
+    away = str(away or "AWAY").upper(); home = str(home or "HOME").upper()
+    ap = _ml_ui_pct(_ml_ui_val(row, "ML Card Away Win %", "Away Model %", default=50))
+    hp = _ml_ui_pct(_ml_ui_val(row, "ML Card Home Win %", "Home Model %", default=100-ap))
+    ar = _fi_num(_ml_ui_val(row, "ML Card Away Projected Runs", "Away Projected Runs", default=None), None)
+    hr = _fi_num(_ml_ui_val(row, "ML Card Home Projected Runs", "Home Projected Runs", default=None), None)
+    rating = html.escape(str(_ml_ui_val(row, "ML Card Rating", "ML Official Tier", "ML Grade", default="MODEL")))
+    best = html.escape(str(_ml_ui_val(row, "ML Card Best Play", "Pick", default="PASS")))
+    bestp = _ml_ui_val(row, "ML Card Best Play Prob %", "ML True Win Confidence %", default=max(ap,hp))
+    total_pick = html.escape(str(_ml_ui_val(row, "ML Card Total Pick", default="TOTAL —")))
+    total_prob = _ml_ui_val(row, "ML Card Total Prob %", default="—")
+    cover = html.escape(str(_ml_ui_val(row, "ML Card Cover Lean", default="RUN LINE —")))
+    cover_prob = _ml_ui_val(row, "ML Card Cover Prob %", default="—")
+    asp_name = str(_ml_ui_val(row, "Away SP", default="—")); hsp_name = str(_ml_ui_val(row, "Home SP", default="—"))
+    asp_cls = str(_ml_ui_val(row, "Away Pitcher Class", default="")); hsp_cls = str(_ml_ui_val(row, "Home Pitcher Class", default=""))
+    asp = html.escape(asp_name + (f" • {asp_cls}" if asp_cls else "")); hsp = html.escape(hsp_name + (f" • {hsp_cls}" if hsp_cls else ""))
+    aprice = _ml_ui_val(row, "Away Price", default="—"); hprice = _ml_ui_val(row, "Home Price", default="—")
+    alogo, hlogo = _ml_ui_logo(away), _ml_ui_logo(home)
+    ar_txt = "—" if ar is None else f"{ar:.1f}"; hr_txt = "—" if hr is None else f"{hr:.1f}"
+    matchup = html.escape(str(_ml_ui_val(row, "Matchup", default=f"{away} @ {home}")))
+    status = html.escape(str(_ml_ui_val(row, "Status", default="")))
+    logo_a = f'<img class="ow-ml-logo" src="{alogo}" />' if alogo else f'<div class="ow-ml-fallback">{away}</div>'
+    logo_h = f'<img class="ow-ml-logo" src="{hlogo}" />' if hlogo else f'<div class="ow-ml-fallback">{home}</div>'
+    st.markdown(f'''
+    <div class="ow-ml-card">
+      <div class="ow-ml-top"><span>{matchup}</span><span class="ow-ml-rating">⚡ {rating}</span></div>
+      <div class="ow-ml-teams"><div class="ow-ml-team">{logo_a}<div class="ow-ml-abbr">{away}</div><div class="ow-ml-sp">{asp}</div></div><div class="ow-ml-vs">@</div><div class="ow-ml-team">{logo_h}<div class="ow-ml-abbr">{home}</div><div class="ow-ml-sp">{hsp}</div></div></div>
+      <div class="ow-ml-prob-label"><b>{ap:.0f}%</b><span>WIN PROBABILITY</span><b>{hp:.0f}%</b></div>
+      <div class="ow-ml-prob"><div class="ow-ml-prob-a" style="width:{ap:.1f}%"></div><div class="ow-ml-prob-h" style="width:{hp:.1f}%"></div></div>
+      <div class="ow-ml-score"><div><small>{away}</small><b>{ar_txt}</b><em>{aprice}</em></div><span>PROJ</span><div><small>{home}</small><b>{hr_txt}</b><em>{hprice}</em></div></div>
+      <div class="ow-ml-best"><div><small>⚡ BEST PLAY</small><strong>{best}</strong></div><b>{bestp}%</b></div>
+      <div class="ow-ml-mini"><div><strong>{total_pick}</strong><span>{total_prob}%</span></div><div><strong>{cover}</strong><span>{cover_prob}%</span></div></div>
+      <div class="ow-ml-foot">{status}</div>
+    </div>''', unsafe_allow_html=True)
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge")
+    st.caption("Same Moneyline engine — redesigned mobile matchup cards. Model math, probabilities, gates and picks are unchanged by this renderer.")
+    df = ml_build_board(board)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No ML board yet. Refresh the K board first.")
+        return
+    st.markdown('''<style>
+    .ow-ml-card{background:#090c12;border:1px solid #232b39;border-radius:18px;padding:14px;margin:12px 0 18px;color:#f5f7fb}.ow-ml-top{display:flex;justify-content:space-between;gap:8px;font-size:.78rem;color:#8d97a8;margin-bottom:10px}.ow-ml-rating{border:1px solid #9d8618;border-radius:999px;padding:4px 9px;color:#f4d84a;font-weight:800;white-space:nowrap}.ow-ml-teams{display:grid;grid-template-columns:1fr 30px 1fr;align-items:center;text-align:center}.ow-ml-logo{width:72px;height:72px;object-fit:contain}.ow-ml-fallback{font-size:1.7rem;font-weight:900;padding:18px}.ow-ml-abbr{font-size:1rem;font-weight:900;margin-top:4px}.ow-ml-sp{font-size:.72rem;color:#aab3c2}.ow-ml-vs{color:#485064;font-weight:800}.ow-ml-prob-label{display:flex;justify-content:space-between;align-items:center;font-size:.78rem;margin:13px 0 4px}.ow-ml-prob-label span{color:#667085;font-size:.62rem}.ow-ml-prob{height:4px;background:#1a1e27;display:flex;border-radius:6px;overflow:hidden}.ow-ml-prob-a{background:#2f6fed}.ow-ml-prob-h{background:#c22b45}.ow-ml-score{display:grid;grid-template-columns:1fr 50px 1fr;text-align:center;align-items:center;padding:13px 0}.ow-ml-score div{display:grid}.ow-ml-score small{color:#9aa3b2;font-weight:800}.ow-ml-score b{font-size:2rem}.ow-ml-score em{font-style:normal;color:#7f8a9d;font-size:.72rem}.ow-ml-score span{color:#444b5b;font-size:.62rem}.ow-ml-best{border:1px solid #175bb7;border-radius:14px;padding:11px 13px;display:flex;justify-content:space-between;align-items:center}.ow-ml-best div{display:grid}.ow-ml-best small{color:#8a95a7}.ow-ml-best strong{font-size:1.45rem}.ow-ml-best>b{font-size:1.65rem}.ow-ml-mini{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.ow-ml-mini div{border:1px solid #273348;border-radius:11px;padding:9px;display:flex;justify-content:space-between;gap:8px;font-size:.8rem}.ow-ml-mini span{color:#9ba5b5}.ow-ml-foot{font-size:.65rem;color:#687386;margin-top:9px}@media(max-width:600px){.ow-ml-logo{width:62px;height:62px}.ow-ml-score b{font-size:1.75rem}.ow-ml-best strong{font-size:1.25rem}}
+    </style>''', unsafe_allow_html=True)
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Games",len(df)); c2.metric("Playable",int((df["Status"]=="PLAYABLE").sum()) if "Status" in df else 0); c3.metric("Leans",int((df["Status"]=="LEAN").sum()) if "Status" in df else 0); c4.metric("Pass",int((df["Status"]=="PASS").sum()) if "Status" in df else 0)
+    filt=st.radio("Display",["ALL","🔥 ELITE/HIGH","PLAYABLE","LEAN","PASS"],horizontal=True,key="ml_mobile_filter")
+    show=df.copy()
+    if filt=="🔥 ELITE/HIGH" and "ML Card Rating" in show.columns:
+        show=show[show["ML Card Rating"].astype(str).str.contains("ELITE|HIGH",case=False,regex=True)]
+    elif filt in ["PLAYABLE","LEAN","PASS"] and "Status" in show.columns:
+        show=show[show["Status"].astype(str).str.upper().eq(filt)]
+    for _,rr in show.head(15).iterrows():
+        _render_ml_matchup_card(rr.to_dict())
+    with st.expander("Moneyline Model Details / Audit", expanded=False):
+        cols=[c for c in ["Matchup","Pick","Status","ML Grade","Projected Score","ML Edge %","Away Model %","Home Model %","Game Volatility","Away SP","Away Pitcher Class","Away Sample Class","Away Experience Gate","Home SP","Home Pitcher Class","Home Sample Class","Home Experience Gate","ML SP Sample Guardrail","Away Top6 Lineup","Home Top6 Lineup","Away Opp Bullpen Runs","Home Opp Bullpen Runs","Away Power Rating","Home Power Rating","ML Card Rating","ML Card Total Pick","ML Card Cover Lean","Moneyline Final Version"] if c in df.columns]
+        st.dataframe(df[cols] if cols else df,use_container_width=True,hide_index=True)
+
+
+
+
+# ============================================================
+# PITCHER EXPERIENCE / ROOKIE / ELITE GUARDRAIL — ALL PITCHER TABS
+# Added 2026-07-23. Shared conservative context layer for K, Pitching Outs,
+# 1st Inning Pitch Count, Pitcher Fantasy, and Moneyline starting pitchers.
+# It NEVER gives a direct "elite = over" boost. It changes trust/confidence,
+# sample-size treatment, and risk labels so rookies/limited samples are not
+# treated like established veterans.
+# ============================================================
+PITCHER_CONTEXT_VERSION = "PITCHER_CONTEXT_ALL_TABS_V1_2026_07_23"
+
+
+def _pcx_pick(row, keys, default=None):
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+    row = row or {}
+    for k in keys:
+        if k in row:
+            v = row.get(k)
+            if v not in [None, "", "—", "nan", "NaN"]:
+                return v
+    return default
+
+
+def _pcx_num(v, default=None):
+    try:
+        if v in [None, "", "—", "nan", "NaN"]:
+            return default
+        x = float(str(v).replace("%", "").replace(",", "").strip())
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _pcx_norm_pct(v, default=None):
+    x = _pcx_num(v, default)
+    if x is None:
+        return None
+    return x / 100.0 if x > 1.0 else x
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _pcx_player_id(name):
+    try:
+        return _mlb_search_player_id_by_name(str(name or "").strip())
+    except Exception:
+        return None
+
+
+def _pcx_profile_from_row(row):
+    """Build the small profile expected by the existing stability classifier."""
+    row = row.to_dict() if isinstance(row, pd.Series) else (row or {})
+    k_pct = _pcx_norm_pct(_pcx_pick(row, ["Pitcher K%", "K%", "Season K%", "K Rate", "K Rate %"], None), None)
+    k9 = _pcx_num(_pcx_pick(row, ["K/9", "K9", "Season K/9"], None), None)
+    ip = _pcx_num(_pcx_pick(row, ["Season IP", "IP", "Pitcher IP", "IP Season"], None), None)
+    avg_ip = _pcx_num(_pcx_pick(row, ["AVG IP", "Avg IP", "L5 Avg IP", "Recent Avg IP", "IP Projection"], None), None)
+    return {"Pitcher K%": k_pct, "K/9": k9, "IP": ip, "AVG IP": avg_ip}
+
+
+def _pcx_context(row, name=None, player_id=None):
+    row = row.to_dict() if isinstance(row, pd.Series) else (row or {})
+    name = name or _pcx_pick(row, ["Pitcher", "pitcher", "Player", "name", "Away SP", "Home SP"], "")
+    pid = player_id or _pcx_pick(row, ["Pitcher ID", "pitcher_id", "player_id", "Player ID", "MLB ID"], None)
+    if not pid and name:
+        pid = _pcx_player_id(name)
+    profile = _pcx_profile_from_row(row)
+    leash = {"recent_ip": _pcx_num(_pcx_pick(row, ["Recent Avg IP", "L5 Avg IP", "AVG IP", "IP Projection", "Beta IP"], None), None)}
+    try:
+        ctx = build_pitcher_experience_stability_layer(pid, profile=profile, recent_rows=[], leash=leash)
+    except Exception:
+        ctx = {"label": "UNKNOWN_SAMPLE", "score": 45.0, "bf_factor": 1.0, "years_mlb": None, "note": "experience lookup unavailable"}
+
+    blob = " ".join(str(row.get(k) or "") for k in [
+        "risk_notes", "Risk Notes", "No-Bet Risk Flags", "role_label", "Role", "starter_status",
+        "Status", "Data Flags", "Warnings", "Pitch Limit Risk", "Rookie Workload Risk"
+    ]).upper()
+    extra_risk = []
+    hard_risk = False
+    if any(x in blob for x in ["OPENER", "BULK", "FOLLOWER"]):
+        extra_risk.append("NON_STANDARD_ROLE")
+        hard_risk = True
+    if any(x in blob for x in ["RETURN FROM IL", "RETURNING FROM IL", "PITCH LIMIT", "LIMITED", "SHORT LEASH"]):
+        extra_risk.append("LEASH/PITCH_LIMIT")
+        hard_risk = True
+    if any(x in blob for x in ["DEBUT", "FIRST START", "CALLUP", "CALL-UP"]):
+        extra_risk.append("DEBUT/CALLUP")
+        hard_risk = True
+
+    label = str(ctx.get("label") or "UNKNOWN_SAMPLE")
+    score = float(_pcx_num(ctx.get("score"), 45.0) or 45.0)
+    # Confidence adjustment only. Raw projections are not boosted because a pitcher is "elite".
+    adj = 0
+    if label == "ELITE_ACE_PROFILE": adj = 4
+    elif label == "VETERAN_WORKHORSE": adj = 5
+    elif label == "STABLE_STARTER": adj = 2
+    elif label == "YOUNG_POWER_ARM": adj = -3
+    elif label == "ROOKIE_VOLATILITY": adj = -8
+    elif label == "SHORT_SAMPLE_RISK": adj = -10
+    if hard_risk:
+        adj -= 7
+
+    years = ctx.get("years_mlb")
+    if label in ["ROOKIE_VOLATILITY", "SHORT_SAMPLE_RISK"] or (years is not None and years <= 1):
+        sample = "ROOKIE / LIMITED MLB SAMPLE"
+    elif label == "YOUNG_POWER_ARM":
+        sample = "YOUNG / DEVELOPING SAMPLE"
+    elif years is not None and years >= 4:
+        sample = "ESTABLISHED MLB SAMPLE"
+    else:
+        sample = "NORMAL MLB SAMPLE"
+
+    if hard_risk or label == "SHORT_SAMPLE_RISK": gate = "⚠️ STRONG GUARDRAIL"
+    elif label == "ROOKIE_VOLATILITY": gate = "⚠️ ROOKIE GUARDRAIL"
+    elif label == "YOUNG_POWER_ARM": gate = "ℹ️ YOUNG ARM"
+    elif label in ["ELITE_ACE_PROFILE", "VETERAN_WORKHORSE"]: gate = "✅ ESTABLISHED"
+    else: gate = "✅ NORMAL"
+
+    return {
+        "Pitcher Class": label,
+        "Experience Score": round(score, 1),
+        "MLB Experience Years": years if years is not None else "—",
+        "Sample Class": sample,
+        "Experience Confidence Adj": int(adj),
+        "Experience Gate": gate,
+        "Experience Risk Flags": ", ".join(extra_risk) if extra_risk else "—",
+        "Pitcher Context Version": PITCHER_CONTEXT_VERSION,
+        "Pitcher Context Note": ctx.get("note", ""),
+    }
+
+
+def _pcx_add_single_pitcher_df(df, name_col="Pitcher"):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out=[]
+    for _, rr in df.iterrows():
+        row=rr.to_dict()
+        try:
+            nm=_pcx_pick(row,[name_col,"Pitcher","pitcher","Player"],"")
+            row.update(_pcx_context(row,name=nm))
+        except Exception as e:
+            row.setdefault("Pitcher Class","UNKNOWN_SAMPLE")
+            row.setdefault("Experience Gate","⚠️ CONTEXT UNAVAILABLE")
+            row["Pitcher Context Error"]=str(e)[:100]
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+# ---- K board: enrich and add an official-confidence guardrail without touching K projection ----
+_PCX_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+def build_kproj_table(board):
+    if _PCX_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    df = _pcx_add_single_pitcher_df(_PCX_PREV_BUILD_K(board))
+    if isinstance(df,pd.DataFrame) and not df.empty:
+        conf_col = next((c for c in ["Confidence %","Win Probability %","K Sim Current Side Prob %","K Sim True Prob %"] if c in df.columns), None)
+        if conf_col:
+            base=pd.to_numeric(df[conf_col],errors="coerce")
+            adj=pd.to_numeric(df.get("Experience Confidence Adj",0),errors="coerce").fillna(0)
+            df["Experience-Adjusted Confidence %"]=(base+adj).clip(0,99).round(1)
+    return df
+
+
+# ---- Pitching Outs: preserve outs math; calibrate confidence and expose role/sample risk ----
+_PCX_PREV_PO_ROWS = _beta_projection_rows if "_beta_projection_rows" in globals() else None
+
+def _beta_projection_rows(board, market_kind="OUTS"):
+    if _PCX_PREV_PO_ROWS is None:
+        return pd.DataFrame()
+    df = _PCX_PREV_PO_ROWS(board, market_kind)
+    if str(market_kind).upper() != "OUTS":
+        return df
+    df = _pcx_add_single_pitcher_df(df)
+    if isinstance(df,pd.DataFrame) and not df.empty:
+        conf_col = next((c for c in ["PO Sim Current Side Prob %","PO Sim True Prob %","IP Confidence %","Confidence %"] if c in df.columns), None)
+        if conf_col:
+            base=pd.to_numeric(df[conf_col],errors="coerce")
+            adj=pd.to_numeric(df.get("Experience Confidence Adj",0),errors="coerce").fillna(0)
+            df["Experience-Adjusted Confidence %"]=(base+adj).clip(0,99).round(1)
+        # Non-standard role / rookie does not rewrite projected outs, but it is a visible official-play guardrail.
+        df["PO Experience Guardrail"] = df["Experience Gate"]
+    return df
+
+
+# ---- Pitcher Fantasy: confidence/volatility calibration, raw FS projection remains unchanged ----
+_PCX_PREV_PFS = build_pitcher_fs_board if "build_pitcher_fs_board" in globals() else None
+
+def build_pitcher_fs_board(board=None):
+    if _PCX_PREV_PFS is None:
+        return pd.DataFrame()
+    df = _pcx_add_single_pitcher_df(_PCX_PREV_PFS(board))
+    if isinstance(df,pd.DataFrame) and not df.empty:
+        if "Confidence %" in df.columns:
+            base=pd.to_numeric(df["Confidence %"],errors="coerce")
+            adj=pd.to_numeric(df.get("Experience Confidence Adj",0),errors="coerce").fillna(0)
+            df["Experience-Adjusted Confidence %"]=(base+adj).clip(0,99).round(1)
+        if "FS Volatility" in df.columns:
+            vol=pd.to_numeric(df["FS Volatility"],errors="coerce")
+            risk=np.where(df["Pitcher Class"].isin(["ROOKIE_VOLATILITY","SHORT_SAMPLE_RISK"]),1.12,
+                 np.where(df["Pitcher Class"].eq("YOUNG_POWER_ARM"),1.06,1.0))
+            df["Experience-Adjusted FS Volatility"]=(vol*risk).round(2)
+    return df
+
+
+# ---- 1st inning: use experience/sample status directly in confidence + play guardrail ----
+_PCX_PREV_FI_BUILD = build_first_inning_pitch_count_board if "build_first_inning_pitch_count_board" in globals() else None
+
+def build_first_inning_pitch_count_board(board):
+    if _PCX_PREV_FI_BUILD is None:
+        return pd.DataFrame()
+    df = _pcx_add_single_pitcher_df(_PCX_PREV_FI_BUILD(board))
+    if df is None or df.empty:
+        return df
+    base=pd.to_numeric(df.get("FI Confidence Score"),errors="coerce")
+    adj=pd.to_numeric(df.get("Experience Confidence Adj",0),errors="coerce").fillna(0)
+    df["FI Experience-Adjusted Confidence"]=(base+adj).clip(20,95).round(0)
+    df["FI Experience Confidence"] = df["FI Experience-Adjusted Confidence"].apply(lambda x: "HIGH" if x>=75 else ("MEDIUM" if x>=58 else "LOW"))
+    # Guardrail only changes play designation for truly low-trust samples; projection and simulated probability stay visible.
+    for i,r in df.iterrows():
+        cls=str(r.get("Pitcher Class") or "")
+        gate=str(r.get("Experience Gate") or "")
+        conf=_pcx_num(r.get("FI Experience-Adjusted Confidence"),50)
+        prob=_pcx_num(r.get("Hit %"),50)
+        pick=str(r.get("Pick") or "")
+        if pick.startswith(("🔥","⚠️")) and (cls in ["ROOKIE_VOLATILITY","SHORT_SAMPLE_RISK"] or "STRONG GUARDRAIL" in gate):
+            # Rookies can still be plays, but they need stronger simulated support.
+            required = 65.0 if "STRONG GUARDRAIL" in gate else 63.0
+            if prob < required or conf < 52:
+                side="OVER" if "OVER" in pick else ("UNDER" if "UNDER" in pick else "")
+                df.at[i,"Pick"] = f"PASS {side} — SAMPLE GUARDRAIL".strip()
+    return df
+
+
+# ---- Moneyline: classify both starting pitchers; display as data-confidence context only ----
+_PCX_PREV_ML = ml_build_board if "ml_build_board" in globals() else None
+
+def ml_build_board(board):
+    if _PCX_PREV_ML is None:
+        return pd.DataFrame()
+    df=_PCX_PREV_ML(board)
+    if df is None or not isinstance(df,pd.DataFrame) or df.empty:
+        return df
+    rows=[]
+    for _,rr in df.iterrows():
+        row=rr.to_dict()
+        try:
+            away_name=str(row.get("Away SP") or "").strip()
+            home_name=str(row.get("Home SP") or "").strip()
+            a=_pcx_context(row,name=away_name) if away_name and away_name!="—" else {}
+            h=_pcx_context(row,name=home_name) if home_name and home_name!="—" else {}
+            for k,v in a.items(): row[f"Away {k}"]=v
+            for k,v in h.items(): row[f"Home {k}"]=v
+            aadj=_pcx_num(a.get("Experience Confidence Adj"),0) or 0
+            hadj=_pcx_num(h.get("Experience Confidence Adj"),0) or 0
+            row["ML SP Experience Balance"] = round(aadj-hadj,1)
+            risky = any(str(x.get("Experience Gate") or "").startswith("⚠️") for x in [a,h] if x)
+            row["ML SP Sample Guardrail"] = "⚠️ REVIEW SP SAMPLE/ROLE" if risky else "✅ SP SAMPLE NORMAL"
+        except Exception as e:
+            row["ML SP Sample Guardrail"]="⚠️ SP CONTEXT UNAVAILABLE"
+            row["ML SP Context Error"]=str(e)[:100]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ---- Add a compact visible context table to each pitcher-facing tab ----
+def _pcx_render_context_table(df, title="Pitcher Experience / Sample Guardrail"):
+    if df is None or not isinstance(df,pd.DataFrame) or df.empty or "Pitcher Class" not in df.columns:
+        return
+    cols=[c for c in ["Pitcher","Matchup","Pitcher Class","Sample Class","Experience Score","MLB Experience Years","Experience Gate","Experience Confidence Adj","Experience Risk Flags"] if c in df.columns]
+    with st.expander(title, expanded=False):
+        st.caption("Elite/veteran status changes data trust, not bet direction. Rookie/limited-sample and non-standard-role pitchers receive stricter confidence guardrails.")
+        st.dataframe(df[cols],use_container_width=True,hide_index=True)
+
+
+_PCX_PREV_RENDER_K = render_kproj_tab if "render_kproj_tab" in globals() else None
+def render_kproj_tab(board):
+    if _PCX_PREV_RENDER_K is not None:
+        _PCX_PREV_RENDER_K(board)
+    try: _pcx_render_context_table(build_kproj_table(board), "K Props — Pitcher Experience / Rookie Guardrail")
+    except Exception: pass
+
+
+_PCX_PREV_RENDER_PO = render_beta_pitching_outs_tab if "render_beta_pitching_outs_tab" in globals() else None
+def render_beta_pitching_outs_tab(board):
+    if _PCX_PREV_RENDER_PO is not None:
+        _PCX_PREV_RENDER_PO(board)
+    try: _pcx_render_context_table(_beta_projection_rows(board,"OUTS"), "Pitching Outs — Pitcher Experience / Role Guardrail")
+    except Exception: pass
+
+
+_PCX_PREV_RENDER_PFS = render_pitcher_fs_tab if "render_pitcher_fs_tab" in globals() else None
+def render_pitcher_fs_tab(board=None):
+    if _PCX_PREV_RENDER_PFS is not None:
+        _PCX_PREV_RENDER_PFS(board)
+    try: _pcx_render_context_table(build_pitcher_fs_board(board), "Pitcher Fantasy — Experience / Sample Guardrail")
+    except Exception: pass
+
+
+# Replace FI renderer so the new classification is visible in the main table.
+def render_first_inning_pitch_count_tab(board):
+    st.markdown('<div class="section-title-pro">⚾ 1st Inning Pitch Count</div>', unsafe_allow_html=True)
+    st.caption("V2 + pitcher context: 10,000 simulations, true FI history, top-of-order context, and elite/veteran/rookie sample guardrails. Separate from Pitching Outs and K projections.")
+    df = build_first_inning_pitch_count_board(board)
+    if df is None or df.empty:
+        st.info("No first-inning pitch-count rows yet. Refresh the main board first.")
+        return
+    found = int((df["Line Status"].astype(str) == "FOUND").sum()) if "Line Status" in df.columns else 0
+    plays = int(df["Pick"].astype(str).str.startswith(("🔥", "⚠️")).sum()) if "Pick" in df.columns else 0
+    c1,c2,c3=st.columns(3); c1.metric("Pitchers",len(df)); c2.metric("UD FI Lines",found); c3.metric("Model Plays",plays)
+    if st.button("💾 Save 1st Inning Official Board", key="save_fi_pc_board", use_container_width=True):
+        ok,msg=_beta_save_official_board(df,"FI_PITCHES"); (st.success if ok else st.warning)(msg)
+    cols=[c for c in ["Pitcher","Matchup","Pitcher Class","Sample Class","Experience Gate","UD Line","Projection","Pick","Edge","Hit %","Median","P10-P90","Expected BF 1st","Expected Pitches/PA","1-2-3 Inning %","L5 FI Avg","L10 FI Avg","Season FI Avg","FI Samples","Top4 K%","Lineup Confirmed","FI Experience Confidence","FI Experience-Adjusted Confidence","Line Status"] if c in df.columns]
+    st.dataframe(df[cols],use_container_width=True,hide_index=True)
+    with st.expander("1st Inning Model Debug",expanded=False): st.dataframe(df,use_container_width=True,hide_index=True)
+
+
+tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
+    "⚾ 1ST INN PC",
     "🧪 IP DEBUG BETA",
     "PITCHER FS",
     "MONEYLINE EDGE",
@@ -37723,6 +38469,9 @@ with tab_kproj:
 
 with tab_beta_outs:
     render_beta_pitching_outs_tab(board)
+
+with tab_first_inning_pc:
+    render_first_inning_pitch_count_tab(board)
 
 with tab_beta_ip_debug:
     render_beta_ip_debug_tab(board)
